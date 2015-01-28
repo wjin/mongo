@@ -31,7 +31,7 @@
 *    it in the license file.
 */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include "mongo/db/dbwebserver.h"
 
@@ -48,6 +48,7 @@
 #include "mongo/db/background.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/db.h"
+#include "mongo/db/global_environment_experiment.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/stats/snapshots.h"
 #include "mongo/util/admin_access.h"
@@ -61,8 +62,11 @@
 
 namespace mongo {
 
-    using namespace mongoutils::html;
-    using namespace bson;
+    using std::map;
+    using std::stringstream;
+    using std::vector;
+
+    using namespace html;
 
     struct Timing {
         Timing() {
@@ -73,8 +77,12 @@ namespace mongo {
 
     class DbWebServer : public MiniWebServer {
     public:
-        DbWebServer(const string& ip, int port, const AdminAccess* webUsers)
-            : MiniWebServer("admin web console", ip, port), _webUsers(webUsers) {
+        DbWebServer(const string& ip,
+                    int port,
+                    const AdminAccess* webUsers)
+                : MiniWebServer("admin web console", ip, port),
+                  _webUsers(webUsers) {
+
             WebStatusPlugin::initAll();
         }
 
@@ -92,13 +100,17 @@ namespace mongo {
             ss << "</pre>";
         }
 
-        void _authorizePrincipal(const UserName& userName) {
-            Status status = cc().getAuthorizationSession()->addAndAuthorizeUser(userName);
+        void _authorizePrincipal(OperationContext* txn, const UserName& userName) {
+            Status status = cc().getAuthorizationSession()->addAndAuthorizeUser(txn, userName);
             uassertStatusOK(status);
         }
 
-        bool allowed( const char * rq , vector<string>& headers, const SockAddr &from ) {
-            if ( from.isLocalHost() || !_webUsers->haveAdminUsers() ) {
+        bool allowed(OperationContext* txn,
+                     const char * rq,
+                     vector<string>& headers,
+                     const SockAddr &from) {
+
+            if ( from.isLocalHost() || !_webUsers->haveAdminUsers(txn) ) {
                 // TODO(spencer): should the above check use "&&" not "||"?  Currently this is much
                 // more permissive than the server's localhost auth bypass.
                 cc().getAuthorizationSession()->grantInternalAuthorization();
@@ -124,7 +136,7 @@ namespace mongo {
                 User* user;
                 AuthorizationManager& authzManager =
                         cc().getAuthorizationSession()->getAuthorizationManager();
-                Status status = authzManager.acquireUser(userName, &user);
+                Status status = authzManager.acquireUser(txn, userName, &user);
                 if (!status.isOK()) {
                     if (status.code() != ErrorCodes::UserNotFound) {
                         uasserted(17051, status.reason());
@@ -152,7 +164,7 @@ namespace mongo {
                     string r1 = md5simpledigest( r.str() );
 
                     if ( r1 == parms["response"] ) {
-                        _authorizePrincipal(userName);
+                        _authorizePrincipal(txn, userName);
                         return true;
                     }
                 }
@@ -179,9 +191,12 @@ namespace mongo {
             vector<string>& headers, // if completely empty, content-type: text/html will be added
             const SockAddr &from
         ) {
+
+            boost::scoped_ptr<OperationContext> txn(getGlobalEnvironment()->newOpCtx());
+
             if ( url.size() > 1 ) {
 
-                if ( ! allowed( rq , headers, from ) ) {
+                if (!allowed(txn.get(), rq, headers, from)) {
                     responseCode = 401;
                     headers.push_back( "Content-Type: text/plain;charset=utf-8" );
                     responseMsg = "not allowed\n";
@@ -206,7 +221,7 @@ namespace mongo {
                             uassert(13453, "server not started with --jsonp",
                                     callback.empty() || serverGlobalParams.jsonp);
 
-                            handler->handle( rq , url , params , responseMsg , responseCode , headers , from );
+                            handler->handle( txn.get(), rq , url , params , responseMsg , responseCode , headers , from );
 
                             if (responseCode == 200 && !callback.empty()) {
                                 responseMsg = callback + '(' + responseMsg + ')';
@@ -230,7 +245,7 @@ namespace mongo {
 
             // generate home page
 
-            if ( ! allowed( rq , headers, from ) ) {
+            if (!allowed(txn.get(), rq, headers, from)) {
                 responseCode = 401;
                 headers.push_back( "Content-Type: text/plain;charset=utf-8" );
                 responseMsg = "not allowed\n";
@@ -251,7 +266,7 @@ namespace mongo {
 
             //ss << "<a href=\"/_status\">_status</a>";
             {
-                const map<string, Command*> *m = Command::webCommands();
+                const Command::CommandMap* m = Command::webCommands();
                 if( m ) {
                     ss <<
                        a("",
@@ -260,7 +275,7 @@ namespace mongo {
                          "for easier human viewing",
                          "Commands")
                        << ": ";
-                    for( map<string, Command*>::const_iterator i = m->begin(); i != m->end(); i++ ) {
+                    for( Command::CommandMap::const_iterator i = m->begin(); i != m->end(); ++i ) {
                         stringstream h;
                         i->second->help(h);
                         string help = h.str();
@@ -281,7 +296,7 @@ namespace mongo {
 
             doUnlockedStuff(ss);
 
-            WebStatusPlugin::runAll( ss );
+            WebStatusPlugin::runAll(txn.get(), ss);
 
             ss << "</body></html>\n";
             responseMsg = ss.str();
@@ -322,7 +337,7 @@ namespace mongo {
             (*_plugins)[i]->init();
     }
 
-    void WebStatusPlugin::runAll( stringstream& ss ) {
+    void WebStatusPlugin::runAll(OperationContext* txn, stringstream& ss) {
         if ( ! _plugins )
             return;
 
@@ -335,7 +350,7 @@ namespace mongo {
 
             ss << "<br>\n";
 
-            p->run(ss);
+            p->run(txn, ss);
         }
 
     }
@@ -352,7 +367,7 @@ namespace mongo {
 
         virtual void init() {}
 
-        virtual void run( stringstream& ss ) {
+        virtual void run(OperationContext* txn, stringstream& ss ) {
             _log->toHTML( ss );
         }
         RamLog * _log;
@@ -410,7 +425,8 @@ namespace mongo {
     public:
         FavIconHandler() : DbWebHandler( "favicon.ico" , 0 , false ) {}
 
-        virtual void handle( const char *rq, const std::string& url, BSONObj params,
+        virtual void handle( OperationContext* txn,
+                             const char *rq, const std::string& url, BSONObj params,
                              string& responseMsg, int& responseCode,
                              vector<string>& headers,  const SockAddr &from ) {
             responseCode = 404;
@@ -424,7 +440,8 @@ namespace mongo {
     public:
         StatusHandler() : DbWebHandler( "_status" , 1 , false ) {}
 
-        virtual void handle( const char *rq, const std::string& url, BSONObj params,
+        virtual void handle( OperationContext* txn,
+                             const char *rq, const std::string& url, BSONObj params,
                              string& responseMsg, int& responseCode,
                              vector<string>& headers,  const SockAddr &from ) {
             headers.push_back( "Content-Type: application/json;charset=utf-8" );
@@ -459,7 +476,7 @@ namespace mongo {
                 string errmsg;
 
                 BSONObjBuilder sub;
-                if ( ! c->run( "admin.$cmd" , co , 0, errmsg , sub , false ) )
+                if ( ! c->run( txn, "admin.$cmd" , co , 0, errmsg , sub , false ) )
                     buf.append( cmd , errmsg );
                 else
                     buf.append( cmd , sub.obj() );
@@ -475,7 +492,8 @@ namespace mongo {
     public:
         CommandListHandler() : DbWebHandler( "_commands" , 1 , true ) {}
 
-        virtual void handle( const char *rq, const std::string& url, BSONObj params,
+        virtual void handle( OperationContext* txn,
+                             const char *rq, const std::string& url, BSONObj params,
                              string& responseMsg, int& responseCode,
                              vector<string>& headers,  const SockAddr &from ) {
             headers.push_back( "Content-Type: text/html;charset=utf-8" );
@@ -485,11 +503,11 @@ namespace mongo {
             ss << start("Commands List");
             ss << p( a("/", "back", "Home") );
             ss << p( "<b>MongoDB List of <a href=\"http://dochub.mongodb.org/core/commands\">Commands</a></b>\n" );
-            const map<string, Command*> *m = Command::commandsByBestName();
+            const Command::CommandMap* m = Command::commandsByBestName();
             ss << "S:slave-ok  R:read-lock  W:write-lock  A:admin-only<br>\n";
             ss << table();
             ss << "<tr><th>Command</th><th>Attributes</th><th>Help</th></tr>\n";
-            for( map<string, Command*>::const_iterator i = m->begin(); i != m->end(); i++ )
+            for( Command::CommandMap::const_iterator i = m->begin(); i != m->end(); ++i )
                 i->second->htmlHelp(ss);
             ss << _table() << _end();
 
@@ -508,11 +526,11 @@ namespace mongo {
         }
 
         Command * _cmd( const string& cmd ) const {
-            const map<string,Command*> *m = Command::webCommands();
+            const Command::CommandMap* m = Command::webCommands();
             if( ! m )
                 return 0;
 
-            map<string,Command*>::const_iterator i = m->find(cmd);
+            Command::CommandMap::const_iterator i = m->find(cmd);
             if ( i == m->end() )
                 return 0;
 
@@ -527,7 +545,8 @@ namespace mongo {
             return _cmd(cmd) != 0;
         }
 
-        virtual void handle( const char *rq, const std::string& url, BSONObj params,
+        virtual void handle( OperationContext* txn,
+                             const char *rq, const std::string& url, BSONObj params,
                              string& responseMsg, int& responseCode,
                              vector<string>& headers,  const SockAddr &from ) {
             string cmd;
@@ -537,10 +556,9 @@ namespace mongo {
             verify( c );
 
             BSONObj cmdObj = BSON( cmd << 1 );
-            Client& client = cc();
 
             BSONObjBuilder result;
-            Command::execCommand(c, client, 0, "admin.", cmdObj , result, false);
+            Command::execCommand(txn, c, 0, "admin.", cmdObj , result, false);
 
             responseCode = 200;
 

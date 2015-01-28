@@ -28,15 +28,21 @@
  *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/commands.h"
-#include "mongo/db/kill_current_op.h"
-#include "mongo/db/pdfile.h"
 #include "mongo/db/query/internal_plans.h"
-#include "mongo/db/query/runner.h"
-#include "mongo/db/storage/mmap_v1/dur_transaction.h"
+#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
+
+    using std::endl;
+    using std::string;
+    using std::stringstream;
 
     class ValidateCmd : public Command {
     public:
@@ -59,7 +65,7 @@ namespace mongo {
         }
         //{ validate: "collectionnamewithoutthedbpart" [, scandata: <bool>] [, full: <bool> } */
 
-        bool run(const string& dbname , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
+        bool run(OperationContext* txn, const string& dbname , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
             string ns = dbname + "." + cmdObj.firstElement().valuestrsafe();
 
             NamespaceString ns_string(ns);
@@ -72,28 +78,21 @@ namespace mongo {
             }
 
             if (!serverGlobalParams.quiet) {
-                MONGO_TLOG(0) << "CMD: validate " << ns << endl;
+                LOG(0) << "CMD: validate " << ns << endl;
             }
 
-            Client::ReadContext ctx(ns_string.ns());
-            DurTransaction txn;
+            AutoGetCollectionForRead ctx(txn, ns_string.ns());
 
-            Database* db = ctx.ctx().db();
-            if ( !db ) {
-                errmsg = "database not found";
-                return false;
-            }
-
-            Collection* collection = db->getCollection( ns );
+            Collection* collection = ctx.getCollection();
             if ( !collection ) {
-                errmsg = "collection not found";
+                errmsg = "ns not found";
                 return false;
             }
 
             result.append( "ns", ns );
 
             ValidateResults results;
-            Status status = collection->validate( &txn, full, scanData, &results, &result );
+            Status status = collection->validate( txn, full, scanData, &results, &result );
             if ( !status.isOK() )
                 return appendCommandStatus( result, status );
 

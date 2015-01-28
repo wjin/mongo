@@ -82,6 +82,7 @@ var firstDbName = "roles_commands_1";
 var secondDbName = "roles_commands_2";
 var adminDbName = "admin";
 var authErrCode = 13;
+var commandNotSupportedCode = 115;
 var shard0name = "shard0000";
 
 // useful shorthand when defining the tests below
@@ -375,6 +376,23 @@ var authCommandsLib = {
             ]
         },
         {
+            testname: "cleanupOrphaned",
+            command: {cleanupOrphaned: firstDbName + ".x"},
+            skipSharded: true,
+            testcases: [
+                {
+                    runOnDb: adminDbName,
+                    roles: roles_clusterManager,
+                    privileges: [
+                        { resource: {cluster: true}, actions: ["cleanupOrphaned"] }
+                    ],
+                    expectFail: true
+                },
+                { runOnDb: firstDbName, roles: {} },
+                { runOnDb: secondDbName, roles: {} }
+            ]
+        },
+        {
             testname: "cloneCollection_1",
             command: {cloneCollection: firstDbName + ".x"},
             skipSharded: true,
@@ -435,22 +453,6 @@ var authCommandsLib = {
                         { resource: {db: secondDbName, collection: "x"}, actions: ["find"] }
                     ]
                 }
-            ]
-        },
-        {
-            testname: "closeAllDatabases",
-            command: {closeAllDatabases: "x"},
-            skipSharded: true,
-            testcases: [
-                {
-                    runOnDb: adminDbName,
-                    roles: roles_hostManager,
-                    privileges: [
-                        { resource: {cluster: true}, actions: ["closeAllDatabases"] }
-                    ]
-                },
-                { runOnDb: firstDbName, roles: {} },
-                { runOnDb: secondDbName, roles: {} }
             ]
         },
         {
@@ -623,6 +625,7 @@ var authCommandsLib = {
         {
             testname: "copydb",
             command: {copydb: 1, fromdb: firstDbName, todb: secondDbName},
+            skipSharded: true, // Does not work sharded due to SERVER-13080
             testcases: [
                 {
                     runOnDb: adminDbName,
@@ -744,6 +747,27 @@ var authCommandsLib = {
                                           __system: 1}),
                     privileges: [
                         { resource: {db: firstDbName, collection: "x"}, actions: ["createIndex"] }
+                    ]
+                }
+            ]
+        },
+        {
+            testname: "currentOpCtx",
+            command: {currentOpCtx: 1},
+            skipSharded: true,
+            testcases: [
+                {
+                    runOnDb: firstDbName,
+                    roles: roles_monitoring,
+                    privileges: [
+                        { resource: {cluster: true}, actions: ["inprog"] }
+                    ]
+                },
+                {
+                    runOnDb: secondDbName,
+                    roles: roles_monitoring,
+                    privileges: [
+                        { resource: {cluster: true}, actions: ["inprog"] }
                     ]
                 }
             ]
@@ -1412,6 +1436,77 @@ var authCommandsLib = {
             ]
         },
         {
+            testname: "listCollections",
+            command: {listCollections: 1},
+            setup: function (db) {
+                db.x.insert({_id: 5});
+                db.y.insert({_id: 6});
+            },
+            teardown: function (db) {
+                db.x.drop();
+                db.y.drop();
+            },
+            testcases: [
+                {
+                    runOnDb: firstDbName,
+                    roles: {
+                        read: 1,
+                        readAnyDatabase: 1,
+                        readWrite: 1,
+                        readWriteAnyDatabase: 1,
+                        clusterAdmin: 1,
+                        clusterMonitor: 1,
+                        clusterManager: 1,
+                        dbAdmin: 1,
+                        dbAdminAnyDatabase: 1,
+                        dbOwner: 1,
+                        backup: 1,
+                        restore: 1,
+                        root: 1,
+                        __system: 1
+                    },
+                    privileges: [
+                        {
+                            resource: {db: firstDbName, collection: ""},
+                            actions: ["listCollections"]
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            testname: "listIndexes",
+            command: {listIndexes: "x"},
+            setup: function (db) {
+                db.x.insert({_id: 5});
+                db.x.insert({_id: 6});
+            },
+            teardown: function (db) { db.x.drop(); },
+            testcases: [
+                {
+                    runOnDb: firstDbName,
+                    roles: {
+                        read: 1,
+                        readAnyDatabase: 1,
+                        readWrite: 1,
+                        readWriteAnyDatabase: 1,
+                        dbAdmin: 1,
+                        dbAdminAnyDatabase: 1,
+                        dbOwner: 1,
+                        backup: 1,
+                        root: 1,
+                        __system: 1
+                    },
+                    privileges: [
+                        {
+                            resource: {db: firstDbName, collection: ""},
+                            actions: ["listIndexes"]
+                        }
+                    ]
+                }
+            ]
+        },
+        {
             testname: "listShards",
             command: {listShards: 1},
             skipStandalone: true,
@@ -1770,7 +1865,6 @@ var authCommandsLib = {
             command: {renameCollection: firstDbName + ".x", to: secondDbName + ".y"},
             setup: function (db) {
                 db.getSisterDB(firstDbName).x.save( {} );
-                db.getSisterDB(firstDbName).getLastError();
                 db.getSisterDB(adminDbName).runCommand({movePrimary: firstDbName, to: shard0name});
                 db.getSisterDB(adminDbName).runCommand({movePrimary: secondDbName, to: shard0name});
             },
@@ -1961,6 +2055,29 @@ var authCommandsLib = {
                     },
                     privileges: [
                         { resource: {cluster: true}, actions: ["replSetGetStatus"] }
+                    ],
+                    expectFail: true
+                },
+                { runOnDb: firstDbName, roles: {} },
+                { runOnDb: secondDbName, roles: {} }
+            ]
+        },
+        {
+            testname: "replSetGetConfig",
+            command: {replSetGetConfig: 1},
+            skipSharded: true,
+            testcases: [
+                {
+                    runOnDb: adminDbName,
+                    roles: {
+                        clusterMonitor: 1,
+                        clusterManager: 1,
+                        clusterAdmin: 1,
+                        root: 1,
+                        __system: 1
+                    },
+                    privileges: [
+                        { resource: {cluster: true}, actions: ["replSetGetConfig"] }
                     ],
                     expectFail: true
                 },
@@ -2290,28 +2407,6 @@ var authCommandsLib = {
                 }
             ]
         }, */
-        {
-            testname: "text",
-            command: {text: "x"},
-            testcases: [
-                {
-                    runOnDb: firstDbName,
-                    roles: roles_read,
-                    privileges: [
-                        { resource: {db: firstDbName, collection: "x"}, actions: ["find"] }
-                    ],
-                    expectFail: true
-                },
-                {
-                    runOnDb: secondDbName,
-                    roles: roles_readAny,
-                    privileges: [
-                        { resource: {db: secondDbName, collection: "x"}, actions: ["find"] }
-                    ],
-                    expectFail: true
-                }
-            ]
-        },
         {
             testname: "top",
             command: {top: 1},

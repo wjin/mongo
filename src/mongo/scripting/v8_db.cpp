@@ -32,19 +32,25 @@
 #include <iostream>
 #include <iomanip>
 #include <boost/scoped_array.hpp>
+#include <boost/shared_ptr.hpp>
 
 #include "mongo/base/init.h"
 #include "mongo/client/sasl_client_authenticate.h"
+#include "mongo/client/native_sasl_client_session.h"
+#include "mongo/client/sasl_scramsha1_client_conversation.h"
 #include "mongo/client/syncclusterconnection.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/s/d_logic.h"
+#include "mongo/s/d_state.h"
 #include "mongo/scripting/engine_v8.h"
 #include "mongo/scripting/v8_utils.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/base64.h"
+#include "mongo/util/hex.h"
 #include "mongo/util/text.h"
 
 using namespace std;
+using boost::scoped_array;
+using boost::shared_ptr;
 
 namespace mongo {
 
@@ -113,6 +119,7 @@ namespace mongo {
         scope->injectV8Method("auth", mongoAuth, proto);
         scope->injectV8Method("logout", mongoLogout, proto);
         scope->injectV8Method("cursorFromId", mongoCursorFromId, proto);
+        scope->injectV8Method("copyDatabaseWithSCRAM", mongoCopyDatabaseWithSCRAM, proto);
 
         fassert(16468, _mongoPrototypeManipulatorsFrozen);
         for (size_t i = 0; i < _mongoPrototypeManipulators.size(); ++i)
@@ -123,13 +130,10 @@ namespace mongo {
 
 
     v8::Handle<v8::Value> mongoConsExternal(V8Scope* scope, const v8::Arguments& args) {
-        char host[255];
+        string host = "127.0.0.1";
         if (args.Length() > 0 && args[0]->IsString()) {
-            uassert(16666, "string argument too long", args[0]->ToString()->Utf8Length() < 250);
-            args[0]->ToString()->WriteAscii(host);
-        }
-        else {
-            strcpy(host, "127.0.0.1");
+            v8::String::Utf8Value utf(args[0]);
+            host = string(*utf);
         }
 
         // only allow function template to be used by a constructor
@@ -143,18 +147,18 @@ namespace mongo {
             return v8AssertionException(errmsg);
         }
 
-        DBClientWithCommands* conn;
+        DBClientBase* conn;
         conn = cs.connect(errmsg);
         if (!conn) {
             return v8AssertionException(errmsg);
         }
 
         v8::Persistent<v8::Object> self = v8::Persistent<v8::Object>::New(args.This());
-        scope->dbClientWithCommandsTracker.track(self, conn);
+        v8::Local<v8::External> connHandle = scope->dbClientBaseTracker.track(self, conn);
 
         ScriptEngine::runConnectCallback(*conn);
 
-        args.This()->SetInternalField(0, v8::External::New(conn));
+        args.This()->SetInternalField(0, connHandle);
         args.This()->ForceSet(scope->v8StringData("slaveOk"), v8::Boolean::New(false));
         args.This()->ForceSet(scope->v8StringData("host"), scope->v8StringData(host));
 
@@ -169,24 +173,25 @@ namespace mongo {
                 args.IsConstructCall());
         verify(scope->MongoFT()->HasInstance(args.This()));
 
-        DBClientBase* conn = createDirectClient();
+        DBClientBase* conn = createDirectClient(scope->getOpContext());
         v8::Persistent<v8::Object> self = v8::Persistent<v8::Object>::New(args.This());
-        scope->dbClientBaseTracker.track(self, conn);
+        v8::Local<v8::External> connHandle = scope->dbClientBaseTracker.track(self, conn);
 
-        args.This()->SetInternalField(0, v8::External::New(conn));
+        args.This()->SetInternalField(0, connHandle);
         args.This()->ForceSet(scope->v8StringData("slaveOk"), v8::Boolean::New(false));
         args.This()->ForceSet(scope->v8StringData("host"), scope->v8StringData("EMBEDDED"));
 
         return v8::Undefined();
     }
 
-    DBClientBase* getConnection(V8Scope* scope, const v8::Arguments& args) {
+    boost::shared_ptr<DBClientBase> getConnection(V8Scope* scope, const v8::Arguments& args) {
         verify(scope->MongoFT()->HasInstance(args.This()));
         verify(args.This()->InternalFieldCount() == 1);
         v8::Local<v8::External> c = v8::External::Cast(*(args.This()->GetInternalField(0)));
-        DBClientBase* conn = (DBClientBase*)(c->Value());
-        massert(16667, "Unable to get db client connection", conn);
-        return conn;
+        boost::shared_ptr<DBClientBase>* conn =
+            static_cast<boost::shared_ptr<DBClientBase>*>(c->Value());
+        massert(16667, "Unable to get db client connection", conn && conn->get());
+        return *conn;
     }
 
     /**
@@ -195,7 +200,7 @@ namespace mongo {
     v8::Handle<v8::Value> mongoFind(V8Scope* scope, const v8::Arguments& args) {
         argumentCheck(args.Length() == 7, "find needs 7 args")
         argumentCheck(args[1]->IsObject(), "needs to be an object")
-        DBClientBase * conn = getConnection(scope, args);
+        boost::shared_ptr<DBClientBase> conn = getConnection(scope, args);
         const string ns = toSTLString(args[0]);
         BSONObj fields;
         BSONObj q = scope->v8ToMongo(args[1]->ToObject());
@@ -204,7 +209,7 @@ namespace mongo {
         if (haveFields)
             fields = scope->v8ToMongo(args[2]->ToObject());
 
-        auto_ptr<mongo::DBClientCursor> cursor;
+        boost::shared_ptr<mongo::DBClientCursor> cursor;
         int nToReturn = args[3]->Int32Value();
         int nToSkip = args[4]->Int32Value();
         int batchSize = args[5]->Int32Value();
@@ -216,9 +221,11 @@ namespace mongo {
         }
 
         v8::Handle<v8::Function> cons = scope->InternalCursorFT()->GetFunction();
-        v8::Persistent<v8::Object> c = v8::Persistent<v8::Object>::New(cons->NewInstance());
+        v8::Handle<v8::Object> c = cons->NewInstance();
         c->SetInternalField(0, v8::External::New(cursor.get()));
-        scope->dbClientCursorTracker.track(c, cursor.release());
+        scope->dbConnectionAndCursor.track(
+            v8::Persistent<v8::Value>::New(c),
+            new V8Scope::DBConnectionAndCursor(conn, cursor));
         return c;
     }
 
@@ -227,19 +234,22 @@ namespace mongo {
         argumentCheck(scope->NumberLongFT()->HasInstance(args[1]), "2nd arg must be a NumberLong")
         argumentCheck(args[2]->IsUndefined() || args[2]->IsNumber(), "3rd arg must be a js Number")
 
-        DBClientBase* conn = getConnection(scope, args);
+        boost::shared_ptr<DBClientBase> conn = getConnection(scope, args);
         const string ns = toSTLString(args[0]);
         long long cursorId = numberLongVal(scope, args[1]->ToObject());
 
-        auto_ptr<mongo::DBClientCursor> cursor(new DBClientCursor(conn, ns, cursorId, 0, 0));
+        boost::shared_ptr<mongo::DBClientCursor> cursor(
+            new DBClientCursor(conn.get(), ns, cursorId, 0, 0));
 
         if (!args[2]->IsUndefined())
             cursor->setBatchSize(args[2]->Int32Value());
 
         v8::Handle<v8::Function> cons = scope->InternalCursorFT()->GetFunction();
-        v8::Persistent<v8::Object> c = v8::Persistent<v8::Object>::New(cons->NewInstance());
+        v8::Handle<v8::Object> c = cons->NewInstance();
         c->SetInternalField(0, v8::External::New(cursor.get()));
-        scope->dbClientCursorTracker.track(c, cursor.release());
+        scope->dbConnectionAndCursor.track(
+            v8::Persistent<v8::Value>::New(c),
+            new V8Scope::DBConnectionAndCursor(conn, cursor));
         return c;
     }
 
@@ -253,7 +263,7 @@ namespace mongo {
             return v8AssertionException("js db in read only mode");
         }
 
-        DBClientBase * conn = getConnection(scope, args);
+        boost::shared_ptr<DBClientBase> conn = getConnection(scope, args);
         const string ns = toSTLString(args[0]);
 
         v8::Handle<v8::Integer> flags = args[2]->ToInteger();
@@ -301,7 +311,7 @@ namespace mongo {
             return v8AssertionException("js db in read only mode");
         }
 
-        DBClientBase * conn = getConnection(scope, args);
+        boost::shared_ptr<DBClientBase> conn = getConnection(scope, args);
         const string ns = toSTLString(args[0]);
 
         v8::Handle<v8::Object> in = args[1]->ToObject();
@@ -327,7 +337,7 @@ namespace mongo {
             return v8AssertionException("js db in read only mode");
         }
 
-        DBClientBase * conn = getConnection(scope, args);
+        boost::shared_ptr<DBClientBase> conn = getConnection(scope, args);
         const string ns = toSTLString(args[0]);
 
         v8::Handle<v8::Object> q = args[1]->ToObject();
@@ -343,7 +353,7 @@ namespace mongo {
     }
 
     v8::Handle<v8::Value> mongoAuth(V8Scope* scope, const v8::Arguments& args) {
-        DBClientWithCommands* conn = getConnection(scope, args);
+        boost::shared_ptr<DBClientBase> conn = getConnection(scope, args);
         if (NULL == conn)
             return v8AssertionException("no connection");
 
@@ -372,11 +382,99 @@ namespace mongo {
 
     v8::Handle<v8::Value> mongoLogout(V8Scope* scope, const v8::Arguments& args) {
         argumentCheck(args.Length() == 1, "logout needs 1 arg")
-        DBClientBase* conn = getConnection(scope, args);
+        boost::shared_ptr<DBClientBase> conn = getConnection(scope, args);
         const string db = toSTLString(args[0]);
         BSONObj ret;
         conn->logout(db, ret);
         return scope->mongoToLZV8(ret, false);
+    }
+
+    v8::Handle<v8::Value> mongoCopyDatabaseWithSCRAM(V8Scope* scope, const v8::Arguments& args) {
+        boost::shared_ptr<DBClientBase> conn = getConnection(scope, args);
+        if (NULL == conn)
+            return v8AssertionException("no connection");
+
+        argumentCheck(args.Length() == 5, "copyDatabase needs 5 arg");
+
+        // copyDatabase(fromdb, todb, fromhost, username, password);
+        std::string fromDb = toSTLString(args[0]);
+        std::string toDb = toSTLString(args[1]);
+        std::string fromHost = toSTLString(args[2]);
+        std::string user = toSTLString(args[3]);
+        std::string hashedPwd = DBClientWithCommands::createPasswordDigest(user,
+                                                                           toSTLString(args[4]));
+
+        boost::scoped_ptr<SaslClientSession> session(new NativeSaslClientSession());
+
+        session->setParameter(SaslClientSession::parameterMechanism, "SCRAM-SHA-1");
+        session->setParameter(SaslClientSession::parameterUser, user);
+        session->setParameter(SaslClientSession::parameterPassword, hashedPwd);
+        session->initialize();
+
+        BSONObj saslFirstCommandPrefix = BSON(
+                "copydbsaslstart" << 1 <<
+                "fromhost" << fromHost <<
+                "fromdb" << fromDb <<
+                saslCommandMechanismFieldName << "SCRAM-SHA-1");
+
+        BSONObj saslFollowupCommandPrefix = BSON("copydb" << 1 <<
+                                                 "fromhost" << fromHost <<
+                                                 "fromdb" << fromDb <<
+                                                 "todb" << toDb);
+
+        BSONObj saslCommandPrefix = saslFirstCommandPrefix;
+        BSONObj inputObj = BSON(saslCommandPayloadFieldName << "");
+        bool isServerDone = false;
+
+        while (!session->isDone()) {
+            std::string payload;
+            BSONType type;
+
+            Status status = saslExtractPayload(inputObj, &payload, &type);
+            if (!status.isOK()) {
+                return v8AssertionException(status.reason());
+            }
+
+            std::string responsePayload;
+            status = session->step(payload, &responsePayload);
+            if (!status.isOK()) {
+                return v8AssertionException(status.reason());
+            }
+
+            BSONObjBuilder commandBuilder;
+
+            commandBuilder.appendElements(saslCommandPrefix);
+            commandBuilder.appendBinData(saslCommandPayloadFieldName,
+                                         int(responsePayload.size()),
+                                         BinDataGeneral,
+                                         responsePayload.c_str());
+            BSONElement conversationId = inputObj[saslCommandConversationIdFieldName];
+            if (!conversationId.eoo())
+                commandBuilder.append(conversationId);
+
+            BSONObj command = commandBuilder.obj();
+
+            bool ok = conn->runCommand("admin", command, inputObj);
+
+            ErrorCodes::Error code = ErrorCodes::fromInt(
+                    inputObj[saslCommandCodeFieldName].numberInt());
+
+            if (!ok || code != ErrorCodes::OK) {
+                if (code == ErrorCodes::OK)
+                    code = ErrorCodes::UnknownError;
+
+                return scope->mongoToLZV8(inputObj, true);
+            }
+
+            isServerDone = inputObj[saslCommandDoneFieldName].trueValue();
+            saslCommandPrefix = saslFollowupCommandPrefix;
+        }
+
+        if (!isServerDone) {
+            return v8AssertionException("copydb client finished before server.");
+        }
+
+        return scope->mongoToLZV8(inputObj, true);
     }
 
     /**
@@ -683,7 +781,7 @@ namespace mongo {
             oid.init(s);
         }
 
-        it->ForceSet(scope->v8StringData("str"), v8::String::New(oid.str().c_str()));
+        it->ForceSet(scope->v8StringData("str"), v8::String::New(oid.toString().c_str()));
         return it;
     }
 
@@ -696,10 +794,16 @@ namespace mongo {
         v8::Handle<v8::Object> it = args.This();
         verify(scope->DBRefFT()->HasInstance(it));
 
-        argumentCheck(args.Length() == 2, "DBRef needs 2 arguments")
+        argumentCheck(args.Length() >= 2 && args.Length() <= 3, "DBRef needs 2 or 3 arguments")
         argumentCheck(args[0]->IsString(), "DBRef 1st parameter must be a string")
         it->ForceSet(scope->v8StringData("$ref"), args[0]);
         it->ForceSet(scope->v8StringData("$id"),  args[1]);
+
+        if (args.Length() == 3) {
+            argumentCheck(args[2]->IsString(), "DBRef 3rd parameter must be a string")
+            it->ForceSet(scope->v8StringData("$db"), args[2]);
+        }
+
         return it;
     }
 

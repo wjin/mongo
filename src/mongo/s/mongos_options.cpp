@@ -26,8 +26,13 @@
  *    then also delete it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+
+#include "mongo/platform/basic.h"
+
 #include "mongo/s/mongos_options.h"
 
+#include <iostream>
 #include <string>
 #include <vector>
 
@@ -37,12 +42,15 @@
 #include "mongo/db/server_options_helpers.h"
 #include "mongo/s/chunk.h"
 #include "mongo/s/version_mongos.h"
+#include "mongo/util/log.h"
 #include "mongo/util/net/ssl_options.h"
 #include "mongo/util/options_parser/startup_options.h"
 #include "mongo/util/startup_test.h"
 #include "mongo/util/stringutils.h"
 
 namespace mongo {
+
+    using std::endl;
 
     MongosGlobalParams mongosGlobalParams;
 
@@ -91,9 +99,6 @@ namespace mongo {
         sharding_options.addOptionChaining("sharding.chunkSize", "chunkSize", moe::Int,
                 "maximum amount of data per chunk");
 
-        sharding_options.addOptionChaining("net.ipv6", "ipv6", moe::Switch,
-                "enable IPv6 support (disabled by default)");
-
         sharding_options.addOptionChaining("net.http.JSONPEnabled", "jsonp", moe::Switch,
                 "allow JSONP access via http (has security implications)")
                                          .setSources(moe::SourceAllLegacy);
@@ -134,15 +139,18 @@ namespace mongo {
 
     bool handlePreValidationMongosOptions(const moe::Environment& params,
                                             const std::vector<std::string>& args) {
-        if (params.count("help")) {
+        if (params.count("help") &&
+            params["help"].as<bool>() == true) {
             printMongosHelp(moe::startupOptions);
             return false;
         }
-        if (params.count("version")) {
+        if (params.count("version") &&
+            params["version"].as<bool>() == true) {
             printShardingVersionInfo(true);
             return false;
         }
-        if ( params.count( "test" ) ) {
+        if (params.count("test") &&
+            params["test"].as<bool>() == true) {
             ::mongo::logger::globalLogDomain()->setMinimumLoggedSeverity(
                     ::mongo::logger::LogSeverity::Debug(5));
             StartupTest::runTests();
@@ -179,7 +187,8 @@ namespace mongo {
         // "sharding.autoSplit" comes from the config file, so override it if "noAutoSplit" is set
         // since that comes from the command line.
         if (params->count("noAutoSplit")) {
-            Status ret = params->set("sharding.autoSplit", moe::Value(false));
+            Status ret = params->set("sharding.autoSplit",
+                                     moe::Value(!(*params)["noAutoSplit"].as<bool>()));
             if (!ret.isOK()) {
                 return ret;
             }
@@ -226,12 +235,8 @@ namespace mongo {
                 params["replication.localPingThresholdMs"].as<int>();
         }
 
-        if ( params.count( "net.ipv6" ) ) {
-            enableIPv6();
-        }
-
         if (params.count("net.http.JSONPEnabled")) {
-            serverGlobalParams.jsonp = true;
+            serverGlobalParams.jsonp = params["net.http.JSONPEnabled"].as<bool>();
         }
 
         if (params.count("noscripting")) {
@@ -260,7 +265,9 @@ namespace mongo {
                       << "and is not recommended for production" << endl;
         }
 
-        mongosGlobalParams.upgrade = params.count("upgrade");
+        if (params.count("upgrade")) {
+            mongosGlobalParams.upgrade = params["upgrade"].as<bool>();
+        }
 
         return Status::OK();
     }

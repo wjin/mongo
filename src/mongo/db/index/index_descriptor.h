@@ -67,7 +67,6 @@ namespace mongo {
               _parentNS(infoObj.getStringField("ns")),
               _isIdIndex(isIdIndexPattern( _keyPattern )),
               _sparse(infoObj["sparse"].trueValue()),
-              _dropDups(infoObj["dropDups"].trueValue()),
               _unique( _isIdIndex || infoObj["unique"].trueValue() ),
               _cachedEntry( NULL )
         {
@@ -124,14 +123,14 @@ namespace mongo {
         // May each key only occur once?
         bool unique() const { return _unique; }
 
-        // Is dropDups set on this index?
-        bool dropDups() const { return _dropDups; }
-
         // Is this index sparse?
         bool isSparse() const { return _sparse; }
 
         // Is this index multikey?
-        bool isMultikey() const { _checkOk(); return _collection->getIndexCatalog()->isMultikey( this ); }
+        bool isMultikey( OperationContext* txn ) const {
+            _checkOk();
+            return _collection->getIndexCatalog()->isMultikey( txn, this );
+        }
 
         bool isIdIndex() const { _checkOk(); return _isIdIndex; }
 
@@ -141,13 +140,13 @@ namespace mongo {
 
         // Allow access to arbitrary fields in the per-index info object.  Some indices stash
         // index-specific data there.
-        BSONElement getInfoElement(const string& name) const { return _infoObj[name]; }
+        BSONElement getInfoElement(const std::string& name) const { return _infoObj[name]; }
 
         //
         // "Internals" of accessing the index, used by IndexAccessMethod(s).
         //
 
-        // Return a (rather compact) string representation.
+        // Return a (rather compact) std::string representation.
         std::string toString() const { _checkOk(); return _infoObj.toString(); }
 
         // Return the info object.
@@ -171,19 +170,14 @@ namespace mongo {
              return i.next().eoo();
         }
 
-        static string makeIndexNamespace( const StringData& ns,
+        static std::string makeIndexNamespace( const StringData& ns,
                                           const StringData& name ) {
             return ns.toString() + ".$" + name.toString();
         }
 
     private:
 
-        void _checkOk() const {
-            if ( _magic == 123987 )
-                return;
-            log() << "uh oh: " << (void*)(this) << " " << _magic;
-            verify(0);
-        }
+        void _checkOk() const;
 
         int _magic;
 
@@ -205,7 +199,6 @@ namespace mongo {
         std::string _indexNamespace;
         bool _isIdIndex;
         bool _sparse;
-        bool _dropDups;
         bool _unique;
         int _version;
 

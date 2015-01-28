@@ -2,30 +2,45 @@
 
 /*    Copyright 2009 10gen Inc.
  *
- *    Licensed under the Apache License, Version 2.0 (the "License");
- *    you may not use this file except in compliance with the License.
- *    You may obtain a copy of the License at
+ *    This program is free software: you can redistribute it and/or  modify
+ *    it under the terms of the GNU Affero General Public License, version 3,
+ *    as published by the Free Software Foundation.
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License for more details.
  *
- *    Unless required by applicable law or agreed to in writing, software
- *    distributed under the License is distributed on an "AS IS" BASIS,
- *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *    See the License for the specific language governing permissions and
- *    limitations under the License.
+ *    You should have received a copy of the GNU Affero General Public License
+ *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
  */
 
 #pragma once
 
 #include <cfloat>
-#include <iostream>
 #include <sstream>
 #include <stdio.h>
 #include <string>
 #include <string.h>
 
-#include "mongo/bson/inline_decls.h"
+#include <boost/static_assert.hpp>
+
+#include "mongo/base/data_view.h"
 #include "mongo/base/string_data.h"
+#include "mongo/bson/inline_decls.h"
+#include "mongo/util/allocator.h"
 #include "mongo/util/assert_util.h"
 
 namespace mongo {
@@ -62,8 +77,8 @@ namespace mongo {
 
     class TrivialAllocator { 
     public:
-        void* Malloc(size_t sz) { return malloc(sz); }
-        void* Realloc(void *p, size_t sz) { return realloc(p, sz); }
+        void* Malloc(size_t sz) { return mongoMalloc(sz); }
+        void* Realloc(void *p, size_t sz) { return mongoRealloc(p, sz); }
         void Free(void *p) { free(p); }
     };
 
@@ -72,18 +87,18 @@ namespace mongo {
         enum { SZ = 512 };
         void* Malloc(size_t sz) {
             if( sz <= SZ ) return buf;
-            return malloc(sz); 
+            return mongoMalloc(sz);
         }
         void* Realloc(void *p, size_t sz) { 
             if( p == buf ) {
                 if( sz <= SZ ) return buf;
-                void *d = malloc(sz);
+                void *d = mongoMalloc(sz);
                 if ( d == 0 )
                     msgasserted( 15912 , "out of memory StackAllocator::Realloc" );
                 memcpy(d, p, SZ);
                 return d;
             }
-            return realloc(p, sz); 
+            return mongoRealloc(p, sz);
         }
         void Free(void *p) { 
             if( p != buf )
@@ -147,34 +162,46 @@ namespace mongo {
         void decouple() { data = 0; }
 
         void appendUChar(unsigned char j) {
-            *((unsigned char*)grow(sizeof(unsigned char))) = j;
+            BOOST_STATIC_ASSERT(CHAR_BIT == 8);
+            appendNumImpl(j);
         }
         void appendChar(char j) {
-            *((char*)grow(sizeof(char))) = j;
+            appendNumImpl(j);
         }
         void appendNum(char j) {
-            *((char*)grow(sizeof(char))) = j;
+            appendNumImpl(j);
         }
         void appendNum(short j) {
-            *((short*)grow(sizeof(short))) = j;
+            BOOST_STATIC_ASSERT(sizeof(short) == 2);
+            appendNumImpl(j);
         }
         void appendNum(int j) {
-            *((int*)grow(sizeof(int))) = j;
+            BOOST_STATIC_ASSERT(sizeof(int) == 4);
+            appendNumImpl(j);
         }
         void appendNum(unsigned j) {
-            *((unsigned*)grow(sizeof(unsigned))) = j;
+            appendNumImpl(j);
         }
+
+        // Bool does not have a well defined encoding.
+#if __cplusplus >= 201103L
+        void appendNum(bool j) = delete;
+#else
         void appendNum(bool j) {
-            *((bool*)grow(sizeof(bool))) = j;
+            invariant(false);
         }
+#endif
+
         void appendNum(double j) {
-            (reinterpret_cast< PackedDouble* >(grow(sizeof(double))))->d = j;
+            BOOST_STATIC_ASSERT(sizeof(double) == 8);
+            appendNumImpl(j);
         }
         void appendNum(long long j) {
-            *((long long*)grow(sizeof(long long))) = j;
+            BOOST_STATIC_ASSERT(sizeof(long long) == 8);
+            appendNumImpl(j);
         }
         void appendNum(unsigned long long j) {
-            *((unsigned long long*)grow(sizeof(unsigned long long))) = j;
+            appendNumImpl(j);
         }
 
         void appendBuf(const void *src, size_t len) {
@@ -191,7 +218,7 @@ namespace mongo {
             str.copyTo( grow(len), includeEndingNull );
         }
 
-        /** @return length of current string */
+        /** @return length of current std::string */
         int len() const { return l; }
         void setlen( int newLen ) { l = newLen; }
         /** @return size of the buffer */
@@ -209,6 +236,16 @@ namespace mongo {
         }
 
     private:
+        template<typename T>
+        void appendNumImpl(T t) {
+            // NOTE: For now, we assume that all things written
+            // by a BufBuilder are intended for external use: either written to disk
+            // or to the wire. Since all of our encoding formats are little endian,
+            // we bake that assumption in here. This decision should be revisited soon.
+            DataView(grow(sizeof(t))).writeLE(t);
+        }
+
+
         /* "slow" portion of 'grow()'  */
         void NOINLINE_DECL grow_reallocate(int newLen) {
             int a = 64;
@@ -252,16 +289,18 @@ namespace mongo {
 #define snprintf _snprintf
 #endif
 
-    /** stringstream deals with locale so this is a lot faster than std::stringstream for UTF8 */
+    /** std::stringstream deals with locale so this is a lot faster than std::stringstream for UTF8 */
     template <typename Allocator>
     class StringBuilderImpl {
     public:
-        static const size_t MONGO_DBL_SIZE = 3 + DBL_MANT_DIG - DBL_MIN_EXP;
+        // Sizes are determined based on the number of characters in 64-bit + the trailing '\0'
+        static const size_t MONGO_DBL_SIZE = 3 + DBL_MANT_DIG - DBL_MIN_EXP + 1;
         static const size_t MONGO_S32_SIZE = 12;
         static const size_t MONGO_U32_SIZE = 11;
         static const size_t MONGO_S64_SIZE = 23;
         static const size_t MONGO_U64_SIZE = 22;
         static const size_t MONGO_S16_SIZE = 7;
+        static const size_t MONGO_PTR_SIZE = 19;    // Accounts for the 0x prefix
 
         StringBuilderImpl() { }
 
@@ -289,8 +328,23 @@ namespace mongo {
         StringBuilderImpl& operator<<( short x ) {
             return SBNUM( x , MONGO_S16_SIZE , "%hd" );
         }
+        StringBuilderImpl& operator<<(const void* x) {
+            if (sizeof(x) == 8) {
+                return SBNUM(x, MONGO_PTR_SIZE, "0x%llX");
+            }
+            else {
+                return SBNUM(x, MONGO_PTR_SIZE, "0x%lX");
+            }
+        }
         StringBuilderImpl& operator<<( char c ) {
             _buf.grow( 1 )[0] = c;
+            return *this;
+        }
+        StringBuilderImpl& operator<<(const char* str) {
+            return *this << StringData(str);
+        }
+        StringBuilderImpl& operator<<(const StringData& str) {
+            append(str);
             return *this;
         }
 
@@ -311,16 +365,11 @@ namespace mongo {
 
         void append( const StringData& str ) { str.copyTo( _buf.grow( str.size() ), false ); }
 
-        StringBuilderImpl& operator<<( const StringData& str ) {
-            append( str );
-            return *this;
-        }
-
         void reset( int maxSize = 0 ) { _buf.reset( maxSize ); }
 
         std::string str() const { return std::string(_buf.data, _buf.l); }
 
-        /** size of current string */
+        /** size of current std::string */
         int len() const { return _buf.l; }
 
     private:

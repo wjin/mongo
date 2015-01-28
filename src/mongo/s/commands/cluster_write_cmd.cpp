@@ -26,6 +26,8 @@
  *    it in the license file.
  */
 
+#include "mongo/platform/basic.h"
+ 
 #include "mongo/base/init.h"
 #include "mongo/base/error_codes.h"
 #include "mongo/db/client_basic.h"
@@ -35,12 +37,18 @@
 #include "mongo/db/lasterror.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/s/client_info.h"
+#include "mongo/s/cluster_explain.h"
 #include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/batched_command_response.h"
 #include "mongo/s/write_ops/batch_upconvert.h"
 #include "mongo/db/stats/counters.h"
+#include "mongo/util/timer.h"
 
 namespace mongo {
+
+    using std::string;
+    using std::stringstream;
+    using std::vector;
 
     /**
      * Base class for mongos write commands.  Cluster write commands support batch writes and write
@@ -80,8 +88,14 @@ namespace mongo {
             return status;
         }
 
+        virtual Status explain(OperationContext* txn,
+                               const std::string& dbname,
+                               const BSONObj& cmdObj,
+                               ExplainCommon::Verbosity verbosity,
+                               BSONObjBuilder* out) const;
+
         // Cluster write command entry point.
-        bool run( const string& dbname,
+        bool run(OperationContext* txn, const string& dbname,
                   BSONObj& cmdObj,
                   int options,
                   string& errmsg,
@@ -144,7 +158,7 @@ namespace mongo {
     // Cluster write command implementation(s) below
     //
 
-    bool ClusterWriteCmd::run( const string& dbName,
+    bool ClusterWriteCmd::run(OperationContext* txn, const string& dbName,
                                BSONObj& cmdObj,
                                int options,
                                string& errMsg,
@@ -174,7 +188,7 @@ namespace mongo {
 
                 // Fixup the namespace to be a full ns internally
                 NamespaceString nss( dbName, request.getNS() );
-                request.setNS( nss.ns() );
+                request.setNSS( nss );
 
                 writer.write( request, &response );
             }
@@ -225,6 +239,52 @@ namespace mongo {
         // return response.getOk();
         result.appendElements( response.toBSON() );
         return true;
+    }
+
+    Status ClusterWriteCmd::explain(OperationContext* txn,
+                                    const std::string& dbname,
+                                    const BSONObj& cmdObj,
+                                    ExplainCommon::Verbosity verbosity,
+                                    BSONObjBuilder* out) const {
+
+        BatchedCommandRequest request(_writeType);
+
+        string errMsg;
+        if (!request.parseBSON(cmdObj, &errMsg) || !request.isValid(&errMsg)) {
+            return Status(ErrorCodes::FailedToParse, errMsg);
+        }
+
+        // Fixup the namespace to be a full ns internally
+        NamespaceString nss(dbname, request.getNS());
+        request.setNS(nss.ns());
+
+        // We can only explain write batches of size 1.
+        if (request.sizeWriteOps() != 1U) {
+            return Status(ErrorCodes::InvalidLength, "explained write batches must be of size 1");
+        }
+
+        BSONObjBuilder explainCmdBob;
+        ClusterExplain::wrapAsExplain(cmdObj, verbosity, &explainCmdBob);
+
+        // We will time how long it takes to run the commands on the shards.
+        Timer timer;
+
+        // Target the command to the shards based on the singleton batch item.
+        BatchItemRef targetingBatchItem(&request, 0);
+        vector<Strategy::CommandResult> shardResults;
+        Status status = STRATEGY->commandOpWrite(dbname,
+                                                 explainCmdBob.obj(),
+                                                 targetingBatchItem,
+                                                 &shardResults);
+        if (!status.isOK())
+            return status;
+
+        long long millisElapsed = timer.millis();
+
+        return ClusterExplain::buildExplainResult(shardResults,
+                                                  ClusterExplain::kWriteOnShards,
+                                                  millisElapsed,
+                                                  out);
     }
 
     //

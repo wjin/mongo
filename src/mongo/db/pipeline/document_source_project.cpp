@@ -26,7 +26,9 @@
  * it in the license file.
  */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
+
+#include <boost/smart_ptr.hpp>
 
 #include "mongo/db/jsobj.h"
 #include "mongo/db/pipeline/document.h"
@@ -35,6 +37,10 @@
 #include "mongo/db/pipeline/value.h"
 
 namespace mongo {
+
+    using boost::intrusive_ptr;
+    using std::string;
+    using std::vector;
 
     const char DocumentSourceProject::projectName[] = "$project";
 
@@ -70,31 +76,12 @@ namespace mongo {
         pEO->addToDocument(out, *input, _variables.get());
         _variables->clearRoot();
 
-#if defined(_DEBUG)
-        if (!_simpleProjection.getSpec().isEmpty()) {
-            // Make sure we return the same results as Projection class
-
-            BSONObj inputBson = input->toBson();
-            BSONObj outputBson = out.peek().toBson();
-
-            BSONObj projected = _simpleProjection.transform(inputBson);
-
-            if (projected != outputBson) {
-                log() << "$project applied incorrectly: " << getRaw() << endl;
-                log() << "input:  " << inputBson << endl;
-                log() << "out: " << outputBson << endl;
-                log() << "projected: " << projected << endl;
-                verify(false); // exits in _DEBUG builds
-            }
-        }
-#endif
-
         return out.freeze();
     }
 
     void DocumentSourceProject::optimize() {
         intrusive_ptr<Expression> pE(pEO->optimize());
-        pEO = dynamic_pointer_cast<ExpressionObject>(pE);
+        pEO = boost::dynamic_pointer_cast<ExpressionObject>(pE);
     }
 
     Value DocumentSourceProject::serialize(bool explain) const {
@@ -128,15 +115,6 @@ namespace mongo {
 
         BSONObj projectObj = elem.Obj();
         pProject->_raw = projectObj.getOwned();
-
-#if defined(_DEBUG)
-        if (exprObj->isSimple()) {
-            DepsTracker deps;
-            vector<string> path;
-            exprObj->addDependencies(&deps, &path);
-            pProject->_simpleProjection.init(deps.toProjection());
-        }
-#endif
 
         return pProject;
     }

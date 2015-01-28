@@ -28,6 +28,7 @@
 
 #pragma once
 
+#include <boost/scoped_ptr.hpp>
 #include <set>
 #include <vector>
 
@@ -107,7 +108,7 @@ namespace mongo {
          */
         Status targetBatch( const NSTargeter& targeter,
                             bool recordTargetErrors,
-                            vector<TargetedWriteBatch*>* targetedBatches );
+                            std::vector<TargetedWriteBatch*>* targetedBatches );
 
         /**
          * Fills a BatchCommandRequest from a TargetedWriteBatch for this BatchWriteOp.
@@ -179,7 +180,7 @@ namespace mongo {
         OwnedPointerVector<BatchedUpsertDetail> _upsertedIds;
 
         // Stats for the entire batch op
-        scoped_ptr<BatchWriteStats> _stats;
+        boost::scoped_ptr<BatchWriteStats> _stats;
     };
 
     struct BatchWriteStats {

@@ -30,6 +30,8 @@
 
 #include <deque>
 
+#include <boost/intrusive_ptr.hpp>
+
 #include "mongo/db/pipeline/value.h"
 #include "mongo/util/intrusive_counter.h"
 #include "mongo/util/timer.h"
@@ -56,18 +58,18 @@ namespace mongo {
          * @param cmdObj the command object sent from the client
          * @returns the pipeline, if created, otherwise a NULL reference
          */
-        static intrusive_ptr<Pipeline> parseCommand(
-            string& errmsg,
+        static boost::intrusive_ptr<Pipeline> parseCommand(
+            std::string& errmsg,
             const BSONObj& cmdObj,
-            const intrusive_ptr<ExpressionContext>& pCtx);
+            const boost::intrusive_ptr<ExpressionContext>& pCtx);
 
         /// Helper to implement Command::addRequiredPrivileges
         static void addRequiredPrivileges(Command* commandTemplate,
-                                          const string& dbname,
+                                          const std::string& dbname,
                                           BSONObj cmdObj,
-                                          vector<Privilege>* out);
+                                          std::vector<Privilege>* out);
 
-        intrusive_ptr<ExpressionContext> getContext() const { return pCtx; }
+        const boost::intrusive_ptr<ExpressionContext>& getContext() const { return pCtx; }
 
         /**
           Split the current Pipeline into a Pipeline for each shard, and
@@ -78,7 +80,7 @@ namespace mongo {
           @returns the Spec for the pipeline command that should be sent
             to the shards
         */
-        intrusive_ptr<Pipeline> splitForSharded();
+        boost::intrusive_ptr<Pipeline> splitForSharded();
 
         /** If the pipeline starts with a $match, return its BSON predicate.
          *  Returns empty BSON if the first stage isn't $match.
@@ -113,7 +115,7 @@ namespace mongo {
         bool isExplain() const { return explain; }
 
         /// The initial source is special since it varies between mongos and mongod.
-        void addInitialSource(intrusive_ptr<DocumentSource> source);
+        void addInitialSource(boost::intrusive_ptr<DocumentSource> source);
 
         /// The source that represents the output. Returns a non-owning pointer.
         DocumentSource* output() { invariant( !sources.empty() ); return sources.back().get(); }
@@ -122,10 +124,10 @@ namespace mongo {
         bool canRunInMongos() const;
 
         /**
-         * Write the pipeline's operators to a vector<Value>, with the
+         * Write the pipeline's operators to a std::vector<Value>, with the
          * explain flag true (for DocumentSource::serializeToArray()).
          */
-        vector<Value> writeExplainOps() const;
+        std::vector<Value> writeExplainOps() const;
         
         /**
          * Returns the dependencies needed by this pipeline.
@@ -170,7 +172,7 @@ namespace mongo {
         static const char serverPipelineName[];
         static const char mongosPipelineName[];
 
-        Pipeline(const intrusive_ptr<ExpressionContext> &pCtx);
+        Pipeline(const boost::intrusive_ptr<ExpressionContext> &pCtx);
 
         typedef std::deque<boost::intrusive_ptr<DocumentSource> > SourceContainer;
         SourceContainer sources;

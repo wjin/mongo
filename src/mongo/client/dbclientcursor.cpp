@@ -2,20 +2,34 @@
 
 /*    Copyright 2009 10gen Inc.
  *
- *    Licensed under the Apache License, Version 2.0 (the "License");
- *    you may not use this file except in compliance with the License.
- *    You may obtain a copy of the License at
+ *    This program is free software: you can redistribute it and/or  modify
+ *    it under the terms of the GNU Affero General Public License, version 3,
+ *    as published by the Free Software Foundation.
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License for more details.
  *
- *    Unless required by applicable law or agreed to in writing, software
- *    distributed under the License is distributed on an "AS IS" BASIS,
- *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *    See the License for the specific language governing permissions and
- *    limitations under the License.
+ *    You should have received a copy of the GNU Affero General Public License
+ *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
  */
 
-#include "mongo/pch.h"
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+
+#include "mongo/platform/basic.h"
 
 #include "mongo/client/dbclientcursor.h"
 
@@ -24,8 +38,16 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/s/shard.h"
 #include "mongo/s/stale_exception.h"  // for RecvStaleConfigException
+#include "mongo/util/debug_util.h"
+#include "mongo/util/exit.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
+
+    using std::auto_ptr;
+    using std::endl;
+    using std::string;
+    using std::vector;
 
     void assembleRequest( const string &ns, BSONObj query, int nToReturn, int nToSkip, const BSONObj *fieldsToReturn, int queryOptions, Message &toSend );
 
@@ -181,16 +203,16 @@ namespace mongo {
 
     void DBClientCursor::dataReceived( bool& retry, string& host ) {
 
-        QueryResult *qr = (QueryResult *) batch.m->singleData();
-        resultFlags = qr->resultFlags();
+        QueryResult::View qr = batch.m->singleData().view2ptr();
+        resultFlags = qr.getResultFlags();
 
-        if ( qr->resultFlags() & ResultFlag_ErrSet ) {
+        if ( qr.getResultFlags() & ResultFlag_ErrSet ) {
             wasError = true;
         }
 
-        if ( qr->resultFlags() & ResultFlag_CursorNotFound ) {
+        if ( qr.getResultFlags() & ResultFlag_CursorNotFound ) {
             // cursor id no longer valid at the server.
-            verify( qr->cursorId == 0 );
+            verify( qr.getCursorId() == 0 );
             cursorId = 0; // 0 indicates no longer valid (dead)
             if ( ! ( opts & QueryOption_CursorTailable ) )
                 throw UserException( 13127 , "getMore: cursor didn't exist on server, possible restart or timeout?" );
@@ -199,16 +221,16 @@ namespace mongo {
         if ( cursorId == 0 || ! ( opts & QueryOption_CursorTailable ) ) {
             // only set initially: we don't want to kill it on end of data
             // if it's a tailable cursor
-            cursorId = qr->cursorId;
+            cursorId = qr.getCursorId();
         }
 
-        batch.nReturned = qr->nReturned;
+        batch.nReturned = qr.getNReturned();
         batch.pos = 0;
-        batch.data = qr->data();
+        batch.data = qr.data();
 
         _client->checkResponse( batch.data, batch.nReturned, &retry, &host ); // watches for "not master"
 
-        if( qr->resultFlags() & ResultFlag_ShardConfigStale ) {
+        if( qr.getResultFlags() & ResultFlag_ShardConfigStale ) {
             BSONObj error;
             verify( peekError( &error ) );
             throw RecvStaleConfigException( (string)"stale config on lazy receive" + causedBy( getErrField( error ) ), error );
@@ -253,6 +275,16 @@ namespace mongo {
         BSONObj o(batch.data);
         batch.data += o.objsize();
         /* todo would be good to make data null at end of batch for safety */
+        return o;
+    }
+
+    BSONObj DBClientCursor::nextSafe() {
+        BSONObj o = next();
+        if( this->wasError && strcmp(o.firstElementFieldName(), "$err") == 0 ) {
+            std::string s = "nextSafe(): " + o.toString();
+            LOG(5) << s;
+            uasserted(13106, s);
+        }
         return o;
     }
 
@@ -325,9 +357,6 @@ namespace mongo {
     }
 
     DBClientCursor::~DBClientCursor() {
-        if (!this)
-            return;
-
         DESTRUCTOR_GUARD (
 
         if ( cursorId && _ownCursor && ! inShutdown() ) {

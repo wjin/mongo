@@ -26,34 +26,48 @@
  *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+
 #include "mongo/db/exec/projection.h"
 
-#include "mongo/db/diskloc.h"
 #include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/expression.h"
+#include "mongo/db/record_id.h"
+#include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
 
+    using std::auto_ptr;
+    using std::endl;
+    using std::vector;
+
     static const char* kIdField = "_id";
+
+    // static
+    const char* ProjectionStage::kStageType = "PROJECTION";
 
     ProjectionStage::ProjectionStage(const ProjectionStageParams& params,
                                      WorkingSet* ws,
                                      PlanStage* child)
         : _ws(ws),
           _child(child),
+          _commonStats(kStageType),
           _projImpl(params.projImpl) {
 
+        _projObj = params.projObj;
+
         if (ProjectionStageParams::NO_FAST_PATH == _projImpl) {
-            _exec.reset(new ProjectionExec(params.projObj, params.fullExpression));
+            _exec.reset(new ProjectionExec(params.projObj, 
+                                           params.fullExpression,
+                                           *params.whereCallback));
         }
         else {
             // We shouldn't need the full expression if we're fast-pathing.
             invariant(NULL == params.fullExpression);
-
-            _projObj = params.projObj;
 
             // Sanity-check the input.
             invariant(_projObj.isOwned());
@@ -179,7 +193,7 @@ namespace mongo {
 
         member->state = WorkingSetMember::OWNED_OBJ;
         member->keyData.clear();
-        member->loc = DiskLoc();
+        member->loc = RecordId();
         member->obj = bob.obj();
         return Status::OK();
     }
@@ -190,6 +204,9 @@ namespace mongo {
 
     PlanStage::StageState ProjectionStage::work(WorkingSetID* out) {
         ++_commonStats.works;
+
+        // Adds the amount of time taken by work() to executionTimeMillis.
+        ScopedTimer timer(&_commonStats.executionTimeMillis);
 
         WorkingSetID id = WorkingSet::INVALID_ID;
         StageState status = _child->work(&id);
@@ -222,34 +239,58 @@ namespace mongo {
                 *out = WorkingSetCommon::allocateStatusMember( _ws, status);
             }
         }
+        else if (PlanStage::NEED_TIME == status) {
+            _commonStats.needTime++;
+        }
         else if (PlanStage::NEED_FETCH == status) {
+            _commonStats.needFetch++;
             *out = id;
-            ++_commonStats.needFetch;
         }
 
         return status;
     }
 
-    void ProjectionStage::prepareToYield() {
+    void ProjectionStage::saveState() {
         ++_commonStats.yields;
-        _child->prepareToYield();
+        _child->saveState();
     }
 
-    void ProjectionStage::recoverFromYield() {
+    void ProjectionStage::restoreState(OperationContext* opCtx) {
         ++_commonStats.unyields;
-        _child->recoverFromYield();
+        _child->restoreState(opCtx);
     }
 
-    void ProjectionStage::invalidate(const DiskLoc& dl, InvalidationType type) {
+    void ProjectionStage::invalidate(OperationContext* txn,
+                                     const RecordId& dl,
+                                     InvalidationType type) {
         ++_commonStats.invalidates;
-        _child->invalidate(dl, type);
+        _child->invalidate(txn, dl, type);
+    }
+
+    vector<PlanStage*> ProjectionStage::getChildren() const {
+        vector<PlanStage*> children;
+        children.push_back(_child.get());
+        return children;
     }
 
     PlanStageStats* ProjectionStage::getStats() {
         _commonStats.isEOF = isEOF();
         auto_ptr<PlanStageStats> ret(new PlanStageStats(_commonStats, STAGE_PROJECTION));
+
+        ProjectionStats* projStats = new ProjectionStats(_specificStats);
+        projStats->projObj = _projObj;
+        ret->specific.reset(projStats);
+
         ret->children.push_back(_child->getStats());
         return ret.release();
+    }
+
+    const CommonStats* ProjectionStage::getCommonStats() {
+        return &_commonStats;
+    }
+
+    const SpecificStats* ProjectionStage::getSpecificStats() {
+        return &_specificStats;
     }
 
 }  // namespace mongo

@@ -40,6 +40,7 @@
 namespace mongo {
 
     using std::string;
+    using std::stringstream;
     using std::vector;
 
     /**
@@ -58,6 +59,10 @@ namespace mongo {
             return false;
         }
 
+        bool slaveOverrideOk() const {
+            return true;
+        }
+
         virtual bool isWriteCommandForConfigServer() const { return false; }
 
         void help(stringstream& ss) const {
@@ -69,16 +74,16 @@ namespace mongo {
                                     const BSONObj& cmdObj ) {
             AuthorizationSession* authzSession = client->getAuthorizationSession();
             ResourcePattern pattern = parseResourcePattern(dbname, cmdObj);
-    
+
             if (authzSession->isAuthorizedForActionsOnResource(pattern, _actionType)) {
                 return Status::OK();
             }
-    
+
             return Status(ErrorCodes::Unauthorized, "unauthorized");
         }
 
         // Cluster plan cache command entry point.
-        bool run( const std::string& dbname,
+        bool run(OperationContext* txn, const std::string& dbname,
                   BSONObj& cmdObj,
                   int options,
                   std::string& errmsg,
@@ -106,7 +111,7 @@ namespace mongo {
     // Cluster plan cache command implementation(s) below
     //
 
-    bool ClusterPlanCacheCmd::run( const std::string& dbName,
+    bool ClusterPlanCacheCmd::run(OperationContext* txn, const std::string& dbName,
                                BSONObj& cmdObj,
                                int options,
                                std::string& errMsg,

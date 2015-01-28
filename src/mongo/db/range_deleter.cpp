@@ -26,27 +26,35 @@
  *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/range_deleter.h"
 
 #include <boost/date_time/posix_time/posix_time_duration.hpp>
 #include <memory>
 
-#include "mongo/s/range_arithmetic.h"
-#include "mongo/db/range_deleter_stats.h"
+#include "mongo/db/global_environment_experiment.h"
+#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/write_concern_options.h"
 #include "mongo/util/concurrency/synchronization.h"
+#include "mongo/util/exit.h"
+#include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/time_support.h"
+#include "mongo/util/timer.h"
 
 using std::auto_ptr;
+using std::endl;
 using std::set;
 using std::pair;
 using std::string;
 
-using mongoutils::str::stream;
-
 namespace {
-    const long int NotEmptyTimeoutMillis = 200;
-    const long long int MaxCurorCheckIntervalMillis = 500;
+    const long int kNotEmptyTimeoutMillis = 200;
+    const long long int kMaxCursorCheckIntervalMillis = 500;
+    const size_t kDeleteJobsHistory = 10; // entries
 
     /**
      * Removes an element from the container that holds a pointer type, and deletes the
@@ -70,43 +78,54 @@ namespace mongo {
 
     namespace duration = boost::posix_time;
 
-    struct RangeDeleter::RangeDeleteEntry {
-        RangeDeleteEntry():
-                secondaryThrottle(true),
-                notifyDone(NULL) {
+    static void logCursorsWaiting(RangeDeleteEntry* entry) {
+
+        // We always log the first cursors waiting message (so we have cursor ids in the logs).
+        // After 15 minutes (the cursor timeout period), we start logging additional messages at
+        // a 1 minute interval.
+        static const long long kLogCursorsThresholdMillis = 15 * 60 * 1000;
+        static const long long kLogCursorsIntervalMillis = 1 * 60 * 1000;
+
+        Date_t currentTime = jsTime();
+        long long elapsedMillisSinceQueued = 0;
+
+        // We always log the first message when lastLoggedTime == 0
+        if (entry->lastLoggedTS != 0) {
+
+            if (currentTime > entry->stats.queueStartTS)
+                elapsedMillisSinceQueued = currentTime - entry->stats.queueStartTS;
+
+            // Not logging, threshold not passed
+            if (elapsedMillisSinceQueued < kLogCursorsThresholdMillis)
+                return;
+
+            long long elapsedMillisSinceLog = 0;
+            if (currentTime > entry->lastLoggedTS)
+                elapsedMillisSinceLog = currentTime - entry->lastLoggedTS;
+
+            // Not logging, logged a short time ago
+            if (elapsedMillisSinceLog < kLogCursorsIntervalMillis)
+                return;
         }
 
-        std::string ns;
-
-        // Inclusive lower range.
-        BSONObj min;
-
-        // Exclusive upper range.
-        BSONObj max;
-
-        // The key pattern of the index the range refers to.
-        // This is relevant especially with special indexes types
-        // like hash indexes.
-        BSONObj shardKeyPattern;
-
-        bool secondaryThrottle;
-
-        // Sets of cursors to wait to close until this can be ready
-        // for deletion.
-        std::set<CursorId> cursorsToWait;
-
-        // Not owned here.
-        // Important invariant: Can only be set and used by one thread.
-        Notification* notifyDone;
-
-        // For debugging only
-        BSONObj toBSON() const {
-            return BSON("ns" << ns
-                    << "min" << min
-                    << "max" << max
-                    << "notifyDoneAddr" << reinterpret_cast<long long>(notifyDone));
+        str::stream cursorList;
+        for (std::set<CursorId>::const_iterator it = entry->cursorsToWait.begin();
+            it != entry->cursorsToWait.end(); ++it) {
+            if (it != entry->cursorsToWait.begin())
+                cursorList << ", ";
+            cursorList << *it;
         }
-    };
+
+        log() << "waiting for open cursors before removing range "
+              << "[" << entry->options.range.minKey << ", " << entry->options.range.maxKey << ") "
+              << "in " << entry->options.range.ns
+              << (entry->lastLoggedTS == 0 ?
+                  string("") :
+                  string(str::stream() << ", elapsed secs: " << elapsedMillisSinceQueued / 1000))
+              << ", cursor ids: [" << string(cursorList) << "]";
+
+        entry->lastLoggedTS = currentTime;
+    }
 
     struct RangeDeleter::NSMinMax {
         NSMinMax(std::string ns, const BSONObj min, const BSONObj max):
@@ -142,7 +161,8 @@ namespace mongo {
         _stopMutex("stopRangeDeleter"),
         _stopRequested(false),
         _queueMutex("RangeDeleter"),
-        _stats(new RangeDeleterStats(&_queueMutex)) {
+        _deletesInProgress(0),
+        _statsHistoryMutex("RangeDeleterStatsHistory") {
     }
 
     RangeDeleter::~RangeDeleter() {
@@ -164,16 +184,17 @@ namespace mongo {
             delete (*it);
         }
 
-        for(NSMinMaxSet::iterator it = _blackList.begin();
-            it != _blackList.end();
+        for(std::deque<DeleteJobStats*>::iterator it = _statsHistory.begin();
+            it != _statsHistory.end();
             ++it) {
             delete (*it);
         }
+
     }
 
     void RangeDeleter::startWorkers() {
         if (!_worker) {
-            _worker.reset(new boost::thread(boost::bind(&RangeDeleter::doWork, this)));
+            _worker.reset(new boost::thread(stdx::bind(&RangeDeleter::doWork, this)));
         }
     }
 
@@ -188,27 +209,24 @@ namespace mongo {
         }
 
         scoped_lock sl(_queueMutex);
-        while (_stats->hasInProgress_inlock()) {
+        while (_deletesInProgress > 0) {
             _nothingInProgressCV.wait(sl.boost());
         }
     }
 
-    bool RangeDeleter::queueDelete(const std::string& ns,
-                                   const BSONObj& min,
-                                   const BSONObj& max,
-                                   const BSONObj& shardKeyPattern,
-                                   bool secondaryThrottle,
+    bool RangeDeleter::queueDelete(OperationContext* txn,
+                                   const RangeDeleterOptions& options,
                                    Notification* notifyDone,
                                    std::string* errMsg) {
         string dummy;
         if (errMsg == NULL) errMsg = &dummy;
 
-        auto_ptr<RangeDeleteEntry> toDelete(new RangeDeleteEntry);
-        toDelete->ns = ns;
-        toDelete->min = min.getOwned();
-        toDelete->max = max.getOwned();
-        toDelete->shardKeyPattern = shardKeyPattern.getOwned();
-        toDelete->secondaryThrottle = secondaryThrottle;
+        const string& ns(options.range.ns);
+        const BSONObj& min(options.range.minKey);
+        const BSONObj& max(options.range.maxKey);
+
+        auto_ptr<RangeDeleteEntry> toDelete(
+                new RangeDeleteEntry(options));
         toDelete->notifyDone = notifyDone;
 
         {
@@ -222,24 +240,27 @@ namespace mongo {
                 return false;
             }
 
-            _deleteSet.insert(new NSMinMax(ns, min, max));
-            _stats->incTotalDeletes_inlock();
-            _stats->incPendingDeletes_inlock();
+            _deleteSet.insert(new NSMinMax(ns, min.getOwned(), max.getOwned()));
         }
 
-        _env->getCursorIds(ns, &toDelete->cursorsToWait);
+        if (options.waitForOpenCursors) {
+            _env->getCursorIds(txn, ns, &toDelete->cursorsToWait);
+        }
+
+        toDelete->stats.queueStartTS = jsTime();
+
+        if (!toDelete->cursorsToWait.empty())
+            logCursorsWaiting(toDelete.get());
 
         {
             scoped_lock sl(_queueMutex);
 
             if (toDelete->cursorsToWait.empty()) {
+                toDelete->stats.queueEndTS = jsTime();
                 _taskQueue.push_back(toDelete.release());
                 _taskQueueNotEmptyCV.notify_one();
             }
             else {
-                log() << "rangeDeleter waiting for " << toDelete->cursorsToWait.size()
-                      << " cursors in " << ns << " to finish" << endl;
-
                 _notReadyQueue.push_back(toDelete.release());
             }
         }
@@ -247,11 +268,43 @@ namespace mongo {
         return true;
     }
 
-    bool RangeDeleter::deleteNow(const std::string& ns,
-                                 const BSONObj& min,
-                                 const BSONObj& max,
-                                 const BSONObj& shardKeyPattern,
-                                 bool secondaryThrottle,
+namespace {
+    const int kWTimeoutMillis = 60 * 60 * 1000;
+
+    bool _waitForMajority(OperationContext* txn, std::string* errMsg) {
+        const WriteConcernOptions writeConcern("majority",
+                                               WriteConcernOptions::NONE,
+                                               kWTimeoutMillis);
+
+        repl::ReplicationCoordinator::StatusAndDuration replStatus =
+                repl::getGlobalReplicationCoordinator()->awaitReplicationOfLastOpForClient(
+                        txn, writeConcern);
+        repl::ReplicationCoordinator::Milliseconds elapsedTime = replStatus.duration;
+        if (replStatus.status.code() == ErrorCodes::ExceededTimeLimit) {
+            *errMsg = str::stream() << "rangeDeleter timed out after "
+                                    << elapsedTime.total_seconds() << " seconds while waiting"
+                                    << " for deletions to be replicated to majority nodes";
+            log() << *errMsg;
+        }
+        else if (replStatus.status.code() == ErrorCodes::NotMaster) {
+            *errMsg = str::stream() << "rangeDeleter no longer PRIMARY after "
+                                    << elapsedTime.total_seconds() << " seconds while waiting"
+                                    << " for deletions to be replicated to majority nodes";
+        }
+        else {
+            LOG(elapsedTime.total_seconds() < 30 ? 1 : 0)
+                << "rangeDeleter took " << elapsedTime.total_seconds() << " seconds "
+                << " waiting for deletes to be replicated to majority nodes";
+
+            fassert(18512, replStatus.status);
+        }
+
+        return replStatus.status.isOK();
+    }
+}
+
+    bool RangeDeleter::deleteNow(OperationContext* txn,
+                                 const RangeDeleterOptions& options,
                                  string* errMsg) {
         if (stopRequested()) {
             *errMsg = "deleter is already stopped.";
@@ -261,6 +314,10 @@ namespace mongo {
         string dummy;
         if (errMsg == NULL) errMsg = &dummy;
 
+        const string& ns(options.range.ns);
+        const BSONObj& min(options.range.minKey);
+        const BSONObj& max(options.range.maxKey);
+
         NSMinMax deleteRange(ns, min, max);
         {
             scoped_lock sl(_queueMutex);
@@ -269,27 +326,29 @@ namespace mongo {
             }
 
             _deleteSet.insert(&deleteRange);
-            _stats->incTotalDeletes_inlock();
 
             // Note: count for pending deletes is an integral part of the shutdown story.
             // Therefore, to simplify things, there is no "pending" state for deletes in
             // deleteNow, the state transition is simply inProgress -> done.
-            _stats->incInProgressDeletes_inlock();
+            _deletesInProgress++;
         }
 
         set<CursorId> cursorsToWait;
-        _env->getCursorIds(ns, &cursorsToWait);
+        if (options.waitForOpenCursors) {
+            _env->getCursorIds(txn, ns, &cursorsToWait);
+        }
 
         long long checkIntervalMillis = 5;
 
-        if (!cursorsToWait.empty()) {
-            log() << "rangeDeleter waiting for " << cursorsToWait.size()
-                  << " cursors in " << ns << " to finish" << endl;
-        }
+        RangeDeleteEntry taskDetails(options);
+        taskDetails.stats.queueStartTS = jsTime();
 
-        while (!cursorsToWait.empty()) {
+        for (; !cursorsToWait.empty(); sleepmillis(checkIntervalMillis)) {
+
+            logCursorsWaiting(&taskDetails);
+
             set<CursorId> cursorsNow;
-            _env->getCursorIds(ns, &cursorsNow);
+            _env->getCursorIds(txn, ns, &cursorsNow);
 
             set<CursorId> cursorsLeft;
             std::set_intersection(cursorsToWait.begin(),
@@ -306,80 +365,59 @@ namespace mongo {
                 scoped_lock sl(_queueMutex);
                 _deleteSet.erase(&deleteRange);
 
-                _stats->decInProgressDeletes_inlock();
-                _stats->decTotalDeletes_inlock();
+                _deletesInProgress--;
 
-                if (!_stats->hasInProgress_inlock()) {
+                if (_deletesInProgress == 0) {
                     _nothingInProgressCV.notify_one();
                 }
 
                 return false;
             }
 
-            if (checkIntervalMillis < MaxCurorCheckIntervalMillis) {
+            if (checkIntervalMillis < kMaxCursorCheckIntervalMillis) {
                 checkIntervalMillis *= 2;
             }
-
-            sleepmillis(checkIntervalMillis);
         }
+        taskDetails.stats.queueEndTS = jsTime();
 
-        bool result = _env->deleteRange(ns, min, max, shardKeyPattern,
-                                        secondaryThrottle, errMsg);
+        taskDetails.stats.deleteStartTS = jsTime();
+        bool result = _env->deleteRange(txn,
+                                        taskDetails,
+                                        &taskDetails.stats.deletedDocCount,
+                                        errMsg);
+
+        taskDetails.stats.deleteEndTS = jsTime();
+
+        if (result) {
+            taskDetails.stats.waitForReplStartTS = jsTime();
+            result = _waitForMajority(txn, errMsg);
+            taskDetails.stats.waitForReplEndTS = jsTime();
+        }
 
         {
             scoped_lock sl(_queueMutex);
             _deleteSet.erase(&deleteRange);
 
-            _stats->decInProgressDeletes_inlock();
-            _stats->decTotalDeletes_inlock();
+            _deletesInProgress--;
 
-            if (!_stats->hasInProgress_inlock()) {
+            if (_deletesInProgress == 0) {
                 _nothingInProgressCV.notify_one();
             }
         }
 
+        recordDelStats(new DeleteJobStats(taskDetails.stats));
         return result;
     }
 
-    bool RangeDeleter::addToBlackList(const StringData& ns,
-                                      const BSONObj& min,
-                                      const BSONObj& max,
-                                      std::string* errMsg) {
-        string dummy;
-        if (errMsg == NULL) errMsg = &dummy;
+    void RangeDeleter::getStatsHistory(std::vector<DeleteJobStats*>* stats) const {
+        stats->clear();
+        stats->reserve(kDeleteJobsHistory);
 
-        scoped_lock sl(_queueMutex);
-
-        if (isBlacklisted_inlock(ns, min, max, errMsg)) {
-            return false;
+        scoped_lock sl(_statsHistoryMutex);
+        for (std::deque<DeleteJobStats*>::const_iterator it = _statsHistory.begin();
+                it != _statsHistory.end(); ++it) {
+            stats->push_back(new DeleteJobStats(**it));
         }
-
-        for (NSMinMaxSet::const_iterator iter = _deleteSet.begin();
-                iter != _deleteSet.end(); ++iter) {
-            const NSMinMax* const entry = *iter;
-            if (entry->ns == ns && rangeOverlaps(entry->min, entry->max, min, max)) {
-                *errMsg = stream() << "Cannot black list ns: " << ns
-                        << ", min: " << min
-                        << ", max: " << max
-                        << " since it is already queued for deletion.";
-                return false;
-            }
-        }
-
-        _blackList.insert(new NSMinMax(ns.toString(), min, max));
-        return true;
-    }
-
-    bool RangeDeleter::removeFromBlackList(const StringData& ns,
-                                           const BSONObj& min,
-                                           const BSONObj& max) {
-        scoped_lock sl(_queueMutex);
-        NSMinMax entry(ns.toString(), min, max);
-        return deletePtrElement(&_blackList, &entry);
-    }
-
-    const RangeDeleterStats* RangeDeleter::getStats() const {
-        return _stats.get();
     }
 
     BSONObj RangeDeleter::toBSON() const {
@@ -410,13 +448,15 @@ namespace mongo {
         while (!inShutdown() && !stopRequested()) {
             string errMsg;
 
+            boost::scoped_ptr<OperationContext> txn(getGlobalEnvironment()->newOpCtx());
+
             RangeDeleteEntry* nextTask = NULL;
 
             {
                 scoped_lock sl(_queueMutex);
                 while (_taskQueue.empty()) {
                     _taskQueueNotEmptyCV.timed_wait(
-                        sl.boost(), duration::milliseconds(NotEmptyTimeoutMillis));
+                        sl.boost(), duration::milliseconds(kNotEmptyTimeoutMillis));
 
                     if (stopRequested()) {
                         log() << "stopping range deleter worker" << endl;
@@ -432,7 +472,13 @@ namespace mongo {
                             RangeDeleteEntry* entry = *iter;
 
                             set<CursorId> cursorsNow;
-                            _env->getCursorIds(entry->ns, &cursorsNow);
+                            {
+                                if (entry->options.waitForOpenCursors) {
+                                    _env->getCursorIds(txn.get(),
+                                                       entry->options.range.ns,
+                                                       &cursorsNow);
+                                }
+                            }
 
                             set<CursorId> cursorsLeft;
                             std::set_intersection(entry->cursorsToWait.begin(),
@@ -445,11 +491,13 @@ namespace mongo {
                             entry->cursorsToWait.swap(cursorsLeft);
 
                             if (entry->cursorsToWait.empty()) {
+                               (*iter)->stats.queueEndTS = jsTime();
                                 _taskQueue.push_back(*iter);
                                 _taskQueueNotEmptyCV.notify_one();
                                 iter = _notReadyQueue.erase(iter);
                             }
                             else {
+                                logCursorsWaiting(entry);
                                 ++iter;
                             }
                         }
@@ -464,75 +512,61 @@ namespace mongo {
                 nextTask = _taskQueue.front();
                 _taskQueue.pop_front();
 
-                _stats->decPendingDeletes_inlock();
-                _stats->incInProgressDeletes_inlock();
+                _deletesInProgress++;
             }
 
-            if (!_env->deleteRange(nextTask->ns,
-                                   nextTask->min,
-                                   nextTask->max,
-                                   nextTask->shardKeyPattern,
-                                   nextTask->secondaryThrottle,
-                                   &errMsg)) {
-                warning() << "Error encountered while trying to delete range: "
-                          << errMsg << endl;
+            {
+                nextTask->stats.deleteStartTS = jsTime();
+                bool delResult = _env->deleteRange(txn.get(),
+                                                   *nextTask,
+                                                   &nextTask->stats.deletedDocCount,
+                                                   &errMsg);
+                nextTask->stats.deleteEndTS = jsTime();
+
+                if (delResult) {
+                    nextTask->stats.waitForReplStartTS = jsTime();
+
+                    if (!_waitForMajority(txn.get(), &errMsg)) {
+                        warning() << "Error encountered while waiting for replication: " << errMsg;
+                    }
+
+                    nextTask->stats.waitForReplEndTS = jsTime();
+                }
+                else {
+                    warning() << "Error encountered while trying to delete range: "
+                              << errMsg << endl;
+                }
             }
 
             {
                 scoped_lock sl(_queueMutex);
 
-                NSMinMax setEntry(nextTask->ns, nextTask->min, nextTask->max);
+                NSMinMax setEntry(nextTask->options.range.ns,
+                                  nextTask->options.range.minKey,
+                                  nextTask->options.range.maxKey);
                 deletePtrElement(&_deleteSet, &setEntry);
-                _stats->decInProgressDeletes_inlock();
-                _stats->decTotalDeletes_inlock();
+                _deletesInProgress--;
 
                 if (nextTask->notifyDone) {
                     nextTask->notifyDone->notifyOne();
                 }
-
-                delete nextTask;
-                nextTask = NULL;
             }
+
+            recordDelStats(new DeleteJobStats(nextTask->stats));
+            delete nextTask;
+            nextTask = NULL;
         }
-    }
-
-    bool RangeDeleter::isBlacklisted_inlock(const StringData& ns,
-                                            const BSONObj& min,
-                                            const BSONObj& max,
-                                            std::string* errMsg) const {
-        for (NSMinMaxSet::const_iterator iter = _blackList.begin();
-                iter != _blackList.end(); ++iter) {
-            const NSMinMax* const entry = *iter;
-            if (ns != entry->ns) continue;
-
-            if (rangeOverlaps(min, max, entry->min, entry->max)) {
-                *errMsg = stream() << "ns: " << ns
-                        << ", min: " << min
-                        << ", max: " << max
-                        << " intersects with black list"
-                        << " min: " << entry->min
-                        << ", max: " << entry->max;
-                return true;
-            }
-        }
-
-        return false;
     }
 
     bool RangeDeleter::canEnqueue_inlock(const StringData& ns,
                                          const BSONObj& min,
                                          const BSONObj& max,
                                          string* errMsg) const {
-        if (isBlacklisted_inlock(ns, min, max, errMsg)) {
-            return false;
-        }
 
         NSMinMax toDelete(ns.toString(), min, max);
         if (_deleteSet.count(&toDelete) > 0) {
-            *errMsg = stream() << "ns: " << ns
-                    << ", min: " << min
-                    << ", max: " << max
-                    << " is already being processed for deletion.";
+            *errMsg = str::stream() << "ns: " << ns << ", min: " << min << ", max: " << max
+                                    << " is already being processed for deletion.";
             return false;
         }
 
@@ -542,6 +576,60 @@ namespace mongo {
     bool RangeDeleter::stopRequested() const {
         scoped_lock sl(_stopMutex);
         return _stopRequested;
+    }
+
+    size_t RangeDeleter::getTotalDeletes() const {
+        scoped_lock sl(_queueMutex);
+        return _deleteSet.size();
+    }
+
+    size_t RangeDeleter::getPendingDeletes() const {
+        scoped_lock sl(_queueMutex);
+        return _notReadyQueue.size() + _taskQueue.size();
+    }
+
+    size_t RangeDeleter::getDeletesInProgress() const {
+        scoped_lock sl(_queueMutex);
+        return _deletesInProgress;
+    }
+
+    void RangeDeleter::recordDelStats(DeleteJobStats* newStat) {
+        scoped_lock sl(_statsHistoryMutex);
+        if (_statsHistory.size() == kDeleteJobsHistory) {
+            delete _statsHistory.front();
+            _statsHistory.pop_front();
+        }
+
+        _statsHistory.push_back(newStat);
+    }
+
+    RangeDeleteEntry::RangeDeleteEntry(const RangeDeleterOptions& options)
+        : options(options),
+          notifyDone(NULL),
+          lastLoggedTS(0) {
+    }
+
+    BSONObj RangeDeleteEntry::toBSON() const {
+        BSONObjBuilder builder;
+        builder.append("ns", options.range.ns);
+        builder.append("min", options.range.minKey);
+        builder.append("max", options.range.maxKey);
+        BSONArrayBuilder cursorBuilder(builder.subarrayStart("cursors"));
+
+        for (std::set<CursorId>::const_iterator it = cursorsToWait.begin();
+                it != cursorsToWait.end(); ++it) {
+            cursorBuilder.append((long long)*it);
+        }
+        cursorBuilder.doneFast();
+
+        return builder.done().copy();
+    }
+
+    RangeDeleterOptions::RangeDeleterOptions(const KeyRange& range)
+        : range(range),
+          fromMigrate(false),
+          onlyRemoveOrphanedDocs(false),
+          waitForOpenCursors(false) {
     }
 
 }

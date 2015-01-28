@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2013 MongoDB Inc.
+ *    Copyright (C) 2013-2014 MongoDB Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -15,39 +15,53 @@
  */
 
 /**
- * This file tests db/exec/oplogstart.{h,cpp}. OplogStart is a planner stage
- * used by an InternalRunner. It is responsible for walking the oplog
- * backwards in order to find where the oplog should be replayed from for
- * replication.
+ * This file tests db/exec/oplogstart.{h,cpp}. OplogStart is an execution stage
+ * responsible for walking the oplog backwards in order to find where the oplog should
+ * be replayed from for replication.
  */
 
 #include "mongo/dbtests/dbtests.h"
 
+#include <boost/scoped_ptr.hpp>
+
 #include "mongo/db/db.h"
+#include "mongo/db/dbdirectclient.h"
 #include "mongo/db/exec/oplogstart.h"
 #include "mongo/db/exec/working_set.h"
+#include "mongo/db/global_environment_experiment.h"
 #include "mongo/db/query/canonical_query.h"
-#include "mongo/db/query/internal_runner.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/repl_settings.h"
-#include "mongo/db/storage/mmap_v1/dur_transaction.h"
+#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/catalog/collection.h"
 
 namespace OplogStartTests {
 
+    using boost::scoped_ptr;
+    using std::string;
+
     class Base {
     public:
-        Base() : _context(ns()) {
-            DurTransaction txn;
-            Collection* c = _context.db()->getCollection(&txn, ns());
+        Base() : _txn(),
+                 _scopedXact(&_txn, MODE_X),
+                 _lk(_txn.lockState()),
+                 _wunit(&_txn),
+                 _context(&_txn, ns()),
+                 _client(&_txn) {
+
+            Collection* c = _context.db()->getCollection(ns());
             if (!c) {
-                c = _context.db()->createCollection(&txn, ns());
+                c = _context.db()->createCollection(&_txn, ns());
             }
-            c->getIndexCatalog()->ensureHaveIdIndex(&txn);
+            ASSERT(c->getIndexCatalog()->haveIdIndex(&_txn));
         }
 
         ~Base() {
             client()->dropCollection(ns());
+            _wunit.commit();
+
+            // The OplogStart stage is not allowed to outlive it's RecoveryUnit.
+            _stage.reset();
         }
 
     protected:
@@ -65,7 +79,7 @@ namespace OplogStartTests {
             return _context.db()->getCollection( ns() );
         }
 
-        DBDirectClient *client() const { return &_client; }
+        DBDirectClient* client() { return &_client; }
 
         void setupFromQuery(const BSONObj& query) {
             CanonicalQuery* cq;
@@ -73,7 +87,7 @@ namespace OplogStartTests {
             ASSERT(s.isOK());
             _cq.reset(cq);
             _oplogws.reset(new WorkingSet());
-            _stage.reset(new OplogStart(collection(), _cq->root(), _oplogws.get()));
+            _stage.reset(new OplogStart(&_txn, collection(), _cq->root(), _oplogws.get()));
         }
 
         void assertWorkingSetMemberHasId(WorkingSetID id, int expectedId) {
@@ -89,14 +103,16 @@ namespace OplogStartTests {
         scoped_ptr<OplogStart> _stage;
 
     private:
-        Lock::GlobalWrite lk;
+        // The order of these is important in order to ensure order of destruction
+        OperationContextImpl _txn;
+        ScopedTransaction _scopedXact;
+        Lock::GlobalWrite _lk;
+        WriteUnitOfWork _wunit;
         Client::Context _context;
 
-        static DBDirectClient _client;
+        DBDirectClient _client;
     };
 
-    // static
-    DBDirectClient Base::_client;
 
     /**
      * When the ts is newer than the oldest document, the OplogStart
@@ -347,15 +363,22 @@ namespace OplogStartTests {
         void setupTests() {
             add< OplogStartIsOldest >();
             add< OplogStartIsNewest >();
-            add< OplogStartIsNewestExtentHop >();
-            add< OplogStartOneEmptyExtent >();
-            add< OplogStartTwoEmptyExtents >();
-            add< OplogStartTwoFullExtents >();
-            add< OplogStartThreeFullOneEmpty >();
-            add< OplogStartOneFullExtent >();
-            add< OplogStartFirstExtentEmpty >();
-            add< OplogStartEOF >();
+
+            // These tests rely on extent allocation details specific to mmapv1.
+            // TODO figure out a way to generically test this.
+            if (getGlobalEnvironment()->getGlobalStorageEngine()->isMmapV1()) {
+                add< OplogStartIsNewestExtentHop >();
+                add< OplogStartOneEmptyExtent >();
+                add< OplogStartTwoEmptyExtents >();
+                add< OplogStartTwoFullExtents >();
+                add< OplogStartThreeFullOneEmpty >();
+                add< OplogStartOneFullExtent >();
+                add< OplogStartFirstExtentEmpty >();
+                add< OplogStartEOF >();
+            }
         }
-    } oplogStart;
+    };
+
+    SuiteInstance<All> oplogStart;
 
 } // namespace OplogStartTests

@@ -28,39 +28,57 @@
  *    it in the license file.
  */
 
-#include "mongo/pch.h"
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+
+#include "mongo/platform/basic.h"
 
 #include "mongo/db/commands/mr.h"
+
+#include <boost/scoped_ptr.hpp>
 
 #include "mongo/client/connpool.h"
 #include "mongo/client/parallel.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/db.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/instance.h"
-#include "mongo/db/matcher.h"
-#include "mongo/db/query/get_runner.h"
+#include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/matcher/matcher.h"
+#include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/query_planner.h"
-#include "mongo/db/repl/is_master.h"
 #include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/range_preserver.h"
-#include "mongo/db/storage/mmap_v1/dur_transaction.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/storage_options.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/s/collection_metadata.h"
-#include "mongo/s/d_logic.h"
+#include "mongo/s/d_state.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/shard_key_pattern.h"
 #include "mongo/s/stale_exception.h"
+#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
 
+    using boost::scoped_ptr;
+    using std::auto_ptr;
+    using std::endl;
+    using std::set;
+    using std::string;
+    using std::stringstream;
+    using std::vector;
+
     namespace mr {
 
-        AtomicUInt Config::JOB_NUMBER;
+        AtomicUInt32 Config::JOB_NUMBER;
 
         JSFunction::JSFunction( const std::string& type , const BSONElement& e ) {
             _type = type;
@@ -242,7 +260,7 @@ namespace mongo {
         Config::Config( const string& _dbname , const BSONObj& cmdObj )
         {
             dbname = _dbname;
-            ns = dbname + "." + cmdObj.firstElement().valuestr();
+            ns = dbname + "." + cmdObj.firstElement().valuestrsafe();
 
             verbose = cmdObj["verbose"].trueValue();
             jsMode = cmdObj["jsMode"].trueValue();
@@ -272,7 +290,7 @@ namespace mongo {
                         << ".tmp.mr."
                         << cmdObj.firstElement().String()
                         << "_"
-                        << JOB_NUMBER++;
+                        << JOB_NUMBER.fetchAndAdd(1);
                 incLong = tempNamespace + "_inc";
             }
 
@@ -319,11 +337,23 @@ namespace mongo {
          * Clean up the temporary and incremental collections
          */
         void State::dropTempCollections() {
+            // Dropping the tempNamespace must be logged as that collection is replicated.
             _db.dropCollection(_config.tempNamespace);
             // Always forget about temporary namespaces, so we don't cache lots of them
             ShardConnection::forgetNS( _config.tempNamespace );
             if (_useIncremental) {
-                _db.dropCollection(_config.incLong);
+                // We don't want to log the deletion of incLong as it isn't replicated. While
+                // harmless, this would lead to a scary looking warning on the secondaries.
+                ScopedTransaction scopedXact(_txn, MODE_IX);
+                Lock::DBLock lk(_txn->lockState(),
+                                nsToDatabaseSubstring(_config.incLong),
+                                MODE_X);
+                if (Database* db = dbHolder().get(_txn, _config.incLong)) {
+                    WriteUnitOfWork wunit(_txn);
+                    db->dropCollection(_txn, _config.incLong);
+                    wunit.commit();
+                }
+
                 ShardConnection::forgetNS( _config.incLong );
             }
 
@@ -339,44 +369,38 @@ namespace mongo {
             dropTempCollections();
             if (_useIncremental) {
                 // Create the inc collection and make sure we have index on "0" key.
-                Client::WriteContext incCtx( _config.incLong );
-                Collection* incColl = incCtx.ctx().db()->getCollection( _txn, _config.incLong );
-                if ( !incColl ) {
-                    CollectionOptions options;
-                    options.setNoIdIndex();
-                    options.temp = true;
-                    incColl = incCtx.ctx().db()->createCollection( _txn, _config.incLong, options );
+                // Intentionally not replicating the inc collection to secondaries.
+                Client::WriteContext incCtx(_txn, _config.incLong);
+                WriteUnitOfWork wuow(_txn);
+                Collection* incColl = incCtx.getCollection();
+                invariant(!incColl);
 
-                    // Log the createCollection operation.
-                    BSONObjBuilder b;
-                    b.append( "create", nsToCollectionSubstring( _config.incLong ));
-                    b.appendElements( options.toBSON() );
-                    string logNs = nsToDatabase( _config.incLong ) + ".$cmd";
-                    logOp( _txn, "c", logNs.c_str(), b.obj() );
-                }
+                CollectionOptions options;
+                options.setNoIdIndex();
+                options.temp = true;
+                incColl = incCtx.db()->createCollection(_txn, _config.incLong, options);
+                invariant(incColl);
 
                 BSONObj indexSpec = BSON( "key" << BSON( "0" << 1 ) << "ns" << _config.incLong
                                           << "name" << "_temp_0" );
-                Status status = incColl->getIndexCatalog()->createIndex(_txn, indexSpec, false);
-                // Log the createIndex operation.
-                string logNs = nsToDatabase( _config.incLong ) + ".system.indexes";
-                logOp( _txn, "i", logNs.c_str(), indexSpec );
+                Status status = incColl->getIndexCatalog()->createIndexOnEmptyCollection(_txn,
+                                                                                         indexSpec);
                 if ( !status.isOK() ) {
                     uasserted( 17305 , str::stream() << "createIndex failed for mr incLong ns: " <<
                             _config.incLong << " err: " << status.code() );
                 }
+                wuow.commit();
             }
 
             vector<BSONObj> indexesToInsert;
 
             {
                 // copy indexes into temporary storage
-                Client::WriteContext finalCtx( _config.outputOptions.finalNamespace );
-                Collection* finalColl =
-                    finalCtx.ctx().db()->getCollection( _config.outputOptions.finalNamespace );
+                Client::WriteContext finalCtx(_txn, _config.outputOptions.finalNamespace);
+                Collection* const finalColl = finalCtx.getCollection();
                 if ( finalColl ) {
                     IndexCatalog::IndexIterator ii =
-                        finalColl->getIndexCatalog()->getIndexIterator( true );
+                        finalColl->getIndexCatalog()->getIndexIterator( _txn, true );
                     // Iterate over finalColl's indexes.
                     while ( ii.more() ) {
                         IndexDescriptor* currIndex = ii.next();
@@ -399,28 +423,40 @@ namespace mongo {
 
             {
                 // create temp collection and insert the indexes from temporary storage
-                Client::WriteContext tempCtx( _config.tempNamespace );
-                Collection* tempColl = tempCtx.ctx().db()->getCollection( _txn, _config.tempNamespace );
-                if ( !tempColl ) {
-                    CollectionOptions options;
-                    options.temp = true;
-                    tempColl = tempCtx.ctx().db()->createCollection( _txn, _config.tempNamespace, options );
+                Client::WriteContext tempCtx(_txn, _config.tempNamespace);
+                WriteUnitOfWork wuow(_txn);
+                uassert(ErrorCodes::NotMaster, "no longer master", 
+                        repl::getGlobalReplicationCoordinator()->
+                        canAcceptWritesForDatabase(nsToDatabase(_config.tempNamespace.c_str())));
+                Collection* tempColl = tempCtx.getCollection();
+                invariant(!tempColl);
 
-                    // Log the createCollection operation.
-                    BSONObjBuilder b;
-                    b.append( "create", nsToCollectionSubstring( _config.tempNamespace ));
-                    b.appendElements( options.toBSON() );
-                    string logNs = nsToDatabase( _config.tempNamespace ) + ".$cmd";
-                    logOp( _txn, "c", logNs.c_str(), b.obj() );
-                }
+                CollectionOptions options;
+                options.temp = true;
+                tempColl = tempCtx.db()->createCollection(_txn, _config.tempNamespace, options);
+
+                // Log the createCollection operation.
+                BSONObjBuilder b;
+                b.append( "create", nsToCollectionSubstring( _config.tempNamespace ));
+                b.appendElements( options.toBSON() );
+                string logNs = nsToDatabase( _config.tempNamespace ) + ".$cmd";
+                repl::logOp(_txn, "c", logNs.c_str(), b.obj());
 
                 for ( vector<BSONObj>::iterator it = indexesToInsert.begin();
                         it != indexesToInsert.end(); ++it ) {
-                    tempColl->getIndexCatalog()->createIndex(_txn, *it, false );
+                    Status status =
+                        tempColl->getIndexCatalog()->createIndexOnEmptyCollection(_txn, *it);
+                    if (!status.isOK()) {
+                        if (status.code() == ErrorCodes::IndexAlreadyExists) {
+                            continue;
+                        }
+                        uassertStatusOK(status);
+                    }
                     // Log the createIndex operation.
                     string logNs = nsToDatabase( _config.tempNamespace ) + ".system.indexes";
-                    logOp( _txn, "i", logNs.c_str(), *it );
+                    repl::logOp(_txn, "i", logNs.c_str(), *it);
                 }
+                wuow.commit();
             }
 
         }
@@ -502,14 +538,20 @@ namespace mongo {
          * Does post processing on output collection.
          * This may involve replacing, merging or reducing.
          */
-        long long State::postProcessCollection(CurOp* op, ProgressMeterHolder& pm) {
+        long long State::postProcessCollection(
+                                OperationContext* txn, CurOp* op, ProgressMeterHolder& pm) {
+
             if ( _onDisk == false || _config.outputOptions.outType == Config::INMEMORY )
                 return numInMemKeys();
 
             if (_config.outputOptions.outNonAtomic)
-                return postProcessCollectionNonAtomic(op, pm);
-            Lock::GlobalWrite lock; // TODO(erh): this is how it was, but seems it doesn't need to be global
-            return postProcessCollectionNonAtomic(op, pm);
+                return postProcessCollectionNonAtomic(txn, op, pm);
+
+            invariant( !txn->lockState()->isLocked() );
+
+            ScopedTransaction transaction(txn, MODE_X);
+            Lock::GlobalWrite lock(txn->lockState()); // TODO(erh): this is how it was, but seems it doesn't need to be global
+            return postProcessCollectionNonAtomic(txn, op, pm);
         }
 
         //
@@ -537,14 +579,17 @@ namespace mongo {
         // End SERVER-6116
         //
 
-        long long State::postProcessCollectionNonAtomic(CurOp* op, ProgressMeterHolder& pm) {
+        long long State::postProcessCollectionNonAtomic(
+                                OperationContext* txn, CurOp* op, ProgressMeterHolder& pm) {
 
             if ( _config.outputOptions.finalNamespace == _config.tempNamespace )
                 return _safeCount( _db, _config.outputOptions.finalNamespace );
 
             if (_config.outputOptions.outType == Config::REPLACE ||
                     _safeCount(_db, _config.outputOptions.finalNamespace) == 0) {
-                Lock::GlobalWrite lock; // TODO(erh): why global???
+
+                ScopedTransaction transaction(txn, MODE_X);
+                Lock::GlobalWrite lock(txn->lockState()); // TODO(erh): why global???
                 // replace: just rename from temp to final collection name, dropping previous collection
                 _db.dropCollection( _config.outputOptions.finalNamespace );
                 BSONObj info;
@@ -564,12 +609,14 @@ namespace mongo {
                 op->setMessage("m/r: merge post processing",
                                "M/R Merge Post Processing Progress",
                                _safeCount(_db, _config.tempNamespace, BSONObj()));
-                auto_ptr<DBClientCursor> cursor = _db.query( _config.tempNamespace , BSONObj() );
-                while ( cursor->more() ) {
-                    Lock::DBWrite lock( _config.outputOptions.finalNamespace );
+                auto_ptr<DBClientCursor> cursor = _db.query(_config.tempNamespace , BSONObj());
+                while (cursor->more()) {
+                    ScopedTransaction scopedXact(_txn, MODE_IX);
+                    Lock::DBLock lock(_txn->lockState(),
+                                      nsToDatabaseSubstring(_config.outputOptions.finalNamespace),
+                                      MODE_X);
                     BSONObj o = cursor->nextSafe();
                     Helpers::upsert( _txn, _config.outputOptions.finalNamespace , o );
-                    _txn->commitIfNeeded();
                     pm.hit();
                 }
                 _db.dropCollection( _config.tempNamespace );
@@ -584,15 +631,18 @@ namespace mongo {
                                _safeCount(_db, _config.tempNamespace, BSONObj()));
                 auto_ptr<DBClientCursor> cursor = _db.query( _config.tempNamespace , BSONObj() );
                 while ( cursor->more() ) {
-                    Lock::GlobalWrite lock; // TODO(erh) why global?
+                    ScopedTransaction transaction(txn, MODE_X);
+                    Lock::GlobalWrite lock(txn->lockState()); // TODO(erh) why global?
                     BSONObj temp = cursor->nextSafe();
                     BSONObj old;
 
                     bool found;
                     {
-                        Client::Context tx( _config.outputOptions.finalNamespace );
-                        Collection* coll = tx.db()->getCollection( _config.outputOptions.finalNamespace );
-                        found = Helpers::findOne(coll,
+                        Client::Context tx(txn, _config.outputOptions.finalNamespace);
+                        Collection* coll =
+                            tx.db()->getCollection(_config.outputOptions.finalNamespace);
+                        found = Helpers::findOne(_txn,
+                                                 coll,
                                                  temp["_id"].wrap(),
                                                  old,
                                                  true);
@@ -611,7 +661,6 @@ namespace mongo {
                     else {
                         Helpers::upsert( _txn, _config.outputOptions.finalNamespace , temp );
                     }
-                    _txn->commitIfNeeded();
                     pm.hit();
                 }
                 pm.finished();
@@ -621,51 +670,47 @@ namespace mongo {
         }
 
         /**
-         * Insert doc in collection
+         * Insert doc in collection. This should be replicated.
          */
         void State::insert( const string& ns , const BSONObj& o ) {
             verify( _onDisk );
 
-            Client::WriteContext ctx( ns );
-            Collection* coll = ctx.ctx().db()->getCollection( ns );
-            if ( !coll )
-                uasserted(13630, str::stream() << "attempted to insert into nonexistent" <<
-                                                  " collection during a mr operation." <<
-                                                  " collection expected: " << ns );
 
-            class BSONObjBuilder b;
+            Client::WriteContext ctx(_txn,  ns );
+            WriteUnitOfWork wuow(_txn);
+            uassert(ErrorCodes::NotMaster, "no longer master", 
+                    repl::getGlobalReplicationCoordinator()->
+                    canAcceptWritesForDatabase(nsToDatabase(ns.c_str())));
+            Collection* coll = getCollectionOrUassert(ctx.db(), ns);
+
+            BSONObjBuilder b;
             if ( !o.hasField( "_id" ) ) {
-                OID id;
-                id.init();
                 b.appendOID( "_id", NULL, true );
             }
             b.appendElements(o);
             BSONObj bo = b.obj();
 
-            coll->insertDocument( _txn, bo, true );
-            logOp( _txn, "i", ns.c_str(), bo );
+            uassertStatusOK( coll->insertDocument( _txn, bo, true ).getStatus() );
+            repl::logOp(_txn, "i", ns.c_str(), bo);
+            wuow.commit();
         }
 
         /**
-         * Insert doc into the inc collection
+         * Insert doc into the inc collection. This should not be replicated.
          */
         void State::_insertToInc( BSONObj& o ) {
             verify( _onDisk );
 
-            Client::WriteContext ctx( _config.incLong );
-            Collection* coll = ctx.ctx().db()->getCollection( _config.incLong );
-            if ( !coll )
-                uasserted(13631, str::stream() << "attempted to insert into nonexistent"
-                                                  " collection during a mr operation." <<
-                                                  " collection expected: " << _config.incLong );
-
-            coll->insertDocument( _txn, o, true );
-            logOp( _txn, "i", _config.incLong.c_str(), o );
-            _txn->commitIfNeeded();
+            Client::WriteContext ctx(_txn,  _config.incLong );
+            WriteUnitOfWork wuow(_txn);
+            Collection* coll = getCollectionOrUassert(ctx.db(), _config.incLong);
+            uassertStatusOK( coll->insertDocument( _txn, o, true ).getStatus() );
+            wuow.commit();
         }
 
-        State::State(TransactionExperiment* txn, const Config& c) :
+        State::State(OperationContext* txn, const Config& c) :
                 _config(c),
+                _db(txn),
                 _useIncremental(true),
                 _txn(txn),
                 _size(0),
@@ -714,7 +759,7 @@ namespace mongo {
             const string userToken = ClientBasic::getCurrent()->getAuthorizationSession()
                                                               ->getAuthenticatedUserNamesToken();
             _scope.reset(globalScriptEngine->getPooledScope(
-                            _config.dbname, "mapreduce" + userToken).release());
+                            _txn, _config.dbname, "mapreduce" + userToken).release());
 
             if ( ! _config.scopeSetup.isEmpty() )
                 _scope->init( &_config.scopeSetup );
@@ -856,6 +901,13 @@ namespace mongo {
             _config.reducer->numReduces = _scope->getNumberInt("_redCt");
         }
 
+        Collection* State::getCollectionOrUassert(Database* db, const StringData& ns) {
+            Collection* out = db ? db->getCollection(ns) : NULL;
+            uassert(18697, "Collection unexpectedly disappeared: " + ns.toString(),
+                    out);
+            return out;
+        }
+
         /**
          * Applies last reduce and finalize on a list of tuples (key, val)
          * Inserts single result {_id: key, value: val} into temp collection
@@ -888,7 +940,7 @@ namespace mongo {
          * After calling this method, the temp collection will be completed.
          * If inline, the results will be in the in memory map
          */
-        void State::finalReduce( CurOp * op , ProgressMeterHolder& pm ) {
+        void State::finalReduce(CurOp * op , ProgressMeterHolder& pm ) {
 
             if (_jsMode) {
                 // apply the reduce within JS
@@ -929,12 +981,13 @@ namespace mongo {
             BSONObj sortKey = BSON( "0" << 1 );
 
             {
-                Client::WriteContext incCtx( _config.incLong );
-                Collection* incColl = incCtx.ctx().db()->getCollection( _config.incLong );
+                Client::WriteContext incCtx(_txn, _config.incLong );
+                WriteUnitOfWork wuow(_txn);
+                Collection* incColl = getCollectionOrUassert(incCtx.db(), _config.incLong );
 
                 bool foundIndex = false;
                 IndexCatalog::IndexIterator ii =
-                    incColl->getIndexCatalog()->getIndexIterator( true );
+                    incColl->getIndexCatalog()->getIndexIterator( _txn, true );
                 // Iterate over incColl's indexes.
                 while ( ii.more() ) {
                     IndexDescriptor* currIndex = ii.next();
@@ -946,9 +999,10 @@ namespace mongo {
                 }
 
                 verify( foundIndex );
+                wuow.commit();
             }
 
-            Client::ReadContext ctx( _config.incLong );
+            scoped_ptr<AutoGetCollectionForRead> ctx(new AutoGetCollectionForRead(_txn, _config.incLong));
 
             BSONObj prev;
             BSONList all;
@@ -957,21 +1011,36 @@ namespace mongo {
                                         "M/R: (3/3) Final Reduce Progress",
                                         _db.count(_config.incLong, BSONObj(), QueryOption_SlaveOk)));
 
-            CanonicalQuery* cq;
-            verify(CanonicalQuery::canonicalize(_config.incLong, BSONObj(), sortKey, BSONObj(), &cq).isOK());
+            const NamespaceString nss(_config.incLong);
+            const WhereCallbackReal whereCallback(_txn, nss.db());
 
-            Runner* rawRunner;
-            verify(getRunner(ctx.ctx().db()->getCollection(_config.incLong),
-                             cq, &rawRunner, QueryPlannerParams::NO_TABLE_SCAN).isOK());
+            CanonicalQuery* cqRaw;
+            verify(CanonicalQuery::canonicalize(_config.incLong,
+                                                BSONObj(),
+                                                sortKey,
+                                                BSONObj(),
+                                                &cqRaw,
+                                                whereCallback).isOK());
+            std::auto_ptr<CanonicalQuery> cq(cqRaw);
 
-            auto_ptr<Runner> runner(rawRunner);
-            const ScopedRunnerRegistration safety(runner.get());
-            runner->setYieldPolicy(Runner::YIELD_AUTO);
+            Collection* coll = getCollectionOrUassert(ctx->getDb(), _config.incLong);
+            invariant(coll);
+
+            PlanExecutor* rawExec;
+            verify(getExecutor(_txn,
+                               coll,
+                               cq.release(),
+                               PlanExecutor::YIELD_AUTO,
+                               &rawExec,
+                               QueryPlannerParams::NO_TABLE_SCAN).isOK());
+
+            scoped_ptr<PlanExecutor> exec(rawExec);
 
             // iterate over all sorted objects
             BSONObj o;
-            Runner::RunnerState state;
-            while (Runner::RUNNER_ADVANCED == (state = runner->getNext(&o, NULL))) {
+            PlanExecutor::ExecState state;
+            while (PlanExecutor::ADVANCED == (state = exec->getNext(&o, NULL))) {
+                o = o.getOwned(); // we will be accessing outside of the lock
                 pm.hit();
 
                 if ( o.woSortOrder( prev , sortKey ) == 0 ) {
@@ -983,39 +1052,30 @@ namespace mongo {
                     continue;
                 }
 
-                runner->saveState();
+                exec->saveState();
 
-                // can't be a smart pointer since it needs throw annotation on destructor
-                dbtempreleasecond* yield = new dbtempreleasecond();
+                ctx.reset();
 
-                try {
-                    // reduce a finalize array
-                    finalReduce( all );
-                }
-                catch (...) {
-                    delete yield; // if throws, replaces current exception rather than terminating.
-                    throw;
-                }
-                delete yield;
+                // reduce a finalize array
+                finalReduce( all );
+
+                ctx.reset(new AutoGetCollectionForRead(_txn, _config.incLong));
 
                 all.clear();
                 prev = o;
                 all.push_back( o );
 
-                if (!runner->restoreState()) {
+                if (!exec->restoreState(_txn)) {
                     break;
                 }
 
                 _txn->checkForInterrupt();
             }
 
-            {
-                dbtempreleasecond tl;
-                if ( ! tl.unlocked() )
-                    warning() << "map/reduce can't temp release" << endl;
-                // reduce and finalize last array
-                finalReduce( all );
-            }
+            ctx.reset();
+            // reduce and finalize last array
+            finalReduce( all );
+            ctx.reset(new AutoGetCollectionForRead(_txn, _config.incLong));
 
             pm.finished();
         }
@@ -1070,8 +1130,6 @@ namespace mongo {
             if ( ! _onDisk )
                 return;
 
-            Lock::DBWrite kl(_config.incLong);
-
             for ( InMemory::iterator i=_temp->begin(); i!=_temp->end(); i++ ) {
                 BSONList& all = i->second;
                 if ( all.size() < 1 )
@@ -1082,7 +1140,6 @@ namespace mongo {
             }
             _temp->clear();
             _size = 0;
-
         }
 
         /**
@@ -1104,10 +1161,9 @@ namespace mongo {
         }
 
         void State::reduceAndSpillInMemoryStateIfNeeded() {
-            // Make sure no DB read locks are held, because we might try to acquire write lock and
-            // upgrade is not supported.
-            //
-            dassert(!cc().lockState().hasAnyReadLock());
+            // Make sure no DB locks are held, because this method manages its own locking and
+            // write units of work.
+            invariant(!_txn->lockState()->isLocked());
 
             if (_jsMode) {
                 // try to reduce if it is beneficial
@@ -1123,7 +1179,9 @@ namespace mongo {
                     // reduce now to lower mem usage
                     Timer t;
                     _scope->invoke(_reduceAll, 0, 0, 0, true);
-                    LOG(1) << "  MR - did reduceAll: keys=" << keyCt << " dups=" << dupCt << " newKeys=" << _scope->getNumberInt("_keyCt") << " time=" << t.millis() << "ms" << endl;
+                    LOG(3) << "  MR - did reduceAll: keys=" << keyCt << " dups=" << dupCt
+                           << " newKeys=" << _scope->getNumberInt("_keyCt") << " time="
+                           << t.millis() << "ms" << endl;
                     return;
                 }
             }
@@ -1136,12 +1194,13 @@ namespace mongo {
                 long oldSize = _size;
                 Timer t;
                 reduceInMemory();
-                LOG(1) << "  MR - did reduceInMemory: size=" << oldSize << " dups=" << _dupCount << " newSize=" << _size << " time=" << t.millis() << "ms" << endl;
+                LOG(3) << "  MR - did reduceInMemory: size=" << oldSize << " dups=" << _dupCount
+                       << " newSize=" << _size << " time=" << t.millis() << "ms" << endl;
 
                 // if size is still high, or values are not reducing well, dump
                 if ( _onDisk && (_size > _config.maxInMemSize || _size > oldSize / 2) ) {
                     dumpToInc();
-                    LOG(1) << "  MR - dumping to db" << endl;
+                    LOG(3) << "  MR - dumping to db" << endl;
                 }
             }
         }
@@ -1189,10 +1248,10 @@ namespace mongo {
         public:
             MapReduceCommand() : Command("mapReduce", false, "mapreduce") {}
 
-            /* why !replset ?
-               bad things happen with --slave (i think because of this)
-            */
-            virtual bool slaveOk() const { return !replSet; }
+            virtual bool slaveOk() const {
+                return repl::getGlobalReplicationCoordinator()->getReplicationMode() !=
+                        repl::ReplicationCoordinator::modeReplSet;
+            }
 
             virtual bool slaveOverrideOk() const { return true; }
 
@@ -1210,10 +1269,9 @@ namespace mongo {
                 addPrivilegesRequiredForMapReduce(this, dbname, cmdObj, out);
             }
 
-            bool run(const string& dbname , BSONObj& cmd, int, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
+            bool run(OperationContext* txn, const string& dbname , BSONObj& cmd, int, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
                 Timer t;
-                Client& client = cc();
-                CurOp * op = client.curop();
+                CurOp* op = txn->getCurOp();
 
                 Config config( dbname , cmd );
 
@@ -1226,10 +1284,12 @@ namespace mongo {
                 // Prevent sharding state from changing during the MR.
                 auto_ptr<RangePreserver> rangePreserver;
                 {
-                    Client::ReadContext ctx(config.ns);
-                    Collection* collection = ctx.ctx().db()->getCollection( config.ns );
-                    if ( collection )
+                    AutoGetCollectionForRead ctx(txn, config.ns);
+
+                    Collection* collection = ctx.getCollection();
+                    if (collection) {
                         rangePreserver.reset(new RangePreserver(collection));
+                    }
 
                     // Get metadata before we check our version, to make sure it doesn't increment
                     // in the meantime.  Need to do this in the same lock scope as the block.
@@ -1242,17 +1302,17 @@ namespace mongo {
 
                 BSONObjBuilder countsBuilder;
                 BSONObjBuilder timingBuilder;
-                DurTransaction txn;
-                State state( &txn, config );
+                State state( txn, config );
                 if ( ! state.sourceExists() ) {
                     errmsg = "ns doesn't exist";
                     return false;
                 }
-
-                if (replSet && state.isOnDisk()) {
+                if (state.isOnDisk()) {
                     // this means that it will be doing a write operation, make sure we are on Master
                     // ideally this check should be in slaveOk(), but at that point config is not known
-                    if (!isMasterNs(dbname.c_str())) {
+                    repl::ReplicationCoordinator* const replCoord =
+                        repl::getGlobalReplicationCoordinator();
+                    if (!replCoord->canAcceptWritesForDatabase(dbname)) {
                         errmsg = "not master";
                         return false;
                     }
@@ -1280,47 +1340,65 @@ namespace mongo {
                     progress.showTotal(showTotal);
                     ProgressMeterHolder pm(progress);
 
-                    wassert( config.limit < 0x4000000 ); // see case on next line to 32 bit unsigned
+                    // See cast on next line to 32 bit unsigned
+                    wassert(config.limit < 0x4000000);
 
                     long long mapTime = 0;
                     long long reduceTime = 0;
                     long long numInputs = 0;
+
                     {
-                        // We've got a cursor preventing migrations off, now re-establish our useful cursor
+                        // We've got a cursor preventing migrations off, now re-establish our
+                        // useful cursor.
+
+                        const NamespaceString nss(config.ns);
 
                         // Need lock and context to use it
-                        Lock::DBRead lock( config.ns );
+                        scoped_ptr<ScopedTransaction> scopedXact(
+                                                        new ScopedTransaction(txn, MODE_IS));
+                        scoped_ptr<AutoGetDb> scopedAutoDb(new AutoGetDb(txn, nss.db(), MODE_S));
 
-                        // This context does no version check, safe b/c we checked earlier and have an
-                        // open cursor
-                        Client::Context ctx(config.ns, storageGlobalParams.dbpath, false);
+                        const WhereCallbackReal whereCallback(txn, nss.db());
 
-                        CanonicalQuery* cq;
-                        if (!CanonicalQuery::canonicalize(config.ns, config.filter, config.sort, BSONObj(), &cq).isOK()) {
+                        CanonicalQuery* cqRaw;
+                        if (!CanonicalQuery::canonicalize(config.ns,
+                                                          config.filter,
+                                                          config.sort,
+                                                          BSONObj(),
+                                                          &cqRaw,
+                                                          whereCallback).isOK()) {
                             uasserted(17238, "Can't canonicalize query " + config.filter.toString());
                             return 0;
                         }
+                        std::auto_ptr<CanonicalQuery> cq(cqRaw);
 
-                        Runner* rawRunner;
-                        if (!getRunner(ctx.db()->getCollection( config.ns), cq, &rawRunner).isOK()) {
-                            uasserted(17239, "Can't get runner for query " + config.filter.toString());
+                        Database* db = scopedAutoDb->getDb();
+                        Collection* coll = state.getCollectionOrUassert(db, config.ns);
+                        invariant(coll);
+
+                        PlanExecutor* rawExec;
+                        if (!getExecutor(txn,
+                                         coll,
+                                         cq.release(),
+                                         PlanExecutor::YIELD_AUTO,
+                                         &rawExec).isOK()) {
+                            uasserted(17239, "Can't get executor for query "
+                                             + config.filter.toString());
                             return 0;
                         }
 
-                        auto_ptr<Runner> runner(rawRunner);
-                        const ScopedRunnerRegistration safety(runner.get());
-                        runner->setYieldPolicy(Runner::YIELD_AUTO);
+                        scoped_ptr<PlanExecutor> exec(rawExec);
 
                         Timer mt;
 
                         // go through each doc
                         BSONObj o;
-                        while (Runner::RUNNER_ADVANCED == runner->getNext(&o, NULL)) {
+                        while (PlanExecutor::ADVANCED == exec->getNext(&o, NULL)) {
                             // check to see if this is a new object we don't own yet
                             // because of a chunk migration
                             if ( collMetadata ) {
-                                KeyPattern kp( collMetadata->getKeyPattern() );
-                                if ( !collMetadata->keyBelongsToMe( kp.extractSingleKey( o ) ) ) {
+                                ShardKeyPattern kp( collMetadata->getKeyPattern() );
+                                if (!collMetadata->keyBelongsToMe(kp.extractShardKeyFromDoc(o))) {
                                     continue;
                                 }
                             }
@@ -1338,20 +1416,36 @@ namespace mongo {
                             if (numInputs % 100 == 0) {
                                 Timer t;
 
-                                // TODO: As an optimization, we might want to do the save/restore 
-                                // state and yield inside the reduceAndSpillInMemoryState method,
-                                // so it only happens if necessary.
-                                //
-                                runner->saveState();
-                                {
-                                    dbtemprelease unlock;
-                                    state.reduceAndSpillInMemoryStateIfNeeded();
+                                // TODO: As an optimization, we might want to do the save/restore
+                                // state and yield inside the reduceAndSpillInMemoryState method, so
+                                // it only happens if necessary.
+                                exec->saveState();
+
+                                scopedAutoDb.reset();
+                                scopedXact.reset();
+
+                                state.reduceAndSpillInMemoryStateIfNeeded();
+
+                                scopedXact.reset(new ScopedTransaction(txn, MODE_IS));
+                                scopedAutoDb.reset(new AutoGetDb(txn, nss.db(), MODE_S));
+
+                                exec->restoreState(txn);
+
+                                // Need to reload the database, in case it was dropped after we
+                                // released the lock
+                                db = scopedAutoDb->getDb();
+                                if (db == NULL) {
+                                    // Database was deleted after we freed the lock
+                                    StringBuilder sb;
+                                    sb << "Database "
+                                       << nss.db()
+                                       << " was deleted in the middle of the reduce job.";
+                                    uasserted(28523, sb.str());
                                 }
-                                runner->restoreState();
 
                                 reduceTime += t.micros();
 
-                                txn.checkForInterrupt();
+                                txn->checkForInterrupt();
                             }
 
                             pm.hit();
@@ -1362,7 +1456,7 @@ namespace mongo {
                     }
                     pm.finished();
 
-                    txn.checkForInterrupt();
+                    txn->checkForInterrupt();
 
                     // update counters
                     countsBuilder.appendNumber("input", numInputs);
@@ -1382,13 +1476,13 @@ namespace mongo {
                     // if not inline: dump the in memory map to inc collection, all data is on disk
                     state.dumpToInc();
                     // final reduce
-                    state.finalReduce( op , pm );
+                    state.finalReduce(op , pm );
                     reduceTime += rt.micros();
                     countsBuilder.appendNumber( "reduce" , state.numReduces() );
                     timingBuilder.appendNumber("reduceTime", reduceTime / 1000);
                     timingBuilder.append( "mode" , state.jsMode() ? "js" : "mixed" );
 
-                    long long finalCount = state.postProcessCollection(op, pm);
+                    long long finalCount = state.postProcessCollection(txn, op, pm);
                     state.appendResults( result );
 
                     timingBuilder.appendNumber( "total" , t.millis() );
@@ -1434,7 +1528,10 @@ namespace mongo {
         public:
             void help(stringstream& h) const { h << "internal"; }
             MapReduceFinishCommand() : Command( "mapreduce.shardedfinish" ) {}
-            virtual bool slaveOk() const { return !replSet; }
+            virtual bool slaveOk() const {
+                return repl::getGlobalReplicationCoordinator()->getReplicationMode() !=
+                        repl::ReplicationCoordinator::modeReplSet;
+            }
             virtual bool slaveOverrideOk() const { return true; }
             virtual bool isWriteCommandForConfigServer() const { return false; }
             virtual void addRequiredPrivileges(const std::string& dbname,
@@ -1444,7 +1541,7 @@ namespace mongo {
                 actions.addAction(ActionType::internal);
                 out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
             }
-            bool run(const string& dbname , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+            bool run(OperationContext* txn, const string& dbname , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
                 ShardedConnectionInfo::addHook();
                 // legacy name
                 string shardedOutputCollection = cmdObj["shardedOutputCollection"].valuestrsafe();
@@ -1457,12 +1554,10 @@ namespace mongo {
                     inputNS = dbname + "." + shardedOutputCollection;
                 }
 
-                Client& client = cc();
-                CurOp * op = client.curop();
+                CurOp * op = txn->getCurOp();
 
                 Config config( dbname , cmdObj.firstElement().embeddedObjectUserCheck() );
-                DurTransaction txn;
-                State state(&txn, config);
+                State state(txn, config);
                 state.init();
 
                 // no need for incremental collection because records are already sorted
@@ -1508,6 +1603,13 @@ namespace mongo {
                 // it would be better to do just one big $or query, but then the sorting would not be efficient
                 string shardName = shardingState.getShardName();
                 DBConfigPtr confOut = grid.getDBConfig( dbname , false );
+
+                if (!confOut) {
+                    log() << "Sharding metadata for output database: " << dbname
+                          << " does not exist";
+                    return false;
+                }
+
                 vector<ChunkPtr> chunks;
                 if ( confOut->isSharded(config.outputOptions.finalNamespace) ) {
                     ChunkManagerPtr cm = confOut->getChunkManager(
@@ -1582,7 +1684,7 @@ namespace mongo {
 
                 result.append( "chunkSizes" , chunkSizes.arr() );
 
-                long long outputCount = state.postProcessCollection(op, pm);
+                long long outputCount = state.postProcessCollection(txn, op, pm);
                 state.appendResults( result );
 
                 BSONObjBuilder countsB(32);

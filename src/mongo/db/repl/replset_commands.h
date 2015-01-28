@@ -32,11 +32,11 @@
 
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/repl/rs.h" // replSet bool
 
 namespace mongo {
+namespace repl {
 
-    extern bool replSetBlind;
+    extern unsigned replSetForceInitialSyncFailure;
 
     /**
      * Base class for repl set commands.  Checks basic things such if we're in
@@ -48,29 +48,8 @@ namespace mongo {
         virtual bool slaveOk() const { return true; }
         virtual bool adminOnly() const { return true; }
         virtual bool isWriteCommandForConfigServer() const { return false; }
-        virtual void help( stringstream &help ) const { help << "internal"; }
-
-        bool check(string& errmsg, BSONObjBuilder& result) {
-            if( !replSet ) {
-                errmsg = "not running with --replSet";
-                if (serverGlobalParams.configsvr) {
-                    result.append("info", "configsvr"); // for shell prompt
-                }
-                return false;
-            }
-
-            if( theReplSet == 0 ) {
-                result.append("startupStatus", ReplSet::startupStatus);
-                string s;
-                errmsg = ReplSet::startupStatusMsg.empty() ?
-                            "replset unknown error 2" : ReplSet::startupStatusMsg.get();
-                if( ReplSet::startupStatus == 3 )
-                    result.append("info", "run rs.initiate(...) if not yet done for the set");
-                return false;
-            }
-
-            return true;
-        }
+        virtual void help( std::stringstream &help ) const { help << "internal"; }
     };
 
+} // namespace repl
 } // namespace mongo

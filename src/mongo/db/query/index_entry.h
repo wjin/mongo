@@ -32,6 +32,7 @@
 
 #include "mongo/db/index_names.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
 
@@ -43,14 +44,16 @@ namespace mongo {
          * Use this constructor if you're making an IndexEntry from the catalog.
          */
         IndexEntry(const BSONObj& kp,
-                   const string& accessMethod,
+                   const std::string& accessMethod,
                    bool mk,
                    bool sp,
-                   const string& n,
+                   bool unq,
+                   const std::string& n,
                    const BSONObj& io)
             : keyPattern(kp),
               multikey(mk),
               sparse(sp),
+              unique(unq),
               name(n),
               infoObj(io) {
 
@@ -63,16 +66,18 @@ namespace mongo {
         IndexEntry(const BSONObj& kp,
                    bool mk,
                    bool sp,
-                   const string& n,
+                   bool unq,
+                   const std::string& n,
                    const BSONObj& io)
             : keyPattern(kp),
               multikey(mk),
               sparse(sp),
+              unique(unq),
               name(n),
               infoObj(io) {
 
             type = IndexNames::nameToType(IndexNames::findPluginName(keyPattern));
-        }     
+        }
 
         /**
          * For testing purposes only.
@@ -81,11 +86,12 @@ namespace mongo {
             : keyPattern(kp),
               multikey(false),
               sparse(false),
+              unique(false),
               name("test_foo"),
               infoObj(BSONObj()) {
 
             type = IndexNames::nameToType(IndexNames::findPluginName(keyPattern));
-        }     
+        }
 
         BSONObj keyPattern;
 
@@ -93,7 +99,9 @@ namespace mongo {
 
         bool sparse;
 
-        string name;
+        bool unique;
+
+        std::string name;
 
         // Geo indices have extra parameters.  We need those available to plan correctly.
         BSONObj infoObj;

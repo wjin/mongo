@@ -28,7 +28,9 @@
 *    then also delete it in the license file.
 */
 
-#include "mongo/pch.h"
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+
+#include "mongo/platform/basic.h"
 
 #include "mongo/dbtests/framework.h"
 
@@ -40,19 +42,24 @@
 #include "mongo/base/initializer.h"
 #include "mongo/base/status.h"
 #include "mongo/db/client.h"
-#include "mongo/db/storage/mmap_v1/dur.h"
+#include "mongo/db/concurrency/lock_state.h"
+#include "mongo/db/global_environment_d.h"
+#include "mongo/db/global_environment_experiment.h"
 #include "mongo/db/ops/update.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/dbtests/framework_options.h"
 #include "mongo/util/background.h"
 #include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/exit.h"
-#include "mongo/util/file_allocator.h"
+#include "mongo/util/log.h"
 #include "mongo/util/version_reporting.h"
 
 namespace moe = mongo::optionenvironment;
 
 namespace mongo {
+
+    using std::endl;
+    using std::string;
 
     namespace dbtests {
 
@@ -92,6 +99,9 @@ namespace mongo {
                     }
                     else if (minutesRunning > 1){
                         warning() << currentTestName << " has been running for more than " << minutesRunning-1 << " minutes." << endl;
+
+                        // See what is stuck
+                        getGlobalLockManager()->dump();
                     }
                 }
             }
@@ -103,33 +113,24 @@ namespace mongo {
             frameworkGlobalParams.runsPerTest = 1;
 
             Client::initThread("testsuite");
-            acquirePathLock();
 
             srand( (unsigned) frameworkGlobalParams.seed );
             printGitVersion();
             printOpenSSLVersion();
             printSysInfo();
 
-            FileAllocator::get()->start();
-
-            dur::startup();
+            getGlobalEnvironment()->setGlobalStorageEngine(storageGlobalParams.engine);
 
             TestWatchDog twd;
             twd.go();
-
-            // set tlogLevel to -1 to suppress MONGO_TLOG(0) output in a test program
-            tlogLevel = -1;
 
             int ret = ::mongo::unittest::Suite::run(frameworkGlobalParams.suites,
                                                     frameworkGlobalParams.filter,
                                                     frameworkGlobalParams.runsPerTest);
 
-#if !defined(_WIN32) && !defined(__sunos__)
-            flock( lockFile, LOCK_UN );
-#endif
 
             cc().shutdown();
-            dbexit( (ExitCode)ret ); // so everything shuts down cleanly
+            exitCleanly( (ExitCode)ret ); // so everything shuts down cleanly
             return ret;
         }
     }  // namespace dbtests

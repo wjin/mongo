@@ -43,19 +43,7 @@ namespace mongo {
                       bool modifiers_,
                       unsigned long long numDocsModified_,
                       unsigned long long numMatched_,
-                      const BSONObj& upsertedObject_ )
-            : existing(existing_)
-            , modifiers(modifiers_)
-            , numDocsModified(numDocsModified_)
-            , numMatched(numMatched_) {
-
-            BSONElement id = upsertedObject_["_id"];
-            if ( ! existing && numMatched == 1 && !id.eoo() ) {
-                upserted = id.wrap(kUpsertedFieldName);
-            }
-
-            LOG(4) << "UpdateResult -- " << toString();
-        }
+                      const BSONObj& upsertedObject_ );
 
 
         // if existing objects were modified

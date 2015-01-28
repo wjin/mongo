@@ -2,20 +2,34 @@
 
 /*    Copyright 2009 10gen Inc.
  *
- *    Licensed under the Apache License, Version 2.0 (the "License");
- *    you may not use this file except in compliance with the License.
- *    You may obtain a copy of the License at
+ *    This program is free software: you can redistribute it and/or  modify
+ *    it under the terms of the GNU Affero General Public License, version 3,
+ *    as published by the Free Software Foundation.
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License for more details.
  *
- *    Unless required by applicable law or agreed to in writing, software
- *    distributed under the License is distributed on an "AS IS" BASIS,
- *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *    See the License for the specific language governing permissions and
- *    limitations under the License.
+ *    You should have received a copy of the GNU Affero General Public License
+ *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
  */
 
-#include "mongo/pch.h"
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+
+#include "mongo/platform/basic.h"
 
 #include "mongo/util/file_allocator.h"
 
@@ -38,7 +52,11 @@
 #endif
 
 #include "mongo/platform/posix_fadvise.h"
+#include "mongo/stdx/functional.h"
 #include "mongo/util/concurrency/thread_name.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/fail_point_service.h"
+#include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/paths.h"
 #include "mongo/util/processinfo.h"
@@ -53,9 +71,16 @@ using namespace mongoutils;
 
 namespace mongo {
 
+    using std::endl;
+    using std::list;
+    using std::string;
+    using std::stringstream;
+
     // unique number for temporary file names
     unsigned long long FileAllocator::_uniqueNumber = 0;
     static SimpleMutex _uniqueNumberMutex( "uniqueNumberMutex" );
+
+    MONGO_FP_DECLARE(allocateDiskFull);
 
     /**
      * Aliases for Win32 CRT functions
@@ -64,6 +89,18 @@ namespace mongo {
     static inline long lseek(int fd, long offset, int origin) { return _lseek(fd, offset, origin); }
     static inline int write(int fd, const void *data, int count) { return _write(fd, data, count); }
     static inline int close(int fd) { return _close(fd); }
+
+    typedef BOOL (CALLBACK *GetVolumeInformationByHandleWPtr)(HANDLE, LPWSTR, DWORD, LPDWORD, LPDWORD, LPDWORD, LPWSTR, DWORD);
+    GetVolumeInformationByHandleWPtr GetVolumeInformationByHandleWFunc;
+
+    MONGO_INITIALIZER(InitGetVolumeInformationByHandleW)(InitializerContext *context) {
+        HMODULE kernelLib = LoadLibraryA("kernel32.dll");
+        if (kernelLib) {
+            GetVolumeInformationByHandleWFunc = reinterpret_cast<GetVolumeInformationByHandleWPtr>
+                (GetProcAddress(kernelLib, "GetVolumeInformationByHandleW"));
+        }
+        return Status::OK();
+    }
 #endif
 
     boost::filesystem::path ensureParentDirCreated(const boost::filesystem::path& p){
@@ -86,7 +123,7 @@ namespace mongo {
 
 
     void FileAllocator::start() {
-        boost::thread t( boost::bind( &FileAllocator::run , this ) );
+        boost::thread t( stdx::bind( &FileAllocator::run , this ) );
     }
 
     void FileAllocator::requestAllocation( const string &name, long &size ) {
@@ -105,6 +142,11 @@ namespace mongo {
 
     void FileAllocator::allocateAsap( const string &name, unsigned long long &size ) {
         scoped_lock lk( _pendingMutex );
+
+        // In case the allocator is in failed state, check once before starting so that subsequent
+        // requests for the same database would fail fast after the first one has failed.
+        checkFailure();
+
         long oldSize = prevSize( name );
         if ( oldSize != -1 ) {
             size = oldSize;
@@ -149,8 +191,11 @@ namespace mongo {
 #if defined(__linux__)
 // these are from <linux/magic.h> but that isn't available on all systems
 # define NFS_SUPER_MAGIC 0x6969
+# define TMPFS_MAGIC 0x01021994
 
-        return (fs_stats.f_type == NFS_SUPER_MAGIC);
+        return (fs_stats.f_type == NFS_SUPER_MAGIC)
+            || (fs_stats.f_type == TMPFS_MAGIC)
+            ;
 
 #elif defined(__freebsd__)
 
@@ -167,7 +212,36 @@ namespace mongo {
 #endif
     }
 
+#if defined(_WIN32)
+    static bool isFileOnNTFSVolume(int fd) {
+        if (!GetVolumeInformationByHandleWFunc) {
+            warning() << "Could not retrieve pointer to GetVolumeInformationByHandleW function";
+            return false;
+        }
+
+        HANDLE fileHandle = (HANDLE)_get_osfhandle(fd);
+        if (fileHandle == INVALID_HANDLE_VALUE) {
+            warning() << "_get_osfhandle() failed with " << _strerror(NULL);
+            return false;
+        }
+
+        WCHAR fileSystemName[MAX_PATH + 1];
+        if (!GetVolumeInformationByHandleWFunc(fileHandle, NULL, 0, NULL, 0, NULL, fileSystemName, sizeof(fileSystemName))) {
+            DWORD gle = GetLastError();
+            warning() << "GetVolumeInformationByHandleW failed with " << errnoWithDescription(gle);
+            return false;
+        }
+
+        return lstrcmpW(fileSystemName, L"NTFS") == 0;
+    }
+#endif
+
     void FileAllocator::ensureLength(int fd , long size) {
+        // Test running out of disk scenarios
+        if (MONGO_FAIL_POINT(allocateDiskFull)) {
+            uasserted( 10444 , "File allocation failed due to failpoint.");
+        }
+
 #if !defined(_WIN32)
         if (useSparseFiles(fd)) {
             LOG(1) << "using ftruncate to create a sparse file" << endl;
@@ -207,6 +281,13 @@ namespace mongo {
                 return;
             }
 
+#if defined(_WIN32)
+            if (!isFileOnNTFSVolume(fd)) {
+                log() << "No need to zero out datafile on non-NTFS volume" << endl;
+                return;
+            }
+#endif
+
             lseek(fd, 0, SEEK_SET);
 
             const long z = 256 * 1024;
@@ -224,10 +305,6 @@ namespace mongo {
                 left -= written;
             }
         }
-    }
-
-    bool FileAllocator::hasFailed() const {
-        return _failed;
     }
 
     void FileAllocator::checkFailure() {
@@ -272,7 +349,7 @@ namespace mongo {
               return fn;
         }
         return "";
-	}
+    }
 
     void FileAllocator::run( FileAllocator * fa ) {
         setThreadName( "FileAllocator" );
@@ -362,10 +439,14 @@ namespace mongo {
                     } catch ( const std::exception& e ) {
                         log() << "error removing files: " << e.what() << endl;
                     }
-                    scoped_lock lk( fa->_pendingMutex );
-                    fa->_failed = true;
-                    // not erasing from pending
-                    fa->_pendingUpdated.notify_all();
+
+                    {
+                        scoped_lock lk(fa->_pendingMutex);
+                        fa->_failed = true;
+
+                        // TODO: Should we remove the file from pending?
+                        fa->_pendingUpdated.notify_all();
+                    }
                     
                     
                     sleepsecs(10);

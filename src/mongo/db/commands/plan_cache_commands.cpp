@@ -26,6 +26,11 @@
 *    it in the license file.
 */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+
+#include "mongo/platform/basic.h"
+
+#include <boost/scoped_ptr.hpp>
 #include <string>
 #include <sstream>
 
@@ -37,11 +42,13 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands/plan_cache_commands.h"
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/query/explain_plan.h"
+#include "mongo/db/query/explain.h"
 #include "mongo/db/query/plan_ranker.h"
+#include "mongo/util/log.h"
 
 namespace {
 
+    using boost::scoped_ptr;
     using std::string;
     using namespace mongo;
 
@@ -62,10 +69,12 @@ namespace {
     /**
      * Retrieves a collection's plan cache from the database.
      */
-    Status getPlanCache(Database* db, const string& ns, PlanCache** planCacheOut) {
-        invariant(db);
+    static Status getPlanCache(OperationContext* txn,
+                               Collection* collection,
+                               const string& ns,
+                               PlanCache** planCacheOut) {
+        *planCacheOut = NULL;
 
-        Collection* collection = db->getCollection(ns);
         if (NULL == collection) {
             return Status(ErrorCodes::BadValue, "no such collection");
         }
@@ -114,11 +123,11 @@ namespace mongo {
           helpText(helpText),
           actionType(actionType) { }
 
-    bool PlanCacheCommand::run(const string& dbname, BSONObj& cmdObj, int options,
+    bool PlanCacheCommand::run(OperationContext* txn, const string& dbname, BSONObj& cmdObj, int options,
                                string& errmsg, BSONObjBuilder& result, bool fromRepl) {
         string ns = parseNs(dbname, cmdObj);
 
-        Status status = runPlanCacheCommand(ns, cmdObj, &result);
+        Status status = runPlanCacheCommand(txn, ns, cmdObj, &result);
 
         if (!status.isOK()) {
             addStatus(status, result);
@@ -134,11 +143,16 @@ namespace mongo {
         return false;
     }
 
+    bool PlanCacheCommand::slaveOverrideOk() const {
+        return true;
+    }
+
     void PlanCacheCommand::help(stringstream& ss) const {
         ss << helpText;
     }
 
-    Status PlanCacheCommand::checkAuthForCommand(ClientBasic* client, const std::string& dbname,
+    Status PlanCacheCommand::checkAuthForCommand(ClientBasic* client,
+                                                 const std::string& dbname,
                                                  const BSONObj& cmdObj) {
         AuthorizationSession* authzSession = client->getAuthorizationSession();
         ResourcePattern pattern = parseResourcePattern(dbname, cmdObj);
@@ -151,7 +165,9 @@ namespace mongo {
     }
 
     // static
-    Status PlanCacheCommand::canonicalize(const string& ns, const BSONObj& cmdObj,
+    Status PlanCacheCommand::canonicalize(OperationContext* txn,
+                                          const string& ns,
+                                          const BSONObj& cmdObj,
                                           CanonicalQuery** canonicalQueryOut) {
         // query - required
         BSONElement queryElt = cmdObj.getField("query");
@@ -188,7 +204,12 @@ namespace mongo {
 
         // Create canonical query
         CanonicalQuery* cqRaw;
-        Status result = CanonicalQuery::canonicalize(ns, queryObj, sortObj, projObj, &cqRaw);
+
+        const NamespaceString nss(ns);
+        const WhereCallbackReal whereCallback(txn, nss.db());
+
+        Status result = CanonicalQuery::canonicalize(
+                            ns, queryObj, sortObj, projObj, &cqRaw, whereCallback);
         if (!result.isOK()) {
             return result;
         }
@@ -201,13 +222,15 @@ namespace mongo {
         "Displays all query shapes in a collection.",
         ActionType::planCacheRead) { }
 
-    Status PlanCacheListQueryShapes::runPlanCacheCommand(const string& ns, BSONObj& cmdObj,
+    Status PlanCacheListQueryShapes::runPlanCacheCommand(OperationContext* txn,
+                                                         const string& ns,
+                                                         BSONObj& cmdObj,
                                                          BSONObjBuilder* bob) {
         // This is a read lock. The query cache is owned by the collection.
-        Client::ReadContext readCtx(ns);
-        Client::Context& ctx = readCtx.ctx();
+        AutoGetCollectionForRead ctx(txn, ns);
+
         PlanCache* planCache;
-        Status status = getPlanCache(ctx.db(), ns, &planCache);
+        Status status = getPlanCache(txn, ctx.getCollection(), ns, &planCache);
         if (!status.isOK()) {
             // No collection - return results with empty shapes array.
             BSONArrayBuilder arrayBuilder(bob->subarrayStart("shapes"));
@@ -247,22 +270,27 @@ namespace mongo {
         "Drops one or all cached queries in a collection.",
         ActionType::planCacheWrite) { }
 
-    Status PlanCacheClear::runPlanCacheCommand(const string& ns, BSONObj& cmdObj,
+    Status PlanCacheClear::runPlanCacheCommand(OperationContext* txn,
+                                               const std::string& ns,
+                                               BSONObj& cmdObj,
                                                BSONObjBuilder* bob) {
         // This is a read lock. The query cache is owned by the collection.
-        Client::ReadContext readCtx(ns);
-        Client::Context& ctx = readCtx.ctx();
+        AutoGetCollectionForRead ctx(txn, ns);
+
         PlanCache* planCache;
-        Status status = getPlanCache(ctx.db(), ns, &planCache);
+        Status status = getPlanCache(txn, ctx.getCollection(), ns, &planCache);
         if (!status.isOK()) {
             // No collection - nothing to do. Return OK status.
             return Status::OK();
         }
-        return clear(planCache, ns, cmdObj);
+        return clear(txn, planCache, ns, cmdObj);
     }
 
     // static
-    Status PlanCacheClear::clear(PlanCache* planCache, const string& ns, const BSONObj& cmdObj) {
+    Status PlanCacheClear::clear(OperationContext* txn,
+                                 PlanCache* planCache,
+                                 const string& ns,
+                                 const BSONObj& cmdObj) {
         invariant(planCache);
 
         // According to the specification, the planCacheClear command runs in two modes:
@@ -271,7 +299,7 @@ namespace mongo {
         //   command arguments.
         if (cmdObj.hasField("query")) {
             CanonicalQuery* cqRaw;
-            Status status = PlanCacheCommand::canonicalize(ns, cmdObj, &cqRaw);
+            Status status = PlanCacheCommand::canonicalize(txn, ns, cmdObj, &cqRaw);
             if (!status.isOK()) {
                 return status;
             }
@@ -317,26 +345,31 @@ namespace mongo {
         "Displays the cached plans for a query shape.",
         ActionType::planCacheRead) { }
 
-    Status PlanCacheListPlans::runPlanCacheCommand(const string& ns, BSONObj& cmdObj,
+    Status PlanCacheListPlans::runPlanCacheCommand(OperationContext* txn,
+                                                   const std::string& ns,
+                                                   BSONObj& cmdObj,
                                                    BSONObjBuilder* bob) {
-        Client::ReadContext readCtx(ns);
-        Client::Context& ctx = readCtx.ctx();
+        AutoGetCollectionForRead ctx(txn, ns);
+
         PlanCache* planCache;
-        Status status = getPlanCache(ctx.db(), ns, &planCache);
+        Status status = getPlanCache(txn, ctx.getCollection(), ns, &planCache);
         if (!status.isOK()) {
             // No collection - return empty plans array.
             BSONArrayBuilder plansBuilder(bob->subarrayStart("plans"));
             plansBuilder.doneFast();
             return Status::OK();
         }
-        return list(*planCache, ns, cmdObj, bob);
+        return list(txn, *planCache, ns, cmdObj, bob);
     }
 
     // static
-    Status PlanCacheListPlans::list(const PlanCache& planCache, const std::string& ns,
-                                    const BSONObj& cmdObj, BSONObjBuilder* bob) {
+    Status PlanCacheListPlans::list(OperationContext* txn,
+                                    const PlanCache& planCache,
+                                    const std::string& ns,
+                                    const BSONObj& cmdObj,
+                                    BSONObjBuilder* bob) {
         CanonicalQuery* cqRaw;
-        Status status = canonicalize(ns, cmdObj, &cqRaw);
+        Status status = canonicalize(txn, ns, cmdObj, &cqRaw);
         if (!status.isOK()) {
             return status;
         }
@@ -381,7 +414,7 @@ namespace mongo {
             BSONObjBuilder statsBob(reasonBob.subobjStart("stats"));
             PlanStageStats* stats = entry->decision->stats.vector()[i];
             if (stats) {
-                statsToBSON(*stats, &statsBob);
+                Explain::statsToBSON(*stats, &statsBob);
             }
             statsBob.doneFast();
             reasonBob.doneFast();

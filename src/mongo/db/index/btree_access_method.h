@@ -51,14 +51,15 @@ namespace mongo {
         // superclass and subclasses (like this) can use them.
         using BtreeBasedAccessMethod::_descriptor;
 
-        BtreeAccessMethod(IndexCatalogEntry* btreeState );
+        BtreeAccessMethod(IndexCatalogEntry* btreeState,
+                          SortedDataInterface* btree );
         virtual ~BtreeAccessMethod() { }
 
     private:
         virtual void getKeys(const BSONObj& obj, BSONObjSet* keys);
 
         // Our keys differ for V0 and V1.
-        scoped_ptr<BtreeKeyGenerator> _keyGenerator;
+        boost::scoped_ptr<BtreeKeyGenerator> _keyGenerator;
     };
 
 }  // namespace mongo

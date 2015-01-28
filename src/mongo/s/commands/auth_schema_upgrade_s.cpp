@@ -26,6 +26,8 @@
  * then also delete it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+
 #include "mongo/platform/basic.h"
 
 #include <boost/scoped_ptr.hpp>
@@ -44,8 +46,13 @@
 #include "mongo/s/config.h"
 #include "mongo/s/shard.h"
 #include "mongo/s/type_shard.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
+
+    using std::endl;
+    using std::string;
+
 namespace {
 
     /**
@@ -121,6 +128,7 @@ namespace {
 
     class CmdAuthSchemaUpgradeS : public CmdAuthSchemaUpgrade {
         virtual bool run(
+                OperationContext* txn,
                 const string& dbname,
                 BSONObj& cmdObj,
                 int options,
@@ -150,13 +158,13 @@ namespace {
                         Status(ErrorCodes::LockBusy, "Could not lock auth data update lock."));
             }
 
-            status = checkClusterMongoVersions(configServer.getConnectionString(), "2.5.4");
+            status = checkClusterMongoVersions(configServer.getConnectionString(), "2.7.6");
             if (!status.isOK()) {
                 log() << "Auth schema upgrade failed: " << status << endl;
                 return appendCommandStatus(result, status);
             }
 
-            status = authzManager->upgradeSchema(maxSteps, writeConcern);
+            status = authzManager->upgradeSchema(txn, maxSteps, writeConcern);
             if (!status.isOK())
                 return appendCommandStatus(result, status);
 

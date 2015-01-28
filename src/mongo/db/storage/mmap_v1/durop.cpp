@@ -28,23 +28,30 @@
 *    it in the license file.
 */
 
-#include "mongo/pch.h"
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+
+#include "mongo/platform/basic.h"
 
 #include "mongo/db/storage/mmap_v1/durop.h"
 
-#include "mongo/db/d_concurrency.h"
-#include "mongo/db/repair_database.h"
-#include "mongo/db/storage/durable_mapped_file.h"
-#include "mongo/util/alignedbuilder.h"
+#include <boost/filesystem/operations.hpp>
+#include <boost/shared_ptr.hpp>
+
+#include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/storage/mmap_v1/aligned_builder.h"
+#include "mongo/db/storage/mmap_v1/durable_mapped_file.h"
+#include "mongo/db/storage/mmap_v1/mmap_v1_engine.h"
 #include "mongo/util/file.h"
 #include "mongo/util/file_allocator.h"
+#include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 
-using namespace mongoutils;
-
-#include <boost/filesystem/operations.hpp>
-
 namespace mongo {
+
+    using boost::scoped_array;
+    using boost::shared_ptr;
+    using std::endl;
+    using std::string;
 
     namespace dur {
 
@@ -95,7 +102,7 @@ namespace mongo {
 
         FileCreatedOp::FileCreatedOp(const std::string& f, unsigned long long l) :
             DurOp(JEntry::OpCode_FileCreated) {
-            _p = RelativePath::fromFullPath(f);
+            _p = RelativePath::fromFullPath(storageGlobalParams.dbpath, f);
             _len = l;
         }
 

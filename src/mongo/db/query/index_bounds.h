@@ -41,13 +41,13 @@ namespace mongo {
      */
     struct OrderedIntervalList {
         OrderedIntervalList() { }
-        OrderedIntervalList(const string& n) : name(n) { }
+        OrderedIntervalList(const std::string& n) : name(n) { }
 
         // Must be ordered according to the index order.
-        vector<Interval> intervals;
+        std::vector<Interval> intervals;
 
         // TODO: We could drop this.  Only used in IndexBounds::isValidFor.
-        string name;
+        std::string name;
 
         bool isValidFor(int expectedOrientation) const;
         std::string toString() const;
@@ -71,10 +71,10 @@ namespace mongo {
      * interpret.  Previously known as FieldRangeVector.
      */
     struct IndexBounds {
-        IndexBounds() : isSimpleRange(false) { }
+        IndexBounds() : isSimpleRange(false), endKeyInclusive(false) { }
 
         // For each indexed field, the values that the field is allowed to take on.
-        vector<OrderedIntervalList> fields;
+        std::vector<OrderedIntervalList> fields;
 
         // Debugging check.
         // We must have as many fields the key pattern does.
@@ -93,6 +93,15 @@ namespace mongo {
         size_t getNumIntervals(size_t i) const;
         Interval getInterval(size_t i, size_t j) const;
         std::string toString() const;
+
+        /**
+         * BSON format for explain. The format is an array of strings for each field.
+         * Each string represents an interval. The strings use "[" and "]" if the interval
+         * bounds are inclusive, and "(" / ")" if exclusive.
+         *
+         * Ex.
+         *  {a: ["[1, 1]", "(3, 10)"], b: ["[Infinity, 10)"] }
+         */
         BSONObj toBSON() const;
 
         // TODO: we use this for max/min scan.  Consider migrating that.
@@ -121,7 +130,7 @@ namespace mongo {
          *
          * Returns true if there is a valid start key.  Returns false otherwise.
          */
-        bool getStartKey(vector<const BSONElement*>* valueOut, vector<bool>* inclusiveOut);
+        bool getStartKey(std::vector<const BSONElement*>* valueOut, std::vector<bool>* inclusiveOut);
 
         /**
          * The states of a key from an index scan.  See checkKey below.
@@ -179,7 +188,7 @@ namespace mongo {
          *         If the i-th element is true, seek to the i-th element of out.
          */
         KeyState checkKey(const BSONObj& key, int* keyEltsToUse, bool* movePastKeyElts,
-                          vector<const BSONElement*>* out, vector<bool>* incOut);
+                          std::vector<const BSONElement*>* out, std::vector<bool>* incOut);
 
         /**
          * Relative position of a key to an interval.
@@ -217,7 +226,7 @@ namespace mongo {
          * 'where' is the leftmost field that isn't in the interval we think it is.
          * 'what' is the orientation of the field with respect to that interval.
          */
-        bool findLeftmostProblem(const vector<BSONElement>& keyValues, size_t* where,
+        bool findLeftmostProblem(const std::vector<BSONElement>& keyValues, size_t* where,
                                  Location* what);
 
         /**
@@ -226,16 +235,16 @@ namespace mongo {
          *
          * keyValues are the elements of the index key in order.
          */
-        bool spaceLeftToAdvance(size_t fieldsToCheck, const vector<BSONElement>& keyValues);
+        bool spaceLeftToAdvance(size_t fieldsToCheck, const std::vector<BSONElement>& keyValues);
 
         // The actual bounds.  Must outlive this object.  Not owned by us.
         const IndexBounds* _bounds;
 
         // For each field, which interval are we currently in?
-        vector<size_t> _curInterval;
+        std::vector<size_t> _curInterval;
 
         // Direction of scan * direction of indexing.
-        vector<int> _expectedDirection;
+        std::vector<int> _expectedDirection;
     };
 
 }  // namespace mongo

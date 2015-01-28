@@ -30,8 +30,10 @@
 
 #pragma once
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
+#include <boost/noncopyable.hpp>
+#include <boost/shared_ptr.hpp>
 #include <string>
 
 #include "mongo/client/parallel.h"
@@ -106,9 +108,9 @@ namespace mongo {
 
         static long long TIMEOUT;
 
-        typedef map<long long,ShardedClientCursorPtr> MapSharded;
-        typedef map<long long,int> MapShardedInt;
-        typedef map<long long,string> MapNormal;
+        typedef std::map<long long,ShardedClientCursorPtr> MapSharded;
+        typedef std::map<long long,int> MapShardedInt;
+        typedef std::map<long long,std::string> MapNormal;
 
         CursorCache();
         ~CursorCache();
@@ -123,7 +125,7 @@ namespace mongo {
         void removeRef( long long id );
 
         /** @return the server for id or "" */
-        string getRef( long long id ) const ;
+        std::string getRef( long long id ) const ;
         /** @return the ns for id or "" */
         std::string getRefNS(long long id) const ;
         

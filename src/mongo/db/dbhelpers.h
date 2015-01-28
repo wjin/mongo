@@ -28,11 +28,11 @@
 
 #pragma once
 
-// TODO: Remove
-#include "mongo/pch.h"
+#include <boost/noncopyable.hpp>
 
 #include "mongo/db/client.h"
 #include "mongo/db/db.h"
+#include "mongo/db/record_id.h"
 #include "mongo/db/keypattern.h"
 #include "mongo/s/range_arithmetic.h"
 
@@ -42,7 +42,8 @@ namespace mongo {
 
     class Collection;
     class Cursor;
-    class TransactionExperiment;
+    class OperationContext;
+    struct WriteConcernOptions;
 
     /**
      * db helpers are helper functions and classes that let us easily manipulate the local
@@ -64,7 +65,7 @@ namespace mongo {
 
            Note: does nothing if collection does not yet exist.
         */
-        static void ensureIndex(TransactionExperiment* txn,
+        static void ensureIndex(OperationContext* txn,
                                 Collection* collection,
                                 BSONObj keyPattern,
                                 bool unique,
@@ -81,29 +82,30 @@ namespace mongo {
 
            @return true if object found
         */
-        static bool findOne(Collection* collection,
+        static bool findOne(OperationContext* txn,
+                            Collection* collection,
                             const BSONObj &query,
                             BSONObj& result, 
                             bool requireIndex = false);
 
-        static DiskLoc findOne(Collection* collection, const BSONObj &query, bool requireIndex);
-
-        /**
-         * have to be locked already
-         */
-        static vector<BSONObj> findAll( const string& ns , const BSONObj& query );
+        static RecordId findOne(OperationContext* txn,
+                               Collection* collection,
+                               const BSONObj &query,
+                               bool requireIndex);
 
         /**
          * @param foundIndex if passed in will be set to 1 if ns and index found
          * @return true if object found
          */
-        static bool findById(Database* db, const char *ns, BSONObj query, BSONObj& result,
+        static bool findById(OperationContext* txn,
+                             Database* db, const char *ns, BSONObj query, BSONObj& result,
                              bool* nsFound = 0, bool* indexFound = 0 );
 
         /* TODO: should this move into Collection?
          * uasserts if no _id index.
          * @return null loc if not found */
-        static DiskLoc findById(Collection* collection, const BSONObj& query);
+        static RecordId findById(OperationContext* txn,
+                                Collection* collection, const BSONObj& query);
 
         /** Get/put the first (or last) object from a collection.  Generally only useful if the collection
             only ever has a single object -- which is a "singleton collection".
@@ -112,26 +114,24 @@ namespace mongo {
 
             @return true if object exists.
         */
-        static bool getSingleton(const char *ns, BSONObj& result);
-        static void putSingleton(TransactionExperiment* txn, const char *ns, BSONObj obj);
-        static void putSingletonGod(TransactionExperiment* txn, const char *ns, BSONObj obj, bool logTheOp);
-        static bool getFirst(const char *ns, BSONObj& result) { return getSingleton(ns, result); }
-        static bool getLast(const char *ns, BSONObj& result); // get last object int he collection; e.g. {$natural : -1}
+        static bool getSingleton(OperationContext* txn, const char *ns, BSONObj& result);
+        static void putSingleton(OperationContext* txn, const char *ns, BSONObj obj);
+        static void putSingletonGod(OperationContext* txn, const char *ns, BSONObj obj, bool logTheOp);
+
+        /**
+         * get last object int he collection; e.g. {$natural : -1}
+         */
+        static bool getLast(OperationContext* txn, const char *ns, BSONObj& result);
 
         /**
          * you have to lock
          * you do not have to have Context set
          * o has to have an _id field or will assert
          */
-        static void upsert( TransactionExperiment* txn,
-                            const string& ns,
+        static void upsert( OperationContext* txn,
+                            const std::string& ns,
                             const BSONObj& o,
                             bool fromMigrate = false );
-
-        /** You do not need to set the database before calling.
-            @return true if collection is empty.
-        */
-        static bool isEmpty(const char *ns);
 
         // TODO: this should be somewhere else probably
         /* Takes object o, and returns a new object with the
@@ -162,9 +162,10 @@ namespace mongo {
          * Does oplog the individual document deletions.
          * // TODO: Refactor this mechanism, it is growing too large
          */
-        static long long removeRange( const KeyRange& range,
-                                      bool maxInclusive = false,
-                                      bool secondaryThrottle = false,
+        static long long removeRange( OperationContext* txn,
+                                      const KeyRange& range,
+                                      bool maxInclusive,
+                                      const WriteConcernOptions& secondaryThrottle,
                                       RemoveSaver* callback = NULL,
                                       bool fromMigrate = false,
                                       bool onlyRemoveOrphanedDocs = false );
@@ -189,9 +190,10 @@ namespace mongo {
          * @return IndexNotFound if the index pattern doesn't match any indexes
          * @return InvalidLength if the estimated size exceeds maxChunkSizeBytes
          */
-        static Status getLocsInRange( const KeyRange& range,
+        static Status getLocsInRange( OperationContext* txn,
+                                      const KeyRange& range,
                                       long long maxChunkSizeBytes,
-                                      set<DiskLoc>* locs,
+                                      std::set<RecordId>* locs,
                                       long long* numDocs,
                                       long long* estChunkSizeBytes );
 
@@ -200,14 +202,14 @@ namespace mongo {
          * You do not need to set the database before calling.
          * Does not oplog the operation.
          */
-        static void emptyCollection(TransactionExperiment* txn, const char *ns);
+        static void emptyCollection(OperationContext* txn, const char *ns);
 
         /**
          * for saving deleted bson objects to a flat file
          */
         class RemoveSaver : public boost::noncopyable {
         public:
-            RemoveSaver(const string& type, const string& ns, const string& why);
+            RemoveSaver(const std::string& type, const std::string& ns, const std::string& why);
             ~RemoveSaver();
 
             void goingToDelete( const BSONObj& o );
@@ -215,7 +217,7 @@ namespace mongo {
         private:
             boost::filesystem::path _root;
             boost::filesystem::path _file;
-            ofstream* _out;
+            std::ofstream* _out;
         };
 
     };

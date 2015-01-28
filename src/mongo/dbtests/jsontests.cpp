@@ -29,16 +29,27 @@
  *    then also delete it in the license file.
  */
 
-#include "mongo/pch.h"
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+
+#include "mongo/platform/basic.h"
 
 #include <limits>
 
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
 #include "mongo/dbtests/dbtests.h"
+#include "mongo/util/log.h"
 
 
 namespace JsonTests {
+
+    using std::cout;
+    using std::endl;
+    using std::numeric_limits;
+    using std::string;
+    using std::stringstream;
+    using std::vector;
+
     namespace JsonStringTests {
 
         class Empty {
@@ -284,8 +295,9 @@ namespace JsonTests {
         class DBRef {
         public:
             void run() {
-                OID oid;
-                memset( &oid, 0xff, 12 );
+                char OIDbytes[OID::kOIDSize];
+                memset( &OIDbytes, 0xff, OID::kOIDSize );
+                OID oid = OID::from(OIDbytes);
                 BSONObjBuilder b;
                 b.appendDBRef( "a", "namespace", oid );
                 BSONObj built = b.done();
@@ -301,8 +313,9 @@ namespace JsonTests {
         class DBRefZero {
         public:
             void run() {
-                OID oid;
-                memset( &oid, 0, 12 );
+                char OIDbytes[OID::kOIDSize];
+                memset( &OIDbytes, 0, OID::kOIDSize );
+                OID oid = OID::from(OIDbytes);
                 BSONObjBuilder b;
                 b.appendDBRef( "a", "namespace", oid );
                 ASSERT_EQUALS( "{ \"a\" : { \"$ref\" : \"namespace\", \"$id\" : \"000000000000000000000000\" } }",
@@ -313,8 +326,9 @@ namespace JsonTests {
         class ObjectId {
         public:
             void run() {
-                OID oid;
-                memset( &oid, 0xff, 12 );
+                char OIDbytes[OID::kOIDSize];
+                memset( &OIDbytes, 0xff, OID::kOIDSize );
+                OID oid = OID::from(OIDbytes);
                 BSONObjBuilder b;
                 b.appendOID( "a", &oid );
                 BSONObj built = b.done();
@@ -418,6 +432,14 @@ namespace JsonTests {
                                built.jsonString( Strict ) );
                 ASSERT_EQUALS( "{ \"a\" : Date( 0 ) }", built.jsonString( TenGen ) );
                 ASSERT_EQUALS( "{ \"a\" : Date( 0 ) }", built.jsonString( JS ) );
+
+                // Test dates above our maximum formattable date.  See SERVER-13760.
+                BSONObjBuilder b2;
+                b2.appendDate("a", 32535262800000ULL);
+                BSONObj built2 = b2.done();
+                ASSERT_EQUALS(
+                            "{ \"a\" : { \"$date\" : { \"$numberLong\" : \"32535262800000\" } } }",
+                            built2.jsonString( Strict ) );
             }
 
         private:
@@ -570,10 +592,10 @@ namespace JsonTests {
             virtual ~Base() {}
             void run() {
                 ASSERT( fromjson( json() ).valid() );
-                assertEquals( bson(), fromjson( json() ), "mode: <default>" );
-                assertEquals( bson(), fromjson( bson().jsonString( Strict ) ), "mode: strict" );
-                assertEquals( bson(), fromjson( bson().jsonString( TenGen ) ), "mode: tengen" );
-                assertEquals( bson(), fromjson( bson().jsonString( JS ) ), "mode: js" );
+                assertEquals( bson(), fromjson( tojson( bson() ) ), "mode: <default>" );
+                assertEquals( bson(), fromjson( tojson( bson(), Strict ) ), "mode: strict" );
+                assertEquals( bson(), fromjson( tojson( bson(), TenGen ) ), "mode: tengen" );
+                assertEquals( bson(), fromjson( tojson( bson(), JS ) ), "mode: js" );
             }
         protected:
             virtual BSONObj bson() const = 0;
@@ -584,12 +606,14 @@ namespace JsonTests {
                                const char* msg) {
                 const bool bad = expected.woCompare( actual );
                 if ( bad ) {
-                    out() << "want:" << expected.jsonString() << " size: " << expected.objsize() << endl;
-                    out() << "got :" << actual.jsonString() << " size: " << actual.objsize() << endl;
-                    out() << expected.hexDump() << endl;
-                    out() << actual.hexDump() << endl;
-                    out() << msg << endl;
-                    out() << "orig json:" << this->json();
+                    ::mongo::log() << "want:" << expected.jsonString()
+                                   << " size: " << expected.objsize() << endl;
+                    ::mongo::log() << "got :" << actual.jsonString()
+                                   << " size: " << actual.objsize() << endl;
+                    ::mongo::log() << expected.hexDump() << endl;
+                    ::mongo::log() << actual.hexDump() << endl;
+                    ::mongo::log() << msg << endl;
+                    ::mongo::log() << "orig json:" << this->json();
                 }
                 ASSERT( !bad );
             }
@@ -801,6 +825,27 @@ namespace JsonTests {
             }
             virtual string json() const {
                 return "{ \"a\" : [] }";
+            }
+        };
+
+        class TopLevelArrayEmpty : public Base {
+            virtual BSONObj bson() const {
+                return BSONArray();
+            }
+            virtual string json() const {
+                return "[]";
+            }
+        };
+
+        class TopLevelArray : public Base {
+            virtual BSONObj bson() const {
+                BSONArrayBuilder builder;
+                builder.append(123);
+                builder.append("abc");
+                return builder.arr();
+            }
+            virtual string json() const {
+                return "[ 123, \"abc\" ]";
             }
         };
 
@@ -1142,7 +1187,6 @@ namespace JsonTests {
             virtual BSONObj bson() const {
                 BSONObjBuilder b;
                 OID o;
-                memset( &o, 0, 12 );
                 BSONObjBuilder subBuilder(b.subobjStart("a"));
                 subBuilder.append("$ref", "ns");
                 subBuilder.append("$id", o);
@@ -1158,7 +1202,6 @@ namespace JsonTests {
             virtual BSONObj bson() const {
                 BSONObjBuilder b;
                 OID o;
-                memset( &o, 0, 12 );
                 BSONObjBuilder subBuilder(b.subobjStart("a"));
                 subBuilder.append("$ref", "ns");
                 subBuilder.append("$id", o);
@@ -1200,8 +1243,9 @@ namespace JsonTests {
         class Oid2 : public Base {
             virtual BSONObj bson() const {
                 BSONObjBuilder b;
-                OID o;
-                memset( &o, 0x0f, 12 );
+                char OIDbytes[OID::kOIDSize];
+                memset( &OIDbytes, 0x0f, OID::kOIDSize );
+                OID o = OID::from(OIDbytes);
                 b.appendOID( "_id", &o );
                 return b.obj();
             }
@@ -2597,6 +2641,40 @@ namespace JsonTests {
             }
         };
 
+        class MinKeyAlone : public Bad {
+            virtual string json() const {
+                return "{ \"$minKey\" : 1 }";
+            }
+        };
+
+        class MaxKeyAlone : public Bad {
+            virtual string json() const {
+                return "{ \"$maxKey\" : 1 }";
+            }
+        };
+
+        class MinKey : public Base {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                b.appendMinKey("a");
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : { \"$minKey\" : 1 } }";
+            }
+        };
+
+        class MaxKey : public Base {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                b.appendMaxKey("a");
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : { \"$maxKey\" : 1 } }";
+            }
+        };
+
     } // namespace FromJsonTests
 
     class All : public Suite {
@@ -2665,6 +2743,8 @@ namespace JsonTests {
             add< FromJsonTests::Subobject >();
             add< FromJsonTests::DeeplyNestedObject >();
             add< FromJsonTests::ArrayEmpty >();
+            add< FromJsonTests::TopLevelArrayEmpty >();
+            add< FromJsonTests::TopLevelArray >();
             add< FromJsonTests::Array >();
             add< FromJsonTests::True >();
             add< FromJsonTests::False >();
@@ -2856,8 +2936,12 @@ namespace JsonTests {
             add< FromJsonTests::EmbeddedDatesFormat3 >();
             add< FromJsonTests::NullString >();
             add< FromJsonTests::NullFieldUnquoted >();
+            add< FromJsonTests::MinKey >();
+            add< FromJsonTests::MaxKey >();
         }
-    } myall;
+    };
+
+    SuiteInstance<All> myall;
 
 } // namespace JsonTests
 

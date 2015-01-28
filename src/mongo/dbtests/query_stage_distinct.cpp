@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2013-2014 MongoDB Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -28,10 +28,11 @@
 
 #include "mongo/client/dbclientcursor.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/dbdirectclient.h"
 #include "mongo/db/exec/distinct_scan.h"
 #include "mongo/db/exec/plan_stage.h"
-#include "mongo/db/instance.h"
 #include "mongo/db/json.h"
+#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/query/index_bounds_builder.h"
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/db/catalog/collection.h"
@@ -45,27 +46,20 @@ namespace QueryStageDistinct {
 
     class DistinctBase {
     public:
-        DistinctBase() { }
+        DistinctBase() : _client(&_txn) { 
+
+        }
 
         virtual ~DistinctBase() {
-            Client::WriteContext ctx(ns());
             _client.dropCollection(ns());
         }
 
         void addIndex(const BSONObj& obj) {
-            Client::WriteContext ctx(ns());
-            _client.ensureIndex(ns(), obj);
+            ASSERT_OK(dbtests::createIndex(&_txn, ns(), obj));
         }
 
         void insert(const BSONObj& obj) {
-            Client::WriteContext ctx(ns());
             _client.insert(ns(), obj);
-        }
-
-        IndexDescriptor* getIndex(const BSONObj& obj) {
-            Client::ReadContext ctx(ns());
-            Collection* collection = ctx.ctx().db()->getCollection( ns() );
-            return collection->getIndexCatalog()->findIndexByKeyPattern( obj );
         }
 
         /**
@@ -85,22 +79,24 @@ namespace QueryStageDistinct {
 
             // Distinct hack execution is always covered.
             // Key value is retrieved from working set key data
-            // instead of DiskLoc.
+            // instead of RecordId.
             ASSERT_FALSE(member->hasObj());
             BSONElement keyElt;
             ASSERT_TRUE(member->getFieldDotted(field, &keyElt));
-            ASSERT_EQUALS(mongo::NumberInt, keyElt.type());
+            ASSERT_TRUE(keyElt.isNumber());
 
             return keyElt.numberInt();
         }
 
         static const char* ns() { return "unittests.QueryStageDistinct"; }
 
+    protected:
+        OperationContextImpl _txn;
+
     private:
-        static DBDirectClient _client;
+        DBDirectClient _client;
     };
 
-    DBDirectClient DistinctBase::_client;
 
     // Tests distinct with single key indices.
     class QueryStageDistinctBasic : public DistinctBase {
@@ -121,11 +117,12 @@ namespace QueryStageDistinct {
             // Make an index on a:1
             addIndex(BSON("a" << 1));
 
-            Client::ReadContext ctx(ns());
+            AutoGetCollectionForRead ctx(&_txn, ns());
+            Collection* coll = ctx.getCollection();
 
             // Set up the distinct stage.
             DistinctParams params;
-            params.descriptor = getIndex(BSON("a" << 1));
+            params.descriptor = coll->getIndexCatalog()->findIndexByKeyPattern(&_txn, BSON("a" << 1));
             verify(params.descriptor);
             params.direction = 1;
             // Distinct-ing over the 0-th field of the keypattern.
@@ -137,12 +134,12 @@ namespace QueryStageDistinct {
             params.bounds.fields.push_back(oil);
 
             WorkingSet ws;
-            DistinctScan* distinct = new DistinctScan(params, &ws);
+            DistinctScan distinct(&_txn, params, &ws);
 
             WorkingSetID wsid;
             // Get our first result.
             int firstResultWorks = 0;
-            while (PlanStage::ADVANCED != distinct->work(&wsid)) {
+            while (PlanStage::ADVANCED != distinct.work(&wsid)) {
                 ++firstResultWorks;
             }
             // 5 is a bogus number.  There's some amount of setup done by the first few calls but
@@ -153,7 +150,7 @@ namespace QueryStageDistinct {
             // Getting our second result should be very quick as we just skip
             // over the first result.
             int secondResultWorks = 0;
-            while (PlanStage::ADVANCED != distinct->work(&wsid)) {
+            while (PlanStage::ADVANCED != distinct.work(&wsid)) {
                 ++secondResultWorks;
             }
             ASSERT_EQUALS(2, getIntFieldDotted(ws, wsid, "a"));
@@ -161,7 +158,7 @@ namespace QueryStageDistinct {
             // all the 'a' values.
             ASSERT_EQUALS(0, secondResultWorks);
 
-            ASSERT_EQUALS(PlanStage::IS_EOF, distinct->work(&wsid));
+            ASSERT_EQUALS(PlanStage::IS_EOF, distinct.work(&wsid));
         }
     };
 
@@ -184,12 +181,13 @@ namespace QueryStageDistinct {
             // Make an index on a:1
             addIndex(BSON("a" << 1));
 
-            Client::ReadContext ctx(ns());
+            AutoGetCollectionForRead ctx(&_txn, ns());
+            Collection* coll = ctx.getCollection();
 
             // Set up the distinct stage.
             DistinctParams params;
-            params.descriptor = getIndex(BSON("a" << 1));
-            ASSERT_TRUE(params.descriptor->isMultikey());
+            params.descriptor = coll->getIndexCatalog()->findIndexByKeyPattern(&_txn, BSON("a" << 1));
+            ASSERT_TRUE(params.descriptor->isMultikey(&_txn));
 
             verify(params.descriptor);
             params.direction = 1;
@@ -202,14 +200,14 @@ namespace QueryStageDistinct {
             params.bounds.fields.push_back(oil);
 
             WorkingSet ws;
-            DistinctScan* distinct = new DistinctScan(params, &ws);
+            DistinctScan distinct(&_txn, params, &ws);
 
             // We should see each number in the range [1, 6] exactly once.
             std::set<int> seen;
 
             WorkingSetID wsid;
             PlanStage::StageState state;
-            while (PlanStage::IS_EOF != (state = distinct->work(&wsid))) {
+            while (PlanStage::IS_EOF != (state = distinct.work(&wsid))) {
                 if (PlanStage::ADVANCED == state) {
                     // Check int value.
                     int currentNumber = getIntFieldDotted(ws, wsid, "a");
@@ -237,6 +235,8 @@ namespace QueryStageDistinct {
             add<QueryStageDistinctBasic>();
             add<QueryStageDistinctMultiKey>();
         }
-    }  queryStageDistinctAll;
+    };
+
+    SuiteInstance<All> queryStageDistinctAll;
 
 }  // namespace QueryStageDistinct

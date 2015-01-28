@@ -34,20 +34,22 @@
 
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
-#include "mongo/db/matcher.h"
+#include "mongo/db/matcher/matcher.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_geo.h"
 
 namespace mongo {
 
+    using std::auto_ptr;
+
     TEST( ExpressionGeoTest, Geo1 ) {
         BSONObj query = fromjson("{loc:{$within:{$box:[{x: 4, y:4},[6,6]]}}}");
 
-        GeoQuery gq;
-        ASSERT( gq.parseFrom( query["loc"].Obj() ) );
+        auto_ptr<GeoExpression> gq(new GeoExpression);
+        ASSERT_OK( gq->parseFrom( query["loc"].Obj() ) );
 
         GeoMatchExpression ge;
-        ASSERT( ge.init("a", gq, query ).isOK() );
+        ASSERT( ge.init("a", gq.release(), query ).isOK() );
 
         ASSERT(!ge.matchesBSON(fromjson("{a: [3,4]}")));
         ASSERT(ge.matchesBSON(fromjson("{a: [4,4]}")));
@@ -60,14 +62,14 @@ namespace mongo {
     TEST(ExpressionGeoTest, GeoNear1) {
         BSONObj query = fromjson("{loc:{$near:{$maxDistance:100, "
                                  "$geometry:{type:\"Point\", coordinates:[0,0]}}}}");
-        NearQuery nq;
-        ASSERT_OK(nq.parseFrom(query["loc"].Obj()));
+        auto_ptr<GeoNearExpression> nq(new GeoNearExpression);
+        ASSERT_OK(nq->parseFrom(query["loc"].Obj()));
 
         GeoNearMatchExpression gne;
-        ASSERT(gne.init("a", nq, query).isOK());
+        ASSERT(gne.init("a", nq.release(), query).isOK());
 
         // We can't match the data but we can make sure it was parsed OK.
-        ASSERT_EQUALS(gne.getData().centroid.crs, SPHERE);
+        ASSERT_EQUALS(gne.getData().centroid->crs, SPHERE);
         ASSERT_EQUALS(gne.getData().minDistance, 0);
         ASSERT_EQUALS(gne.getData().maxDistance, 100);
     }

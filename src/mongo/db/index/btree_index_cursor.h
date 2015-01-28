@@ -28,35 +28,27 @@
 
 #pragma once
 
+#include <boost/scoped_ptr.hpp>
 #include <vector>
 
 #include "mongo/base/status.h"
-#include "mongo/db/diskloc.h"
-#include "mongo/db/jsobj.h"
 #include "mongo/db/index/index_cursor.h"
 #include "mongo/db/index/index_descriptor.h"
-#include "mongo/db/structure/btree/btree_interface.h"
+#include "mongo/db/jsobj.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/storage/sorted_data_interface.h"
 
 namespace mongo {
 
     class BtreeIndexCursor : public IndexCursor {
     public:
-        virtual ~BtreeIndexCursor();
-
         bool isEOF() const;
-
-        /**
-         * Called from btree_logic.cpp when we're about to delete a Btree bucket.
-         */
-        static void aboutToDeleteBucket(const DiskLoc& bucket);
-
-        virtual Status setOptions(const CursorOptions& options);
 
         virtual Status seek(const BSONObj& position);
 
         // Btree-specific seeking functions.
-        Status seek(const vector<const BSONElement*>& position,
-                    const vector<bool>& inclusive);
+        Status seek(const std::vector<const BSONElement*>& position,
+                    const std::vector<bool>& inclusive);
 
         /**
          * Seek to the key 'position'.  If 'afterKey' is true, seeks to the first
@@ -69,11 +61,11 @@ namespace mongo {
         Status skip(const BSONObj& keyBegin,
                     int keyBeginLen,
                     bool afterKey,
-                    const vector<const BSONElement*>& keyEnd,
-                    const vector<bool>& keyEndInclusive);
+                    const std::vector<const BSONElement*>& keyEnd,
+                    const std::vector<bool>& keyEndInclusive);
 
         virtual BSONObj getKey() const;
-        virtual DiskLoc getValue() const;
+        virtual RecordId getValue() const;
         virtual void next();
 
         /**
@@ -85,25 +77,20 @@ namespace mongo {
 
         virtual Status savePosition();
 
-        virtual Status restorePosition();
+        virtual Status restorePosition(OperationContext* txn);
 
-        virtual string toString();
+        virtual std::string toString();
 
     private:
         // We keep the constructor private and only allow the AM to create us.
         friend class BtreeBasedAccessMethod;
 
         /**
-         * head is the head of the Btree.
          * interface is an abstraction to hide the fact that we have two types of Btrees.
-         *
-         * 'this' will forward by default.  Call setOptions to change this.
-         * XXX: put options in ctor(?)
          *
          * Intentionally private, we're friends with the only class allowed to call it.
          */
-        BtreeIndexCursor(const DiskLoc head,
-                         BtreeInterface* newInterface);
+        BtreeIndexCursor(SortedDataInterface::Cursor* cursor);
 
         bool isSavedPositionValid();
 
@@ -113,24 +100,7 @@ namespace mongo {
          */
         void advance();
 
-        // For handling bucket deletion.
-        static unordered_set<BtreeIndexCursor*> _activeCursors;
-        static SimpleMutex _activeCursorsMutex;
-
-        // For saving/restoring position.
-        BtreeInterface::SavedPositionData _savedData;
-
-        int _direction;
-
-        // Not owned here.
-        BtreeInterface* _interface;
-
-        // TODO: Have some kind of BtreeInterface::BtreePosition to encapsulate this.
-        // What are we looking at RIGHT NOW?  We look at a bucket.
-        DiskLoc _bucket;
-
-        // And we look at an offset in the bucket.
-        int _keyOffset;
+        boost::scoped_ptr<SortedDataInterface::Cursor> _cursor;
     };
 
 }  // namespace mongo

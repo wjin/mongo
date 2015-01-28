@@ -26,11 +26,12 @@
  *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+
 #include "mongo/db/query/planner_ixselect.h"
 
 #include <vector>
 
-#include "mongo/db/geo/core.h"
 #include "mongo/db/geo/hash.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/matcher/expression_array.h"
@@ -40,6 +41,7 @@
 #include "mongo/db/query/index_tag.h"
 #include "mongo/db/query/qlog.h"
 #include "mongo/db/query/query_planner_common.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -53,14 +55,12 @@ namespace mongo {
      * 2d indices don't handle wrapping so we can't use them for queries that wrap.
      */
     static bool twoDWontWrap(const Circle& circle, const IndexEntry& index) {
-        GeoHashConverter::Parameters params;
-        params.bits = static_cast<unsigned>(fieldWithDefault(index.infoObj, "bits", 26));
-        params.max = fieldWithDefault(index.infoObj, "max", 180.0);
-        params.min = fieldWithDefault(index.infoObj, "min", -180.0);
-        double numBuckets = (1024 * 1024 * 1024 * 4.0);
-        params.scaling = numBuckets / (params.max - params.min);
 
-        GeoHashConverter conv(params);
+        GeoHashConverter::Parameters hashParams;
+        Status paramStatus = GeoHashConverter::parseParameters(index.infoObj, &hashParams);
+        verify(paramStatus.isOK()); // we validated the params on index creation
+
+        GeoHashConverter conv(hashParams);
 
         // FYI: old code used flat not spherical error.
         double yscandist = rad2deg(circle.radius) + conv.getErrorSphere();
@@ -174,10 +174,11 @@ namespace mongo {
                     return false;
                 }
 
-                // Can't index negations of MOD, REGEX, or ELEM_MATCH_VALUE.
+                // Can't index negations of MOD, REGEX, TYPE_OPERATOR, or ELEM_MATCH_VALUE.
                 MatchExpression::MatchType childtype = node->getChild(0)->matchType();
                 if (MatchExpression::REGEX == childtype ||
                     MatchExpression::MOD == childtype ||
+                    MatchExpression::TYPE_OPERATOR == childtype ||
                     MatchExpression::ELEM_MATCH_VALUE == childtype) {
                     return false;
                 }
@@ -240,46 +241,47 @@ namespace mongo {
             if (exprtype == MatchExpression::GEO) {
                 // within or intersect.
                 GeoMatchExpression* gme = static_cast<GeoMatchExpression*>(node);
-                const GeoQuery& gq = gme->getGeoQuery();
+                const GeoExpression& gq = gme->getGeoExpression();
                 const GeometryContainer& gc = gq.getGeometry();
                 return gc.hasS2Region();
             }
             else if (exprtype == MatchExpression::GEO_NEAR) {
                 GeoNearMatchExpression* gnme = static_cast<GeoNearMatchExpression*>(node);
                 // Make sure the near query is compatible with 2dsphere.
-                if (gnme->getData().centroid.crs == SPHERE || gnme->getData().isNearSphere) {
-                    return true;
-                }
+                return gnme->getData().centroid->crs == SPHERE;
             }
             return false;
         }
         else if (IndexNames::GEO_2D == indexedFieldType) {
             if (exprtype == MatchExpression::GEO_NEAR) {
                 GeoNearMatchExpression* gnme = static_cast<GeoNearMatchExpression*>(node);
-                return gnme->getData().centroid.crs == FLAT;
+                // Make sure the near query is compatible with 2d index
+                return gnme->getData().centroid->crs == FLAT || !gnme->getData().isWrappingQuery;
             }
             else if (exprtype == MatchExpression::GEO) {
                 // 2d only supports within.
                 GeoMatchExpression* gme = static_cast<GeoMatchExpression*>(node);
-                const GeoQuery& gq = gme->getGeoQuery();
-                if (GeoQuery::WITHIN != gq.getPred()) {
+                const GeoExpression& gq = gme->getGeoExpression();
+                if (GeoExpression::WITHIN != gq.getPred()) {
                     return false;
                 }
 
                 const GeometryContainer& gc = gq.getGeometry();
 
-                // 2d indices answer flat queries.
-                if (gc.hasFlatRegion()) {
+                // 2d indices require an R2 covering
+                if (gc.hasR2Region()) {
                     return true;
                 }
 
+                const CapWithCRS* cap = gc.getCapGeometryHack();
+
                 // 2d indices can answer centerSphere queries.
-                if (NULL == gc._cap.get()) {
+                if (NULL == cap) {
                     return false;
                 }
 
-                verify(SPHERE == gc._cap->crs);
-                const Circle& circle = gc._cap->circle;
+                verify(SPHERE == cap->crs);
+                const Circle& circle = cap->circle;
 
                 // No wrapping around the edge of the world is allowed in 2d centerSphere.
                 return twoDWontWrap(circle, index);
@@ -374,6 +376,73 @@ namespace mongo {
             MatchExpression::GEO_NEAR != node->matchType()) {
 
             stripInvalidAssignmentsTo2dsphereIndices(node, indices);
+        }
+    }
+
+    namespace {
+
+        /**
+         * For every node in the subtree rooted at 'node' that has a RelevantTag, removes index
+         * assignments from that tag.
+         *
+         * Used as a helper for stripUnneededAssignments().
+         */
+        void clearAssignments(MatchExpression* node) {
+            if (node->getTag()) {
+                RelevantTag* rt = static_cast<RelevantTag*>(node->getTag());
+                rt->first.clear();
+                rt->notFirst.clear();
+            }
+
+            for (size_t i = 0; i < node->numChildren(); i++) {
+                clearAssignments(node->getChild(i));
+            }
+        }
+
+    } // namespace
+
+    // static
+    void QueryPlannerIXSelect::stripUnneededAssignments(MatchExpression* node,
+                                                        const std::vector<IndexEntry>& indices) {
+        if (MatchExpression::AND == node->matchType()) {
+            for (size_t i = 0; i < node->numChildren(); i++) {
+                MatchExpression* child = node->getChild(i);
+
+                if (MatchExpression::EQ != child->matchType()) {
+                    continue;
+                }
+
+                if (!child->getTag()) {
+                    continue;
+                }
+
+                // We found a EQ child of an AND which is tagged.
+                RelevantTag* rt = static_cast<RelevantTag*>(child->getTag());
+
+                // Look through all of the indices for which this predicate can be answered with
+                // the leading field of the index.
+                for (std::vector<size_t>::const_iterator i = rt->first.begin();
+                        i != rt->first.end(); ++i) {
+                    size_t index = *i;
+
+                    if (indices[index].unique && 1 == indices[index].keyPattern.nFields()) {
+                        // Found an EQ predicate which can use a single-field unique index.
+                        // Clear assignments from the entire tree, and add back a single assignment
+                        // for 'child' to the unique index.
+                        clearAssignments(node);
+                        RelevantTag* newRt = static_cast<RelevantTag*>(child->getTag());
+                        newRt->first.push_back(index);
+
+                        // Tag state has been reset in the entire subtree at 'root'; nothing
+                        // else for us to do.
+                        return;
+                    }
+                }
+            }
+        }
+
+        for (size_t i = 0; i < node->numChildren(); i++) {
+            stripUnneededAssignments(node->getChild(i), indices);
         }
     }
 
@@ -536,12 +605,13 @@ namespace mongo {
     // 2dsphere V2 sparse quirks
     //
 
-    static void stripInvalidAssignmentsTo2dsphereIndex(
-            MatchExpression* node,
-            size_t idx,
-            const unordered_set<StringData, StringData::Hasher>& geoFields) {
+    static void stripInvalidAssignmentsTo2dsphereIndex(MatchExpression* node, size_t idx) {
 
-        if (Indexability::nodeCanUseIndexOnOwnField(node)) {
+        if (Indexability::nodeCanUseIndexOnOwnField(node)
+            && MatchExpression::GEO != node->matchType()
+            && MatchExpression::GEO_NEAR != node->matchType()) {
+            // We found a non-geo predicate tagged to use a V2 2dsphere index which is not
+            // and-related to a geo predicate that can use the index.
             removeIndexRelevantTag(node, idx);
             return;
         }
@@ -556,7 +626,7 @@ namespace mongo {
         if (MatchExpression::AND != nodeType) {
             // It's an OR or some kind of array operator.
             for (size_t i = 0; i < node->numChildren(); ++i) {
-                stripInvalidAssignmentsTo2dsphereIndex(node->getChild(i), idx, geoFields);
+                stripInvalidAssignmentsTo2dsphereIndex(node->getChild(i), idx);
             }
             return;
         }
@@ -570,7 +640,7 @@ namespace mongo {
             if (NULL == tag) {
                 // 'child' could be a logical operator.  Maybe there are some assignments hiding
                 // inside.
-                stripInvalidAssignmentsTo2dsphereIndex(child, idx, geoFields);
+                stripInvalidAssignmentsTo2dsphereIndex(child, idx);
                 continue;
             }
 
@@ -594,7 +664,7 @@ namespace mongo {
             else {
                 // Recurse on the children to ensure that they're not hiding any assignments
                 // to idx.
-                stripInvalidAssignmentsTo2dsphereIndex(child, idx, geoFields);
+                stripInvalidAssignmentsTo2dsphereIndex(child, idx);
             }
         }
 
@@ -602,7 +672,7 @@ namespace mongo {
         // if we use the index we'll miss results.
         if (!hasGeoField) {
             for (size_t i = 0; i < node->numChildren(); ++i) {
-                stripInvalidAssignmentsTo2dsphereIndex(node->getChild(i), idx, geoFields);
+                stripInvalidAssignmentsTo2dsphereIndex(node->getChild(i), idx);
             }
         }
     }
@@ -633,26 +703,22 @@ namespace mongo {
                 continue;
             }
 
-            // Gather the set of geo fields in this index.
-            unordered_set<StringData, StringData::Hasher> geoFields;
+            // If every field is geo don't bother doing anything.
+            bool allFieldsGeo = true;
             BSONObjIterator it(index.keyPattern);
             while (it.more()) {
                 BSONElement elt = it.next();
-                if (String == elt.type()) {
-                    geoFields.insert(elt.fieldName());
+                if (String != elt.type()) {
+                    allFieldsGeo = false;
+                    break;
                 }
             }
-
-            // If every field is geo don't bother doing anything.
-            if (geoFields.size() == static_cast<size_t>(index.keyPattern.nFields())) {
+            if (allFieldsGeo) {
                 continue;
             }
 
-            // You can't have a 2dsphere index without a 2dsphere field.
-            invariant(!geoFields.empty());
-
             // Remove bad assignments from this index.
-            stripInvalidAssignmentsTo2dsphereIndex(node, i, geoFields);
+            stripInvalidAssignmentsTo2dsphereIndex(node, i);
         }
     }
 

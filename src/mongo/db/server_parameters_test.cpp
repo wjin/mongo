@@ -30,9 +30,13 @@
 
 #include "mongo/unittest/unittest.h"
 
+#include "mongo/db/operation_context_noop.h"
 #include "mongo/db/server_parameters.h"
 
 namespace mongo {
+
+    using std::string;
+    using std::vector;
 
     TEST( ServerParameters, Simple1 ) {
         int f = 5;
@@ -68,7 +72,10 @@ namespace mongo {
         ASSERT_EQUALS( "c", v[2] );
 
         BSONObjBuilder b;
-        vv.append( b, vv.name() );
+
+        OperationContextNoop txn;
+        vv.append(&txn, b, vv.name());
+
         BSONObj y = b.obj();
         ASSERT( x.firstElement().woCompare( y.firstElement(), false ) == 0 );
 

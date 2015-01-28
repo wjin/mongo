@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2013-2014 MongoDB Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -26,7 +26,13 @@
  *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/index/haystack_access_method.h"
+
+#include <boost/scoped_ptr.hpp>
 
 #include "mongo/base/status.h"
 #include "mongo/db/geo/hash.h"
@@ -34,13 +40,15 @@
 #include "mongo/db/index/expression_params.h"
 #include "mongo/db/index/haystack_access_method_internal.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/pdfile.h"
 #include "mongo/db/query/internal_plans.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
 
-    HaystackAccessMethod::HaystackAccessMethod(IndexCatalogEntry* btreeState)
-        : BtreeBasedAccessMethod(btreeState) {
+    using boost::scoped_ptr;
+
+    HaystackAccessMethod::HaystackAccessMethod(IndexCatalogEntry* btreeState, SortedDataInterface* btree)
+        : BtreeBasedAccessMethod(btreeState, btree) {
 
         const IndexDescriptor* descriptor = btreeState->descriptor();
 
@@ -57,7 +65,8 @@ namespace mongo {
         ExpressionKeysPrivate::getHaystackKeys(obj, _geoField, _otherFields, _bucketSize, keys);
     }
 
-    void HaystackAccessMethod::searchCommand(const BSONObj& nearObj, double maxDistance,
+    void HaystackAccessMethod::searchCommand(OperationContext* txn, Collection* collection,
+                                             const BSONObj& nearObj, double maxDistance,
                                              const BSONObj& search, BSONObjBuilder* result,
                                              unsigned limit) {
         Timer t;
@@ -72,7 +81,7 @@ namespace mongo {
         }
         int scale = static_cast<int>(ceil(maxDistance / _bucketSize));
 
-        GeoHaystackSearchHopper hopper(nearObj, maxDistance, limit, _geoField, collection());
+        GeoHaystackSearchHopper hopper(txn, nearObj, maxDistance, limit, _geoField, collection);
 
         long long btreeMatches = 0;
 
@@ -92,18 +101,18 @@ namespace mongo {
 
                 BSONObj key = bb.obj();
 
-                unordered_set<DiskLoc, DiskLoc::Hasher> thisPass;
+                unordered_set<RecordId, RecordId::Hasher> thisPass;
 
 
-                scoped_ptr<Runner> runner(InternalPlanner::indexScan(_btreeState->collection(),
+                scoped_ptr<PlanExecutor> exec(InternalPlanner::indexScan(txn,  collection,
                                                                      _descriptor, key, key, true));
-                Runner::RunnerState state;
-                DiskLoc loc;
-                while (Runner::RUNNER_ADVANCED == (state = runner->getNext(NULL, &loc))) {
+                PlanExecutor::ExecState state;
+                RecordId loc;
+                while (PlanExecutor::ADVANCED == (state = exec->getNext(NULL, &loc))) {
                     if (hopper.limitReached()) { break; }
-                    pair<unordered_set<DiskLoc, DiskLoc::Hasher>::iterator, bool> p
+                    pair<unordered_set<RecordId, RecordId::Hasher>::iterator, bool> p
                         = thisPass.insert(loc);
-                    // If a new element was inserted (haven't seen the DiskLoc before), p.second
+                    // If a new element was inserted (haven't seen the RecordId before), p.second
                     // is true.
                     if (p.second) {
                         hopper.consider(loc);

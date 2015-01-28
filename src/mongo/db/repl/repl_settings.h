@@ -36,6 +36,9 @@
 
 
 namespace mongo {
+namespace repl {
+
+    extern int maxSyncSourceLagSecs;
 
     bool anyReplEnabled();
 
@@ -76,11 +79,6 @@ namespace mongo {
 
         std::string rsIndexPrefetch;// --indexPrefetch
 
-        std::set<std::string> discoveredSeeds;
-        mutex discoveredSeeds_mx;
-
-        BSONObj reconfig;
-
         ReplSettings()
             : slave(NotSlave),
             master(false),
@@ -88,12 +86,42 @@ namespace mongo {
             autoresync(false),
             slavedelay(),
             oplogSize(0),
-            pretouch(0),
-            discoveredSeeds(),
-            discoveredSeeds_mx("ReplSettings::discoveredSeeds") {
+            pretouch(0) {
+        }
+
+        // TODO(spencer): Remove explicit copy constructor after we no longer have mutable state
+        // in ReplSettings.
+        ReplSettings(const ReplSettings& other) :
+            slave(other.slave),
+            master(other.master),
+            fastsync(other.fastsync),
+            autoresync(other.autoresync),
+            slavedelay(other.slavedelay),
+            oplogSize(other.oplogSize),
+            source(other.source),
+            only(other.only),
+            pretouch(other.pretouch),
+            replSet(other.replSet),
+            rsIndexPrefetch(other.rsIndexPrefetch) {}
+
+        ReplSettings& operator=(const ReplSettings& other) {
+            if (this == &other) return *this;
+
+            slave = other.slave;
+            master = other.master;
+            fastsync = other.fastsync;
+            autoresync = other.autoresync;
+            slavedelay = other.slavedelay;
+            oplogSize = other.oplogSize;
+            source = other.source;
+            only = other.only;
+            pretouch = other.pretouch;
+            replSet = other.replSet;
+            rsIndexPrefetch = other.rsIndexPrefetch;
+            return *this;
         }
 
     };
 
-    extern ReplSettings replSettings;
-}
+} // namespace repl
+} // namespace mongo

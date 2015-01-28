@@ -28,18 +28,25 @@
 *    it in the license file.
 */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
+#include <set>
+
+#include "mongo/bson/mutable/document.h"
 #include "mongo/client/replica_set_monitor.h"
 #include "mongo/client/sasl_client_authenticate.h"
 #include "mongo/db/auth/authorization_manager.h"
-#include "mongo/db/auth/security_key.h"
+#include "mongo/db/auth/internal_user_auth.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/storage_options.h"
+#include "mongo/logger/parse_log_component_settings.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/net/ssl_options.h"
+
+using std::string;
+using std::stringstream;
 
 namespace mongo {
 
@@ -72,31 +79,15 @@ namespace mongo {
             appendParameterNames( help );
             help << "{ getParameter:'*' } to get everything\n";
         }
-        bool run(const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
+        bool run(OperationContext* txn, const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
             bool all = *cmdObj.firstElement().valuestrsafe() == '*';
 
             int before = result.len();
 
-            // TODO: convert to ServerParameters -- SERVER-10515
-
-            if (isJournalingEnabled() && (all || cmdObj.hasElement("journalCommitInterval")) &&
-                !isMongos()) {
-                result.append("journalCommitInterval",
-                              getJournalCommitInterval());
-            }
-            if( all || cmdObj.hasElement( "traceExceptions" ) ) {
-                result.append("traceExceptions",
-                              DBException::traceExceptions);
-            }
-            if( all || cmdObj.hasElement( "replMonitorMaxFailedChecks" ) ) {
-                result.append("replMonitorMaxFailedChecks",
-                              ReplicaSetMonitor::maxConsecutiveFailedChecks);
-            }
-
             const ServerParameter::Map& m = ServerParameterSet::getGlobal()->getMap();
             for ( ServerParameter::Map::const_iterator i = m.begin(); i != m.end(); ++i ) {
                 if ( all || cmdObj.hasElement( i->first.c_str() ) ) {
-                    i->second->append( result, i->second->name() );
+                    i->second->append(txn, result, i->second->name() );
                 }
             }
 
@@ -126,70 +117,96 @@ namespace mongo {
             help << "{ setParameter:1, <param>:<value> }\n";
             appendParameterNames( help );
         }
-        bool run(const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
-            int s = 0;
+        bool run(OperationContext* txn, const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
+            int numSet = 0;
             bool found = false;
 
-            // TODO: convert to ServerParameters -- SERVER-10515
+            const ServerParameter::Map& parameterMap = ServerParameterSet::getGlobal()->getMap();
 
-            if( cmdObj.hasElement("journalCommitInterval") ) {
-                if (isMongos()) {
-                    errmsg = "cannot set journalCommitInterval on a mongos";
+            // First check that we aren't setting the same parameter twice and that we actually are
+            // setting parameters that we have registered and can change at runtime
+            BSONObjIterator parameterCheckIterator(cmdObj);
+
+            // We already know that "setParameter" will be the first element in this object, so skip
+            // past that
+            parameterCheckIterator.next();
+
+            // Set of all the parameters the user is attempting to change
+            std::map<std::string, BSONElement> parametersToSet;
+
+            // Iterate all parameters the user passed in to do the initial validation checks,
+            // including verifying that we are not setting the same parameter twice.
+            while (parameterCheckIterator.more()) {
+                BSONElement parameter = parameterCheckIterator.next();
+                std::string parameterName = parameter.fieldName();
+
+                ServerParameter::Map::const_iterator foundParameter =
+                    parameterMap.find(parameterName);
+
+                // Check to see if this is actually a valid parameter
+                if (foundParameter == parameterMap.end()) {
+                    errmsg = str::stream() << "attempted to set unrecognized parameter ["
+                                           << parameterName
+                                           << "], use help:true to see options ";
                     return false;
                 }
-                if(!isJournalingEnabled()) {
-                    errmsg = "journaling is off";
+
+                // Make sure we are allowed to change this parameter
+                if (!foundParameter->second->allowedToChangeAtRuntime()) {
+                    errmsg = str::stream() << "not allowed to change [" << parameterName
+                                           << "] at runtime";
                     return false;
                 }
-                int x = (int) cmdObj["journalCommitInterval"].Number();
-                verify( x > 1 && x < 500 );
-                setJournalCommitInterval(x);
-                log() << "setParameter journalCommitInterval=" << x << endl;
-                s++;
-            }
-            if( cmdObj.hasElement( "traceExceptions" ) ) {
-                if( s == 0 ) result.append( "was", DBException::traceExceptions );
-                DBException::traceExceptions = cmdObj["traceExceptions"].Bool();
-                s++;
-            }
-            if( cmdObj.hasElement( "replMonitorMaxFailedChecks" ) ) {
-                if( s == 0 ) result.append( "was", ReplicaSetMonitor::maxConsecutiveFailedChecks );
-                ReplicaSetMonitor::maxConsecutiveFailedChecks =
-                    cmdObj["replMonitorMaxFailedChecks"].numberInt();
-                s++;
+
+                // Make sure we are only setting this parameter once
+                if (parametersToSet.count(parameterName)) {
+                    errmsg = str::stream() << "attempted to set parameter ["
+                                           << parameterName
+                                           << "] twice in the same setParameter command, "
+                                           << "once to value: ["
+                                           << parametersToSet[parameterName].toString(false)
+                                           << "], and once to value: [" << parameter.toString(false)
+                                           << "]";
+                    return false;
+                }
+
+                parametersToSet[parameterName] = parameter;
             }
 
-            const ServerParameter::Map& m = ServerParameterSet::getGlobal()->getMap();
-            BSONObjIterator i( cmdObj );
-            i.next(); // skip past command name
-            while ( i.more() ) {
-                BSONElement e = i.next();
-                ServerParameter::Map::const_iterator j = m.find( e.fieldName() );
-                if ( j == m.end() )
+            // Iterate the parameters that we have confirmed we are setting and actually set them.
+            // Not that if setting any one parameter fails, the command will fail, but the user
+            // won't see what has been set and what hasn't.  See SERVER-8552.
+            for (std::map<std::string, BSONElement>::iterator it = parametersToSet.begin();
+                 it != parametersToSet.end(); ++it) {
+                BSONElement parameter = it->second;
+                std::string parameterName = it->first;
+
+                ServerParameter::Map::const_iterator foundParameter =
+                    parameterMap.find(parameterName);
+
+                if (foundParameter == parameterMap.end()) {
+                    errmsg = str::stream() << "Parameter: " << parameterName << " that was "
+                                           << "avaliable during our first lookup in the registered "
+                                           << "parameters map is no longer available.";
+                    return false;
+                }
+
+                if (numSet == 0) {
+                    foundParameter->second->append(txn, result, "was");
+                }
+
+                Status status = foundParameter->second->set(parameter);
+                if (status.isOK()) {
+                    numSet++;
                     continue;
-
-                if ( ! j->second->allowedToChangeAtRuntime() ) {
-                    errmsg = str::stream()
-                        << "not allowed to change ["
-                        << e.fieldName()
-                        << "] at runtime";
-                    return false;
                 }
 
-                if ( s == 0 )
-                    j->second->append( result, "was" );
-
-                Status status = j->second->set( e );
-                if ( status.isOK() ) {
-                    s++;
-                    continue;
-                }
                 errmsg = status.reason();
-                result.append( "code", status.code() );
+                result.append("code", status.code());
                 return false;
             }
 
-            if( s == 0 && !found ) {
+            if (numSet == 0 && !found) {
                 errmsg = "no option found to set, use help:true to see options ";
                 return false;
             }
@@ -199,28 +216,32 @@ namespace mongo {
     } cmdSet;
 
     namespace {
+        using logger::globalLogDomain;
+        using logger::LogComponent;
+        using logger::LogComponentSetting;
+        using logger::LogSeverity;
+        using logger::parseLogComponentSettings;
+
         class LogLevelSetting : public ServerParameter {
         public:
             LogLevelSetting() : ServerParameter(ServerParameterSet::getGlobal(), "logLevel") {}
 
-            virtual void append(BSONObjBuilder& b, const std::string& name) {
-                b << name << logger::globalLogDomain()->getMinimumLogSeverity().toInt();
+            virtual void append(OperationContext* txn, BSONObjBuilder& b, const std::string& name) {
+                b << name << globalLogDomain()->getMinimumLogSeverity().toInt();
             }
 
             virtual Status set(const BSONElement& newValueElement) {
-                typedef logger::LogSeverity LogSeverity;
                 int newValue;
                 if (!newValueElement.coerce(&newValue) || newValue < 0)
                     return Status(ErrorCodes::BadValue, mongoutils::str::stream() <<
                                   "Invalid value for logLevel: " << newValueElement);
                 LogSeverity newSeverity = (newValue > 0) ? LogSeverity::Debug(newValue) :
                     LogSeverity::Log();
-                logger::globalLogDomain()->setMinimumLoggedSeverity(newSeverity);
+                globalLogDomain()->setMinimumLoggedSeverity(newSeverity);
                 return Status::OK();
             }
 
             virtual Status setFromString(const std::string& str) {
-                typedef logger::LogSeverity LogSeverity;
                 int newValue;
                 Status status = parseNumberFromString(str, &newValue);
                 if (!status.isOK())
@@ -230,11 +251,169 @@ namespace mongo {
                                   "Invalid value for logLevel: " << newValue);
                 LogSeverity newSeverity = (newValue > 0) ? LogSeverity::Debug(newValue) :
                     LogSeverity::Log();
-                logger::globalLogDomain()->setMinimumLoggedSeverity(newSeverity);
+                globalLogDomain()->setMinimumLoggedSeverity(newSeverity);
                 return Status::OK();
             }
         } logLevelSetting;
 
+        /**
+         * Log component verbosity.
+         * Log levels of log component hierarchy.
+         * Negative value for a log component means the default log level will be used.
+         */
+        class LogComponentVerbositySetting : public ServerParameter {
+            MONGO_DISALLOW_COPYING(LogComponentVerbositySetting);
+        public:
+            LogComponentVerbositySetting()
+                : ServerParameter(ServerParameterSet::getGlobal(), "logComponentVerbosity") {}
+
+            virtual void append(OperationContext* txn, BSONObjBuilder& b,
+                                const std::string& name) {
+                BSONObj currentSettings;
+                _get(&currentSettings);
+                b << name << currentSettings;
+            }
+
+            virtual Status set(const BSONElement& newValueElement) {
+                if (!newValueElement.isABSONObj()) {
+                    return Status(ErrorCodes::TypeMismatch, mongoutils::str::stream() <<
+                                  "log component verbosity is not a BSON object: " <<
+                                  newValueElement);
+                }
+                return _set(newValueElement.Obj());
+            }
+
+            virtual Status setFromString(const std::string& str) {
+                try {
+                    return _set(mongo::fromjson(str));
+                }
+                catch (const DBException& ex) {
+                    return ex.toStatus();
+                }
+            }
+
+        private:
+            /**
+             * Returns current settings as a BSON document.
+             * The "default" log component is an implementation detail. Don't expose this to users.
+             */
+            void _get(BSONObj* output) const {
+                static const string defaultLogComponentName =
+                    LogComponent(LogComponent::kDefault).getShortName();
+
+                mutablebson::Document doc;
+
+                for (int i = 0; i < int(LogComponent::kNumLogComponents); ++i) {
+                    LogComponent component = static_cast<LogComponent::Value>(i);
+
+                    int severity = -1;
+                    if (globalLogDomain()->hasMinimumLogSeverity(component)) {
+                        severity = globalLogDomain()->getMinimumLogSeverity(component).toInt();
+                    }
+
+                    // Save LogComponent::kDefault LogSeverity at root
+                    if (component == LogComponent::kDefault) {
+                        doc.root().appendInt("verbosity", severity);
+                        continue;
+                    }
+
+                    mutablebson::Element element = doc.makeElementObject(component.getShortName());
+                    element.appendInt("verbosity", severity);
+
+                    mutablebson::Element parentElement = _getParentElement(doc, component);
+                    parentElement.pushBack(element);
+                }
+
+                BSONObj result = doc.getObject();
+                output->swap(result);
+                invariant(!output->hasField(defaultLogComponentName));
+            }
+
+            /**
+             * Updates component hierarchy log levels.
+             *
+             * BSON Format:
+             * {
+             *     verbosity: 4,  <-- maps to 'default' log component.
+             *     componentA: {
+             *         verbosity: 2,  <-- sets componentA's log level to 2.
+             *         componentB: {
+             *             verbosity: 1, <-- sets componentA.componentB's log level to 1.
+             *         }
+             *         componentC: {
+             *             verbosity: -1, <-- clears componentA.componentC's log level so that
+             *                                its final loglevel will be inherited from componentA.
+             *         }
+             *     },
+             *     componentD : 3  <-- sets componentD's log level to 3 (alternative to
+             *                         subdocument with 'verbosity' field).
+             * }
+             *
+             * For the default component, the log level is read from the top-level
+             * "verbosity" field.
+             * For non-default components, we look up the element using the component's
+             * dotted name. If the "<dotted component name>" field is a number, the log
+             * level will be read from the field's value.
+             * Otherwise, we assume that the "<dotted component name>" field is an
+             * object with a "verbosity" field that holds the log level for the component.
+             * The more verbose format with the "verbosity" field is intended to support
+             * setting of log levels of both parent and child log components in the same
+             * BSON document.
+             *
+             * Ignore elements in BSON object that do not map to a log component's dotted
+             * name.
+             */
+            Status _set(const BSONObj& bsonSettings) const {
+                StatusWith< std::vector<LogComponentSetting> > parseStatus =
+                        parseLogComponentSettings(bsonSettings);
+
+                if (!parseStatus.isOK()) {
+                    return parseStatus.getStatus();
+                }
+
+                std::vector<LogComponentSetting> settings = parseStatus.getValue();
+                std::vector<LogComponentSetting>::iterator it = settings.begin();
+                for (; it < settings.end(); ++it) {
+                    LogComponentSetting newSetting = *it;
+
+                    // Negative value means to clear log level of component.
+                    if (newSetting.level < 0) {
+                        globalLogDomain()->clearMinimumLoggedSeverity(newSetting.component);
+                        continue;
+                    }
+                    // Convert non-negative value to Log()/Debug(N).
+                    LogSeverity newSeverity = (newSetting.level > 0) ?
+                            LogSeverity::Debug(newSetting.level) : LogSeverity::Log();
+                    globalLogDomain()->setMinimumLoggedSeverity(newSetting.component,
+                                                                newSeverity);
+                }
+
+                return Status::OK();
+            }
+
+            /**
+             * Search document for element corresponding to log component's parent.
+             */
+            static mutablebson::Element _getParentElement(mutablebson::Document& doc,
+                                                          LogComponent component) {
+                // Hide LogComponent::kDefault
+                if (component == LogComponent::kDefault) {
+                    return doc.end();
+                }
+                LogComponent parentComponent = component.parent();
+
+                // Attach LogComponent::kDefault children to root
+                if (parentComponent == LogComponent::kDefault) {
+                    return doc.root();
+                }
+                mutablebson::Element grandParentElement = _getParentElement(doc, parentComponent);
+                return grandParentElement.findFirstChildNamed(parentComponent.getShortName());
+            }
+        } logComponentVerbositySetting;
+
+    }  // namespace
+
+    namespace {
         class SSLModeSetting : public ServerParameter {
         public:
             SSLModeSetting() : ServerParameter(ServerParameterSet::getGlobal(), "sslMode",
@@ -257,7 +436,8 @@ namespace mongo {
                 }
             }
 
-            virtual void append(BSONObjBuilder& b, const std::string& name) {
+            virtual void append(
+                            OperationContext* txn, BSONObjBuilder& b, const std::string& name) {
                 b << name << sslModeStr();
             }
 
@@ -324,7 +504,8 @@ namespace mongo {
                 }
             }
 
-            virtual void append(BSONObjBuilder& b, const std::string& name) {
+            virtual void append(
+                            OperationContext* txn, BSONObjBuilder& b, const std::string& name) {
                 b << name << clusterAuthModeStr();
             }
 
@@ -370,7 +551,8 @@ namespace mongo {
                                               "MONGODB-X509" <<
                                               saslCommandUserDBFieldName << "$external" <<
                                               saslCommandUserFieldName << 
-                                              getSSLManager()->getClientSubjectName()));
+                                              getSSLManager()->getSSLConfiguration()
+                                                  .clientSubjectName));
 #endif 
                 }
                 else if (str == "x509" && 
@@ -392,6 +574,21 @@ namespace mongo {
                                                     &serverGlobalParams.quiet,
                                                     true,
                                                     true );
+
+        ExportedServerParameter<int> MaxConsecutiveFailedChecksSetting(
+                                                    ServerParameterSet::getGlobal(),
+                                                    "replMonitorMaxFailedChecks",
+                                                    &ReplicaSetMonitor::maxConsecutiveFailedChecks,
+                                                    false, // allowedToChangeAtStartup
+                                                    true); // allowedToChangeAtRuntime
+
+        ExportedServerParameter<bool> TraceExceptionsSetting(ServerParameterSet::getGlobal(),
+                                                             "traceExceptions",
+                                                             &DBException::traceExceptions,
+                                                             false, // allowedToChangeAtStartup
+                                                             true); // allowedToChangeAtRuntime
+
+
     }
 
 }

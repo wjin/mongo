@@ -2,20 +2,34 @@
 /*
  *    Copyright 2010 10gen Inc.
  *
- *    Licensed under the Apache License, Version 2.0 (the "License");
- *    you may not use this file except in compliance with the License.
- *    You may obtain a copy of the License at
+ *    This program is free software: you can redistribute it and/or  modify
+ *    it under the terms of the GNU Affero General Public License, version 3,
+ *    as published by the Free Software Foundation.
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License for more details.
  *
- *    Unless required by applicable law or agreed to in writing, software
- *    distributed under the License is distributed on an "AS IS" BASIS,
- *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *    See the License for the specific language governing permissions and
- *    limitations under the License.
+ *    You should have received a copy of the GNU Affero General Public License
+ *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
  */
 
-#include "mongo/pch.h"
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+
+#include "mongo/platform/basic.h"
 
 #include <boost/filesystem/convenience.hpp>
 #include <fstream>
@@ -24,6 +38,7 @@
 #include "mongo/shell/shell_utils.h"
 #include "mongo/shell/shell_utils_launcher.h"
 #include "mongo/util/file.h"
+#include "mongo/util/log.h"
 #include "mongo/util/md5.hpp"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/sock.h"
@@ -31,6 +46,10 @@
 #include "mongo/util/text.h"
 
 namespace mongo {
+
+    using std::ifstream;
+    using std::string;
+    using std::stringstream;
 
     /**
      * These utilities are thread safe but do not provide mutually exclusive access to resources
@@ -140,7 +159,7 @@ namespace mongo {
             ifstream f(e.valuestrsafe());
             uassert(CANT_OPEN_FILE, "couldn't open file", f.is_open() );
 
-            streamsize sz = 0;
+            std::streamsize sz = 0;
             while( 1 ) {
                 char ch = 0;
                 // slow...maybe change one day
@@ -202,22 +221,19 @@ namespace mongo {
         }
 
         /**
-         * @param args - [ name, byte index ]
-         * In this initial implementation, all bits in the specified byte are flipped.
+         * @param args - [ source, destination ]
+         * copies file 'source' to 'destination'. Errors if the 'destination' file already exists.
          */
-        BSONObj fuzzFile(const BSONObj& args, void* data) {
-            uassert( 13619, "fuzzFile takes 2 arguments", args.nFields() == 2 );
-            scoped_ptr< File > f( new File() );
-            f->open( args.getStringField( "0" ) );
-            uassert( 13620, "couldn't open file to fuzz", !f->bad() && f->is_open() );
+        BSONObj copyFile(const BSONObj& args, void* data) {
+            uassert(13619, "copyFile takes 2 arguments", args.nFields() == 2);
 
-            char c;
-            f->read( args.getIntField( "1" ), &c, 1 );
-            c = ~c;
-            f->write( args.getIntField( "1" ), &c, 1 );
+            BSONObjIterator it(args);
+            const std::string source = it.next().str();
+            const std::string destination = it.next().str();
+
+            boost::filesystem::copy_file(source, destination);
 
             return undefinedReturn;
-            // f close is implicit
         }
 
         BSONObj getHostName(const BSONObj& a, void* data) {
@@ -231,7 +247,7 @@ namespace mongo {
         void installShellUtilsExtended( Scope& scope ) {
             scope.injectNative( "getHostName" , getHostName );
             scope.injectNative( "removeFile" , removeFile );
-            scope.injectNative( "fuzzFile" , fuzzFile );
+            scope.injectNative( "copyFile" , copyFile );
             scope.injectNative( "listFiles" , listFiles );
             scope.injectNative( "ls" , ls );
             scope.injectNative( "pwd", pwd );

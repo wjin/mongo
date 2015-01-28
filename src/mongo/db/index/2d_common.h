@@ -28,6 +28,7 @@
 
 #pragma once
 
+#include <boost/shared_ptr.hpp>
 #include <string>
 #include <vector>
 
@@ -36,9 +37,9 @@
 namespace mongo {
 
     struct TwoDIndexingParams {
-        string geo;
-        vector<pair<string, int> > other;
-        shared_ptr<GeoHashConverter> geoHashConverter;
+        std::string geo;
+        std::vector<std::pair<std::string, int> > other;
+        boost::shared_ptr<GeoHashConverter> geoHashConverter;
     };
 
 }  // namespace mongo

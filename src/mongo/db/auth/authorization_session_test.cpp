@@ -1,21 +1,34 @@
 /*    Copyright 2012 10gen Inc.
  *
- *    Licensed under the Apache License, Version 2.0 (the "License");
- *    you may not use this file except in compliance with the License.
- *    You may obtain a copy of the License at
+ *    This program is free software: you can redistribute it and/or  modify
+ *    it under the terms of the GNU Affero General Public License, version 3,
+ *    as published by the Free Software Foundation.
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License for more details.
  *
- *    Unless required by applicable law or agreed to in writing, software
- *    distributed under the License is distributed on an "AS IS" BASIS,
- *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *    See the License for the specific language governing permissions and
- *    limitations under the License.
+ *    You should have received a copy of the GNU Affero General Public License
+ *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
  */
 
 /**
  * Unit tests of the AuthorizationSession type.
  */
+#include <boost/scoped_ptr.hpp>
 
 #include "mongo/base/status.h"
 #include "mongo/db/auth/authz_session_external_state_mock.h"
@@ -24,6 +37,7 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context_noop.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/map_util.h"
 
@@ -33,6 +47,8 @@
 namespace mongo {
 namespace {
 
+    using boost::scoped_ptr;
+
     class FailureCapableAuthzManagerExternalStateMock :
         public AuthzManagerExternalStateMock {
     public:
@@ -41,7 +57,8 @@ namespace {
 
         void setFindsShouldFail(bool enable) { _findsShouldFail = enable; }
 
-        virtual Status findOne(const NamespaceString& collectionName,
+        virtual Status findOne(OperationContext* txn,
+                               const NamespaceString& collectionName,
                                const BSONObj& query,
                                BSONObj* result) {
             if (_findsShouldFail &&
@@ -50,7 +67,7 @@ namespace {
                 return Status(ErrorCodes::UnknownError,
                               "findOne on admin.system.users set to fail in mock.");
             }
-            return AuthzManagerExternalStateMock::findOne(collectionName, query, result);
+            return AuthzManagerExternalStateMock::findOne(txn, collectionName, query, result);
         }
 
     private:
@@ -60,6 +77,7 @@ namespace {
     class AuthorizationSessionTest : public ::mongo::unittest::Test {
     public:
         FailureCapableAuthzManagerExternalStateMock* managerState;
+        OperationContextNoop _txn;
         AuthzSessionExternalStateMock* sessionState;
         scoped_ptr<AuthorizationManager> authzManager;
         scoped_ptr<AuthorizationSession> authzSession;
@@ -117,10 +135,11 @@ namespace {
 
         // Check that you can't authorize a user that doesn't exist.
         ASSERT_EQUALS(ErrorCodes::UserNotFound,
-                      authzSession->addAndAuthorizeUser(UserName("spencer", "test")));
+                      authzSession->addAndAuthorizeUser(&_txn, UserName("spencer", "test")));
 
         // Add a user with readWrite and dbAdmin on the test DB
-        ASSERT_OK(managerState->insertPrivilegeDocument("admin",
+        ASSERT_OK(managerState->insertPrivilegeDocument(&_txn,
+                "admin",
                 BSON("user" << "spencer" <<
                      "db" << "test" <<
                      "credentials" << BSON("MONGODB-CR" << "a") <<
@@ -129,7 +148,7 @@ namespace {
                                            BSON("role" << "dbAdmin" <<
                                                 "db" << "test"))),
                 BSONObj()));
-        ASSERT_OK(authzSession->addAndAuthorizeUser(UserName("spencer", "test")));
+        ASSERT_OK(authzSession->addAndAuthorizeUser(&_txn, UserName("spencer", "test")));
 
         ASSERT_TRUE(authzSession->isAuthorizedForActionsOnResource(
                             testFooCollResource, ActionType::insert));
@@ -139,14 +158,15 @@ namespace {
                              otherFooCollResource, ActionType::insert));
 
         // Add an admin user with readWriteAnyDatabase
-        ASSERT_OK(managerState->insertPrivilegeDocument("admin",
+        ASSERT_OK(managerState->insertPrivilegeDocument(&_txn,
+                "admin",
                 BSON("user" << "admin" <<
                      "db" << "admin" <<
                      "credentials" << BSON("MONGODB-CR" << "a") <<
                      "roles" << BSON_ARRAY(BSON("role" << "readWriteAnyDatabase" <<
                                                 "db" << "admin"))),
                 BSONObj()));
-        ASSERT_OK(authzSession->addAndAuthorizeUser(UserName("admin", "admin")));
+        ASSERT_OK(authzSession->addAndAuthorizeUser(&_txn, UserName("admin", "admin")));
 
         ASSERT_TRUE(authzSession->isAuthorizedForActionsOnResource(
                             ResourcePattern::forExactNamespace(
@@ -180,7 +200,8 @@ namespace {
 
     TEST_F(AuthorizationSessionTest, DuplicateRolesOK) {
         // Add a user with doubled-up readWrite and single dbAdmin on the test DB
-        ASSERT_OK(managerState->insertPrivilegeDocument("admin",
+        ASSERT_OK(managerState->insertPrivilegeDocument(&_txn,
+                "admin",
                 BSON("user" << "spencer" <<
                      "db" << "test" <<
                      "credentials" << BSON("MONGODB-CR" << "a") <<
@@ -191,7 +212,7 @@ namespace {
                                            BSON("role" << "readWrite" <<
                                                 "db" << "test"))),
                 BSONObj()));
-        ASSERT_OK(authzSession->addAndAuthorizeUser(UserName("spencer", "test")));
+        ASSERT_OK(authzSession->addAndAuthorizeUser(&_txn, UserName("spencer", "test")));
 
         ASSERT_TRUE(authzSession->isAuthorizedForActionsOnResource(
                             testFooCollResource, ActionType::insert));
@@ -202,7 +223,8 @@ namespace {
     }
 
     TEST_F(AuthorizationSessionTest, SystemCollectionsAccessControl) {
-        ASSERT_OK(managerState->insertPrivilegeDocument("admin",
+        ASSERT_OK(managerState->insertPrivilegeDocument(&_txn,
+                "admin",
                 BSON("user" << "rw" <<
                      "db" << "test" <<
                      "credentials" << BSON("MONGODB-CR" << "a") <<
@@ -211,14 +233,16 @@ namespace {
                                            BSON("role" << "dbAdmin" <<
                                                 "db" << "test"))),
                 BSONObj()));
-        ASSERT_OK(managerState->insertPrivilegeDocument("admin",
+        ASSERT_OK(managerState->insertPrivilegeDocument(&_txn,
+                "admin",
                 BSON("user" << "useradmin" <<
                      "db" << "test" <<
                      "credentials" << BSON("MONGODB-CR" << "a") <<
                      "roles" << BSON_ARRAY(BSON("role" << "userAdmin" <<
                                                 "db" << "test"))),
                 BSONObj()));
-        ASSERT_OK(managerState->insertPrivilegeDocument("admin",
+        ASSERT_OK(managerState->insertPrivilegeDocument(&_txn,
+                "admin",
                 BSON("user" << "rwany" <<
                      "db" << "test" <<
                      "credentials" << BSON("MONGODB-CR" << "a") <<
@@ -227,7 +251,8 @@ namespace {
                                            BSON("role" << "dbAdminAnyDatabase" <<
                                                 "db" << "admin"))),
                 BSONObj()));
-        ASSERT_OK(managerState->insertPrivilegeDocument("admin",
+        ASSERT_OK(managerState->insertPrivilegeDocument(&_txn,
+                "admin",
                 BSON("user" << "useradminany" <<
                      "db" << "test" <<
                      "credentials" << BSON("MONGODB-CR" << "a") <<
@@ -235,7 +260,7 @@ namespace {
                                                 "db" << "admin"))),
                 BSONObj()));
 
-        ASSERT_OK(authzSession->addAndAuthorizeUser(UserName("rwany", "test")));
+        ASSERT_OK(authzSession->addAndAuthorizeUser(&_txn, UserName("rwany", "test")));
 
         ASSERT_FALSE(authzSession->isAuthorizedForActionsOnResource(
                              testUsersCollResource, ActionType::insert));
@@ -255,7 +280,7 @@ namespace {
                              otherProfileCollResource, ActionType::find));
 
         // Logging in as useradminany@test implicitly logs out rwany@test.
-        ASSERT_OK(authzSession->addAndAuthorizeUser(UserName("useradminany", "test")));
+        ASSERT_OK(authzSession->addAndAuthorizeUser(&_txn, UserName("useradminany", "test")));
         ASSERT_FALSE(authzSession->isAuthorizedForActionsOnResource(
                              testUsersCollResource, ActionType::insert));
         ASSERT_TRUE(authzSession->isAuthorizedForActionsOnResource(
@@ -274,7 +299,7 @@ namespace {
                              otherProfileCollResource, ActionType::find));
 
         // Logging in as rw@test implicitly logs out useradminany@test.
-        ASSERT_OK(authzSession->addAndAuthorizeUser(UserName("rw", "test")));
+        ASSERT_OK(authzSession->addAndAuthorizeUser(&_txn, UserName("rw", "test")));
 
         ASSERT_FALSE(authzSession->isAuthorizedForActionsOnResource(
                              testUsersCollResource, ActionType::insert));
@@ -295,7 +320,7 @@ namespace {
 
 
         // Logging in as useradmin@test implicitly logs out rw@test.
-        ASSERT_OK(authzSession->addAndAuthorizeUser(UserName("useradmin", "test")));
+        ASSERT_OK(authzSession->addAndAuthorizeUser(&_txn, UserName("useradmin", "test")));
         ASSERT_FALSE(authzSession->isAuthorizedForActionsOnResource(
                              testUsersCollResource, ActionType::insert));
         ASSERT_FALSE(authzSession->isAuthorizedForActionsOnResource(
@@ -316,14 +341,15 @@ namespace {
 
     TEST_F(AuthorizationSessionTest, InvalidateUser) {
         // Add a readWrite user
-        ASSERT_OK(managerState->insertPrivilegeDocument("admin",
+        ASSERT_OK(managerState->insertPrivilegeDocument(&_txn,
+                "admin",
                 BSON("user" << "spencer" <<
                      "db" << "test" <<
                      "credentials" << BSON("MONGODB-CR" << "a") <<
                      "roles" << BSON_ARRAY(BSON("role" << "readWrite" <<
                                                 "db" << "test"))),
                 BSONObj()));
-        ASSERT_OK(authzSession->addAndAuthorizeUser(UserName("spencer", "test")));
+        ASSERT_OK(authzSession->addAndAuthorizeUser(&_txn, UserName("spencer", "test")));
 
         ASSERT_TRUE(authzSession->isAuthorizedForActionsOnResource(
                             testFooCollResource, ActionType::find));
@@ -336,11 +362,13 @@ namespace {
         // Change the user to be read-only
         int ignored;
         managerState->remove(
+                &_txn,
                 AuthorizationManager::usersCollectionNamespace,
                 BSONObj(),
                 BSONObj(),
                 &ignored);
-        ASSERT_OK(managerState->insertPrivilegeDocument("admin",
+        ASSERT_OK(managerState->insertPrivilegeDocument(&_txn,
+                "admin",
                 BSON("user" << "spencer" <<
                      "db" << "test" <<
                      "credentials" << BSON("MONGODB-CR" << "a") <<
@@ -350,7 +378,7 @@ namespace {
 
         // Make sure that invalidating the user causes the session to reload its privileges.
         authzManager->invalidateUserByName(user->getName());
-        authzSession->startRequest(); // Refreshes cached data for invalid users
+        authzSession->startRequest(&_txn); // Refreshes cached data for invalid users
         ASSERT_TRUE(authzSession->isAuthorizedForActionsOnResource(
                             testFooCollResource, ActionType::find));
         ASSERT_FALSE(authzSession->isAuthorizedForActionsOnResource(
@@ -361,13 +389,14 @@ namespace {
 
         // Delete the user.
         managerState->remove(
+                &_txn,
                 AuthorizationManager::usersCollectionNamespace,
                 BSONObj(),
                 BSONObj(),
                 &ignored);
         // Make sure that invalidating the user causes the session to reload its privileges.
         authzManager->invalidateUserByName(user->getName());
-        authzSession->startRequest(); // Refreshes cached data for invalid users
+        authzSession->startRequest(&_txn); // Refreshes cached data for invalid users
         ASSERT_FALSE(authzSession->isAuthorizedForActionsOnResource(
                             testFooCollResource, ActionType::find));
         ASSERT_FALSE(authzSession->isAuthorizedForActionsOnResource(
@@ -377,14 +406,15 @@ namespace {
 
     TEST_F(AuthorizationSessionTest, UseOldUserInfoInFaceOfConnectivityProblems) {
         // Add a readWrite user
-        ASSERT_OK(managerState->insertPrivilegeDocument("admin",
+        ASSERT_OK(managerState->insertPrivilegeDocument(&_txn,
+                "admin",
                 BSON("user" << "spencer" <<
                      "db" << "test" <<
                      "credentials" << BSON("MONGODB-CR" << "a") <<
                      "roles" << BSON_ARRAY(BSON("role" << "readWrite" <<
                                                 "db" << "test"))),
                 BSONObj()));
-        ASSERT_OK(authzSession->addAndAuthorizeUser(UserName("spencer", "test")));
+        ASSERT_OK(authzSession->addAndAuthorizeUser(&_txn, UserName("spencer", "test")));
 
         ASSERT_TRUE(authzSession->isAuthorizedForActionsOnResource(
                             testFooCollResource, ActionType::find));
@@ -398,11 +428,13 @@ namespace {
         int ignored;
         managerState->setFindsShouldFail(true);
         managerState->remove(
+                &_txn,
                 AuthorizationManager::usersCollectionNamespace,
                 BSONObj(),
                 BSONObj(),
                 &ignored);
-        ASSERT_OK(managerState->insertPrivilegeDocument("admin",
+        ASSERT_OK(managerState->insertPrivilegeDocument(&_txn,
+                "admin",
                 BSON("user" << "spencer" <<
                      "db" << "test" <<
                      "credentials" << BSON("MONGODB-CR" << "a") <<
@@ -414,7 +446,7 @@ namespace {
         // document lookup to fail, the authz session should continue to use its known out-of-date
         // privilege data.
         authzManager->invalidateUserByName(user->getName());
-        authzSession->startRequest(); // Refreshes cached data for invalid users
+        authzSession->startRequest(&_txn); // Refreshes cached data for invalid users
         ASSERT_TRUE(authzSession->isAuthorizedForActionsOnResource(
                             testFooCollResource, ActionType::find));
         ASSERT_TRUE(authzSession->isAuthorizedForActionsOnResource(
@@ -423,122 +455,11 @@ namespace {
         // Once we configure document lookup to succeed again, authorization checks should
         // observe the new values.
         managerState->setFindsShouldFail(false);
-        authzSession->startRequest(); // Refreshes cached data for invalid users
+        authzSession->startRequest(&_txn); // Refreshes cached data for invalid users
         ASSERT_TRUE(authzSession->isAuthorizedForActionsOnResource(
                             testFooCollResource, ActionType::find));
         ASSERT_FALSE(authzSession->isAuthorizedForActionsOnResource(
                             testFooCollResource, ActionType::insert));
-    }
-
-
-    TEST_F(AuthorizationSessionTest, ImplicitAcquireFromSomeDatabasesWithV1Users) {
-        managerState->setAuthzVersion(AuthorizationManager::schemaVersion24);
-
-        managerState->insert(NamespaceString("test.system.users"),
-                                    BSON("user" << "andy" <<
-                                         "pwd" << "a" <<
-                                         "roles" << BSON_ARRAY("readWrite")),
-                                    BSONObj());
-        managerState->insert(NamespaceString("other.system.users"),
-                                    BSON("user" << "andy" <<
-                                         "userSource" << "test" <<
-                                         "roles" <<  BSON_ARRAY("read")),
-                                    BSONObj());
-        managerState->insert(NamespaceString("admin.system.users"),
-                                    BSON("user" << "andy" <<
-                                         "userSource" << "test" <<
-                                         "roles" << BSON_ARRAY("clusterAdmin") <<
-                                         "otherDBRoles" << BSON("third" << BSON_ARRAY("dbAdmin"))),
-                                    BSONObj());
-        ASSERT_OK(authzManager->initialize());
-
-        ASSERT(!authzSession->isAuthorizedForActionsOnResource(
-                       testFooCollResource, ActionType::find));
-        ASSERT(!authzSession->isAuthorizedForActionsOnResource(
-                       testFooCollResource, ActionType::insert));
-        ASSERT(!authzSession->isAuthorizedForActionsOnResource(
-                       testFooCollResource, ActionType::collMod));
-        ASSERT(!authzSession->isAuthorizedForActionsOnResource(
-                       otherFooCollResource, ActionType::find));
-        ASSERT(!authzSession->isAuthorizedForActionsOnResource(
-                       otherFooCollResource, ActionType::insert));
-        ASSERT(!authzSession->isAuthorizedForActionsOnResource(
-                       otherFooCollResource, ActionType::collMod));
-        ASSERT(!authzSession->isAuthorizedForActionsOnResource(
-                       thirdFooCollResource, ActionType::find));
-        ASSERT(!authzSession->isAuthorizedForActionsOnResource(
-                       thirdFooCollResource, ActionType::insert));
-        ASSERT(!authzSession->isAuthorizedForActionsOnResource(
-                       thirdFooCollResource, ActionType::collMod));
-        ASSERT(!authzSession->isAuthorizedForActionsOnResource(
-                       adminFooCollResource, ActionType::find));
-        ASSERT(!authzSession->isAuthorizedForActionsOnResource(
-                       adminFooCollResource, ActionType::insert));
-        ASSERT(!authzSession->isAuthorizedForActionsOnResource(
-                       adminFooCollResource, ActionType::collMod));
-        ASSERT(!authzSession->isAuthorizedForActionsOnResource(
-                       ResourcePattern::forClusterResource(), ActionType::shutdown));
-
-        ASSERT_OK(authzSession->addAndAuthorizeUser(UserName("andy", "test")));
-
-        User* user = authzSession->lookupUser(UserName("andy", "test"));
-        ASSERT(UserName("andy", "test") == user->getName());
-
-        ASSERT(authzSession->isAuthorizedForActionsOnResource(
-                       testFooCollResource, ActionType::find));
-        ASSERT(authzSession->isAuthorizedForActionsOnResource(
-                       testFooCollResource, ActionType::insert));
-        ASSERT(!authzSession->isAuthorizedForActionsOnResource(
-                       testFooCollResource, ActionType::collMod));
-        ASSERT(authzSession->isAuthorizedForActionsOnResource(
-                       otherFooCollResource, ActionType::find));
-        ASSERT(!authzSession->isAuthorizedForActionsOnResource(
-                       otherFooCollResource, ActionType::insert));
-        ASSERT(!authzSession->isAuthorizedForActionsOnResource(
-                       otherFooCollResource, ActionType::collMod));
-        ASSERT(!authzSession->isAuthorizedForActionsOnResource(
-                       thirdFooCollResource, ActionType::find));
-        ASSERT(!authzSession->isAuthorizedForActionsOnResource(
-                       thirdFooCollResource, ActionType::insert));
-        ASSERT(authzSession->isAuthorizedForActionsOnResource(
-                       thirdFooCollResource, ActionType::collMod));
-        ASSERT(!authzSession->isAuthorizedForActionsOnResource(
-                       adminFooCollResource, ActionType::find));
-        ASSERT(!authzSession->isAuthorizedForActionsOnResource(
-                       adminFooCollResource, ActionType::insert));
-        ASSERT(!authzSession->isAuthorizedForActionsOnResource(
-                       adminFooCollResource, ActionType::collMod));
-        ASSERT(authzSession->isAuthorizedForActionsOnResource(
-                       ResourcePattern::forClusterResource(), ActionType::shutdown));
-
-        authzSession->logoutDatabase("test");
-
-        ASSERT(!authzSession->isAuthorizedForActionsOnResource(
-                       testFooCollResource, ActionType::find));
-        ASSERT(!authzSession->isAuthorizedForActionsOnResource(
-                       testFooCollResource, ActionType::insert));
-        ASSERT(!authzSession->isAuthorizedForActionsOnResource(
-                       testFooCollResource, ActionType::collMod));
-        ASSERT(!authzSession->isAuthorizedForActionsOnResource(
-                       otherFooCollResource, ActionType::find));
-        ASSERT(!authzSession->isAuthorizedForActionsOnResource(
-                       otherFooCollResource, ActionType::insert));
-        ASSERT(!authzSession->isAuthorizedForActionsOnResource(
-                       otherFooCollResource, ActionType::collMod));
-        ASSERT(!authzSession->isAuthorizedForActionsOnResource(
-                       thirdFooCollResource, ActionType::find));
-        ASSERT(!authzSession->isAuthorizedForActionsOnResource(
-                       thirdFooCollResource, ActionType::insert));
-        ASSERT(!authzSession->isAuthorizedForActionsOnResource(
-                       thirdFooCollResource, ActionType::collMod));
-        ASSERT(!authzSession->isAuthorizedForActionsOnResource(
-                       adminFooCollResource, ActionType::find));
-        ASSERT(!authzSession->isAuthorizedForActionsOnResource(
-                       adminFooCollResource, ActionType::insert));
-        ASSERT(!authzSession->isAuthorizedForActionsOnResource(
-                       adminFooCollResource, ActionType::collMod));
-        ASSERT(!authzSession->isAuthorizedForActionsOnResource(
-                       ResourcePattern::forClusterResource(), ActionType::shutdown));
     }
 
 }  // namespace

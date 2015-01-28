@@ -42,14 +42,12 @@
  * The commands defined here, and profiling, are only available when enabled at
  * build-time with the "--use-cpu-profiler" argument to scons.
  *
- * Example SCons command line, assuming you've installed google-perftools in
- * /usr/local:
+ * Example SCons command line: 
  *
- *     scons --release --use-cpu-profiler \
- *         --cpppath=/usr/local/include --libpath=/usr/local/lib
+ *     scons --release --use-cpu-profiler 
  */
 
-#include "third_party/gperftools-2.0/src/gperftools/profiler.h"
+#include "third_party/gperftools-2.2/src/gperftools/profiler.h"
 
 #include <string>
 #include <vector>
@@ -96,10 +94,11 @@ namespace mongo {
         public:
             CpuProfilerStartCommand() : CpuProfilerCommand( commandName ) {}
 
-            virtual bool run( string const &db,
+            virtual bool run( OperationContext* txn,
+                              std::string const &db,
                               BSONObj &cmdObj,
                               int options,
-                              string &errmsg,
+                              std::string &errmsg,
                               BSONObjBuilder &result,
                               bool fromRepl );
 
@@ -113,10 +112,11 @@ namespace mongo {
         public:
             CpuProfilerStopCommand() : CpuProfilerCommand( commandName ) {}
 
-            virtual bool run( string const &db,
+            virtual bool run( OperationContext* txn,
+                              std::string const &db,
                               BSONObj &cmdObj,
                               int options,
-                              string &errmsg,
+                              std::string &errmsg,
                               BSONObjBuilder &result,
                               bool fromRepl );
 
@@ -126,14 +126,17 @@ namespace mongo {
         char const *const CpuProfilerStartCommand::commandName = "_cpuProfilerStart";
         char const *const CpuProfilerStopCommand::commandName = "_cpuProfilerStop";
 
-        bool CpuProfilerStartCommand::run( string const &db,
+        bool CpuProfilerStartCommand::run( OperationContext* txn,
+                                           std::string const &db,
                                            BSONObj &cmdObj,
                                            int options,
-                                           string &errmsg,
+                                           std::string &errmsg,
                                            BSONObjBuilder &result,
                                            bool fromRepl ) {
-            Lock::DBWrite dbXLock(db);
-            Client::Context ctx(db);
+            ScopedTransaction transaction(txn, MODE_IX);
+            Lock::DBLock dbXLock(txn->lockState(), db, MODE_X);
+            // The lock here is just to prevent concurrency, nothing will write.
+            Client::Context ctx(txn, db);
 
             std::string profileFilename = cmdObj[commandName]["profileFilename"].String();
             if ( ! ::ProfilerStart( profileFilename.c_str() ) ) {
@@ -143,14 +146,16 @@ namespace mongo {
             return true;
         }
 
-        bool CpuProfilerStopCommand::run( string const &db,
+        bool CpuProfilerStopCommand::run( OperationContext* txn,
+                                          std::string const &db,
                                           BSONObj &cmdObj,
                                           int options,
-                                          string &errmsg,
+                                          std::string &errmsg,
                                           BSONObjBuilder &result,
                                           bool fromRepl ) {
-            Lock::DBWrite dbXLock(db);
-            Client::Context ctx(db);
+            ScopedTransaction transaction(txn, MODE_IX);
+            Lock::DBLock dbXLock(txn->lockState(), db, MODE_X);
+            Client::Context ctx(txn, db);
 
             ::ProfilerStop();
             return true;

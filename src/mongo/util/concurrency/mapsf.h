@@ -28,6 +28,8 @@
 *    then also delete it in the license file.
 */
 
+#include <boost/noncopyable.hpp>
+
 #include "mongo/platform/unordered_map.h"
 
 namespace mongo {
@@ -37,17 +39,17 @@ namespace mongo {
         if not a hot code path no problem.
         Examples:
 
-        mapsf< map<int,int>, int, int > mp;
+        mapsf< std::map<int,int>, int, int > mp;
 
         int x = mp.get();
 
-        map< map<int,int>, int, int > two;
+        std::map< std::map<int,int>, int, int > two;
         mp.swap(two);
 
         {
-            mapsf< map<int,int>, int, int >::ref r(mp);
+            mapsf< std::map<int,int>, int, int >::ref r(mp);
             r[9] = 1;
-            map<int,int>::iterator i = r.r.begin();
+            std::map<int,int>::iterator i = r.r.begin();
         }
     */
     template< class M >

@@ -28,7 +28,6 @@
 
 #pragma once
 
-#include <boost/function.hpp>
 #include <string>
 #include <map>
 #include <vector>
@@ -39,6 +38,7 @@
 #include "mongo/db/auth/role_graph.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/stdx/functional.h"
 
 namespace mongo {
 
@@ -58,59 +58,52 @@ namespace mongo {
         void setAuthorizationManager(AuthorizationManager* authzManager);
         void setAuthzVersion(int version);
 
-        virtual Status getAllDatabaseNames(std::vector<std::string>* dbnames);
-
-        virtual Status findOne(const NamespaceString& collectionName,
+        virtual Status findOne(OperationContext* txn,
+                               const NamespaceString& collectionName,
                                const BSONObj& query,
                                BSONObj* result);
 
-        virtual Status query(const NamespaceString& collectionName,
+        virtual Status query(OperationContext* txn,
+                             const NamespaceString& collectionName,
                              const BSONObj& query,
                              const BSONObj& projection, // Currently unused in mock
-                             const boost::function<void(const BSONObj&)>& resultProcessor);
+                             const stdx::function<void(const BSONObj&)>& resultProcessor);
 
         // This implementation does not understand uniqueness constraints.
-        virtual Status insert(const NamespaceString& collectionName,
+        virtual Status insert(OperationContext* txn,
+                              const NamespaceString& collectionName,
                               const BSONObj& document,
                               const BSONObj& writeConcern);
 
         // This implementation does not understand uniqueness constraints, ignores writeConcern,
         // and only correctly handles some upsert behaviors.
-        virtual Status updateOne(const NamespaceString& collectionName,
+        virtual Status updateOne(OperationContext* txn,
+                                 const NamespaceString& collectionName,
                                  const BSONObj& query,
                                  const BSONObj& updatePattern,
                                  bool upsert,
                                  const BSONObj& writeConcern);
-        virtual Status update(const NamespaceString& collectionName,
+        virtual Status update(OperationContext* txn,
+                              const NamespaceString& collectionName,
                               const BSONObj& query,
                               const BSONObj& updatePattern,
                               bool upsert,
                               bool multi,
                               const BSONObj& writeConcern,
                               int* nMatched);
-        virtual Status remove(const NamespaceString& collectionName,
+        virtual Status remove(OperationContext* txn,
+                              const NamespaceString& collectionName,
                               const BSONObj& query,
                               const BSONObj& writeConcern,
                               int* numRemoved);
-        virtual Status createIndex(const NamespaceString& collectionName,
-                                   const BSONObj& pattern,
-                                   bool unique,
-                                   const BSONObj& writeConcern);
-        virtual Status dropIndexes(const NamespaceString& collectionName,
-                                   const BSONObj& writeConcern);
         virtual bool tryAcquireAuthzUpdateLock(const StringData& why);
         virtual void releaseAuthzUpdateLock();
 
-        Status _findUser(const std::string& usersNamespace,
-                                 const BSONObj& query,
-                                 BSONObj* result);
         std::vector<BSONObj> getCollectionContents(const NamespaceString& collectionName);
 
     private:
         typedef std::vector<BSONObj> BSONObjCollection;
         typedef std::map<NamespaceString, BSONObjCollection> NamespaceDocumentMap;
-
-        virtual Status _getUserDocument(const UserName& userName, BSONObj* userDoc);
 
         Status _findOneIter(const NamespaceString& collectionName,
                             const BSONObj& query,

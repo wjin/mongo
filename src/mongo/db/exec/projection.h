@@ -28,11 +28,13 @@
 
 #pragma once
 
-#include "mongo/db/diskloc.h"
+#include <boost/scoped_ptr.hpp>
+
 #include "mongo/db/exec/plan_stage.h"
 #include "mongo/db/exec/projection_exec.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/expression.h"
+#include "mongo/db/record_id.h"
 
 namespace mongo {
 
@@ -48,7 +50,8 @@ namespace mongo {
             SIMPLE_DOC
         };
 
-        ProjectionStageParams() : projImpl(NO_FAST_PATH), fullExpression(NULL) { }
+        ProjectionStageParams(const MatchExpressionParser::WhereCallback& wc) 
+            : projImpl(NO_FAST_PATH), fullExpression(NULL), whereCallback(&wc) { }
 
         ProjectionImplementation projImpl;
 
@@ -63,6 +66,9 @@ namespace mongo {
         // If (COVERED_ONE_INDEX == projObj) this is the key pattern we're extracting covered data
         // from.  Otherwise, this field is ignored.
         BSONObj coveredKeyObj;
+
+        // Used for creating context for the $where clause processing. Not owned.
+        const MatchExpressionParser::WhereCallback* whereCallback;
     };
 
     /**
@@ -79,11 +85,19 @@ namespace mongo {
         virtual bool isEOF();
         virtual StageState work(WorkingSetID* out);
 
-        virtual void prepareToYield();
-        virtual void recoverFromYield();
-        virtual void invalidate(const DiskLoc& dl, InvalidationType type);
+        virtual void saveState();
+        virtual void restoreState(OperationContext* opCtx);
+        virtual void invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type);
+
+        virtual std::vector<PlanStage*> getChildren() const;
+
+        virtual StageType stageType() const { return STAGE_PROJECTION; }
 
         PlanStageStats* getStats();
+
+        virtual const CommonStats* getCommonStats();
+
+        virtual const SpecificStats* getSpecificStats();
 
         typedef unordered_set<StringData, StringData::Hasher> FieldSet;
 
@@ -105,17 +119,20 @@ namespace mongo {
                                              const FieldSet& includedFields,
                                              BSONObjBuilder& bob);
 
+        static const char* kStageType;
+
     private:
         Status transform(WorkingSetMember* member);
 
-        scoped_ptr<ProjectionExec> _exec;
+        boost::scoped_ptr<ProjectionExec> _exec;
 
         // _ws is not owned by us.
         WorkingSet* _ws;
-        scoped_ptr<PlanStage> _child;
+        boost::scoped_ptr<PlanStage> _child;
 
         // Stats
         CommonStats _commonStats;
+        ProjectionStats _specificStats;
 
         // Fast paths:
         ProjectionStageParams::ProjectionImplementation _projImpl;
@@ -134,10 +151,10 @@ namespace mongo {
 
         // Field names can be empty in 2.4 and before so we can't use them as a sentinel value.
         // If the i-th entry is true we include the i-th field in the key.
-        vector<bool> _includeKey;
+        std::vector<bool> _includeKey;
 
         // If the i-th entry of _includeKey is true this is the field name for the i-th key field.
-        vector<StringData> _keyFieldNames;
+        std::vector<StringData> _keyFieldNames;
     };
 
 }  // namespace mongo

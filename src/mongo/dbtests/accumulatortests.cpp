@@ -28,15 +28,18 @@
  *    then also delete it in the license file.
  */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
-#include "mongo/db/interrupt_status_mongod.h"
 #include "mongo/db/pipeline/accumulator.h"
 #include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/dbtests/dbtests.h"
 
 namespace AccumulatorTests {
+
+    using boost::intrusive_ptr;
+    using std::numeric_limits;
+    using std::string;
 
     class Base {
     protected:
@@ -915,6 +918,8 @@ namespace AccumulatorTests {
             add<Sum::IntUndefined>();
             add<Sum::NoOverflowBeforeDouble>();
         }
-    } myall;
+    };
+
+    SuiteInstance<All> myall;
 
 } // namespace AccumulatorTests

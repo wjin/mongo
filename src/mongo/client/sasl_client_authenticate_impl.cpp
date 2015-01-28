@@ -1,16 +1,28 @@
 /*    Copyright 2012 10gen Inc.
  *
- *    Licensed under the Apache License, Version 2.0 (the "License");
- *    you may not use this file except in compliance with the License.
- *    You may obtain a copy of the License at
+ *    This program is free software: you can redistribute it and/or  modify
+ *    it under the terms of the GNU Affero General Public License, version 3,
+ *    as published by the Free Software Foundation.
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License for more details.
  *
- *    Unless required by applicable law or agreed to in writing, software
- *    distributed under the License is distributed on an "AS IS" BASIS,
- *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *    See the License for the specific language governing permissions and
- *    limitations under the License.
+ *    You should have received a copy of the GNU Affero General Public License
+ *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
  */
 
 /**
@@ -19,6 +31,10 @@
  *
  * The primary entry point at runtime is saslClientAuthenticateImpl().
  */
+
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+
+#include "mongo/platform/basic.h"
 
 #include <boost/scoped_ptr.hpp>
 #include <string>
@@ -37,6 +53,9 @@
 #include "mongo/util/password_digest.h"
 
 namespace mongo {
+
+    using std::endl;
+
 namespace {
 
     // Default log level on the client for SASL log messages.
@@ -179,21 +198,30 @@ namespace {
             return ex.toStatus();
         }
 
-        SaslClientSession session;
-        Status status = configureSession(&session, client, targetDatabase, saslParameters);
+        std::string mechanism;
+        Status status = bsonExtractStringField(saslParameters, 
+                                               saslCommandMechanismFieldName,
+                                               &mechanism);
+        if(!status.isOK()) {
+            return status;
+        }
+
+        boost::scoped_ptr<SaslClientSession> session(SaslClientSession::create(mechanism));
+        status = configureSession(session.get(), client, targetDatabase, saslParameters);
+       
         if (!status.isOK())
             return status;
 
         BSONObj saslFirstCommandPrefix = BSON(
                 saslStartCommandName << 1 <<
                 saslCommandMechanismFieldName <<
-                session.getParameter(SaslClientSession::parameterMechanism));
+                session->getParameter(SaslClientSession::parameterMechanism));
 
         BSONObj saslFollowupCommandPrefix = BSON(saslContinueCommandName << 1);
         BSONObj saslCommandPrefix = saslFirstCommandPrefix;
         BSONObj inputObj = BSON(saslCommandPayloadFieldName << "");
         bool isServerDone = false;
-        while (!session.isDone()) {
+        while (!session->isDone()) {
             std::string payload;
             BSONType type;
 
@@ -204,7 +232,7 @@ namespace {
             LOG(saslLogLevel) << "sasl client input: " << base64::encode(payload) << endl;
 
             std::string responsePayload;
-            status = session.step(payload, &responsePayload);
+            status = session->step(payload, &responsePayload);
             if (!status.isOK())
                 return status;
 

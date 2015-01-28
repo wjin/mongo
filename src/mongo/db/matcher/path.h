@@ -44,13 +44,16 @@ namespace mongo {
     public:
         Status init( const StringData& path );
 
+        void setTraverseNonleafArrays( bool b ) { _shouldTraverseNonleafArrays = b; }
         void setTraverseLeafArray( bool b ) { _shouldTraverseLeafArray = b; }
 
         const FieldRef& fieldRef() const { return _fieldRef; }
+        bool shouldTraverseNonleafArrays() const { return _shouldTraverseNonleafArrays; }
         bool shouldTraverseLeafArray() const { return _shouldTraverseLeafArray; }
 
     private:
         FieldRef _fieldRef;
+        bool _shouldTraverseNonleafArrays;
         bool _shouldTraverseLeafArray;
     };
 
@@ -126,6 +129,12 @@ namespace mongo {
         Context next();
 
     private:
+        /**
+         * Helper for more().  Recurs on _subCursor (which traverses the remainder of a path through
+         * subdocuments of an array).
+         */
+        bool subCursorHasMore();
+
         const ElementPath* _path;
         BSONObj _context;
 
@@ -143,7 +152,7 @@ namespace mongo {
             bool isArrayOffsetMatch( const StringData& fieldName ) const;
             bool nextEntireRest() const { return nextPieceOfPath.size() == restOfPath.size(); }
 
-            string restOfPath;
+            std::string restOfPath;
             bool hasMore;
             StringData nextPieceOfPath;
             bool nextPieceOfPathIsNumber;

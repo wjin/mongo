@@ -29,7 +29,7 @@
 */
 
 #pragma once
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 #include "mongo/db/jsobj.h"
 #include "top.h"
 #include "mongo/util/background.h"
@@ -49,8 +49,6 @@ namespace mongo {
         void takeSnapshot();
 
         unsigned long long _created;
-        Top::CollectionData _globalUsage;
-        unsigned long long _totalWriteLockedTime; // micros of total time locked
         Top::UsageMap _usage;
 
         friend class SnapshotThread;
@@ -73,16 +71,6 @@ namespace mongo {
             return _elapsed;
         }
 
-        unsigned long long timeInWriteLock() const {
-            return _newer._totalWriteLockedTime - _older._totalWriteLockedTime;
-        }
-        double percentWriteLocked() const {
-            double e = (double) elapsed();
-            double w = (double) timeInWriteLock();
-            return w/e;
-        }
-
-        Top::CollectionData globalUsageDiff();
         Top::UsageMap collectionUsageDiff();
 
     private:
@@ -101,10 +89,8 @@ namespace mongo {
         int numDeltas() const { return _stored-1; }
 
         const SnapshotData& getPrev( int numBack = 0 );
-        auto_ptr<SnapshotDelta> computeDelta( int numBack = 0 );
+        std::auto_ptr<SnapshotDelta> computeDelta( int numBack = 0 );
 
-
-        void outputLockInfoHTML( stringstream& ss );
     private:
         mongo::mutex _lock;
         int _n;
@@ -115,7 +101,7 @@ namespace mongo {
 
     class SnapshotThread : public BackgroundJob {
     public:
-        virtual string name() const { return "snapshot"; }
+        virtual std::string name() const { return "snapshot"; }
         void run();
     };
 

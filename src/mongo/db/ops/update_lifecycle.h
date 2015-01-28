@@ -34,6 +34,8 @@
 
 namespace mongo {
 
+    class OperationContext;
+
     class UpdateLifecycle {
     public:
 
@@ -56,7 +58,7 @@ namespace mongo {
         /**
          * Return a pointer to any indexes if there is a collection.
          */
-        virtual const IndexPathSet* getIndexKeys() const = 0;
+        virtual const UpdateIndexData* getIndexKeys( OperationContext* opCtx ) const = 0;
 
         /**
          * Returns the shard keys as immutable fields

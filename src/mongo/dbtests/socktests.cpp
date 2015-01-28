@@ -29,8 +29,9 @@
  *    then also delete it in the license file.
  */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
+#include "mongo/db/repl/isself.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/util/net/sock.h"
 
@@ -45,7 +46,7 @@ namespace SockTests {
 
             HostAndPort h("asdfasdfasdf_no_such_host");
             // this fails uncomment when fixed.
-            ASSERT( !h.isSelf() );
+            ASSERT(!mongo::repl::isSelf(h));
         }
     };
 
@@ -55,7 +56,9 @@ namespace SockTests {
         void setupTests() {
             add< HostByName >();
         }
-    } myall;
+    };
+
+    SuiteInstance<All> myall;
 
 } // namespace SockTests
 

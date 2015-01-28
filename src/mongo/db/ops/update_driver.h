@@ -35,11 +35,11 @@
 #include "mongo/base/status.h"
 #include "mongo/bson/mutable/document.h"
 #include "mongo/db/field_ref_set.h"
-#include "mongo/db/index_set.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/ops/modifier_interface.h"
 #include "mongo/db/ops/modifier_table.h"
 #include "mongo/db/query/canonical_query.h"
+#include "mongo/db/update_index_data.h"
 
 namespace mongo {
 
@@ -69,9 +69,11 @@ namespace mongo {
          * conflicts along the way then those errors will be returned.
          */
         Status populateDocumentWithQueryFields(const BSONObj& query,
+                                               const std::vector<FieldRef*>* immutablePaths,
                                                mutablebson::Document& doc) const;
 
         Status populateDocumentWithQueryFields(const CanonicalQuery* query,
+                                               const std::vector<FieldRef*>* immutablePaths,
                                                mutablebson::Document& doc) const;
 
         /**
@@ -96,7 +98,8 @@ namespace mongo {
         Status update(const StringData& matchedField,
                       mutablebson::Document* doc,
                       BSONObj* logOpRec = NULL,
-                      FieldRefSet* updatedFields = NULL);
+                      FieldRefSet* updatedFields = NULL,
+                      bool* docWasModified = NULL);
 
         //
         // Accessors
@@ -107,7 +110,7 @@ namespace mongo {
         bool isDocReplacement() const;
 
         bool modsAffectIndices() const;
-        void refreshIndexKeys(const IndexPathSet* indexedFields);
+        void refreshIndexKeys(const UpdateIndexData* indexedFields);
 
         bool logOp() const;
         void setLogOp(bool logOp);
@@ -147,13 +150,13 @@ namespace mongo {
         bool _replacementMode;
 
         // Collection of update mod instances. Owned here.
-        vector<ModifierInterface*> _mods;
+        std::vector<ModifierInterface*> _mods;
 
         // What are the list of fields in the collection over which the update is going to be
         // applied that participate in indices?
         //
         // NOTE: Owned by the collection's info cache!.
-        const IndexPathSet* _indexedFields;
+        const UpdateIndexData* _indexedFields;
 
         //
         // mutable properties after parsing

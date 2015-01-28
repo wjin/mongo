@@ -40,7 +40,7 @@ namespace mongo {
      */
     class BtreeKeyGenerator {
     public:
-        BtreeKeyGenerator(vector<const char*> fieldNames, vector<BSONElement> fixed, bool isSparse);
+        BtreeKeyGenerator(std::vector<const char*> fieldNames, std::vector<BSONElement> fixed, bool isSparse);
         virtual ~BtreeKeyGenerator() { }
 
         void getKeys(const BSONObj &obj, BSONObjSet *keys) const;
@@ -49,7 +49,8 @@ namespace mongo {
 
     protected:
         // These are used by the getKeysImpl(s) below.
-        vector<const char*> _fieldNames;
+        std::vector<const char*> _fieldNames;
+        bool _isIdIndex;
         bool _isSparse;
         BSONObj _nullKey; // a full key with all fields null
         BSONObj _nullObj;     // only used for _nullElt
@@ -57,25 +58,25 @@ namespace mongo {
         BSONSizeTracker _sizeTracker;
     private:
         // We have V0 and V1.  Sigh.
-        virtual void getKeysImpl(vector<const char*> fieldNames, vector<BSONElement> fixed,
+        virtual void getKeysImpl(std::vector<const char*> fieldNames, std::vector<BSONElement> fixed,
                                  const BSONObj &obj, BSONObjSet *keys) const = 0;
-        vector<BSONElement> _fixed;
+        std::vector<BSONElement> _fixed;
     };
 
     class BtreeKeyGeneratorV0 : public BtreeKeyGenerator {
     public:
-        BtreeKeyGeneratorV0(vector<const char*> fieldNames, vector<BSONElement> fixed,
+        BtreeKeyGeneratorV0(std::vector<const char*> fieldNames, std::vector<BSONElement> fixed,
                             bool isSparse);
         virtual ~BtreeKeyGeneratorV0() { }
-        
+
     private:
-        virtual void getKeysImpl(vector<const char*> fieldNames, vector<BSONElement> fixed,
+        virtual void getKeysImpl(std::vector<const char*> fieldNames, std::vector<BSONElement> fixed,
                                  const BSONObj &obj, BSONObjSet *keys) const;
     };
 
     class BtreeKeyGeneratorV1 : public BtreeKeyGenerator {
     public:
-        BtreeKeyGeneratorV1(vector<const char*> fieldNames, vector<BSONElement> fixed,
+        BtreeKeyGeneratorV1(std::vector<const char*> fieldNames, std::vector<BSONElement> fixed,
                             bool isSparse);
         virtual ~BtreeKeyGeneratorV1() { }
 
@@ -89,11 +90,11 @@ namespace mongo {
          * @param array - array from which keys should be extracted, based on names in fieldNames
          *        If obj and array are both nonempty, obj will be one of the elements of array.
          */        
-        virtual void getKeysImpl(vector<const char*> fieldNames, vector<BSONElement> fixed,
+        virtual void getKeysImpl(std::vector<const char*> fieldNames, std::vector<BSONElement> fixed,
                                  const BSONObj &obj, BSONObjSet *keys) const;
 
         // These guys are called by getKeysImpl.
-        void getKeysImplWithArray(vector<const char*> fieldNames, vector<BSONElement> fixed,
+        void getKeysImplWithArray(std::vector<const char*> fieldNames, std::vector<BSONElement> fixed,
                                   const BSONObj &obj, BSONObjSet *keys, unsigned numNotFound,
                                   const BSONObj &array) const;
         /**
@@ -102,11 +103,11 @@ namespace mongo {
          */
         BSONElement extractNextElement(const BSONObj &obj, const BSONObj &arr, const char *&field,
                                        bool &arrayNestedArray ) const;
-        void _getKeysArrEltFixed(vector<const char*> &fieldNames, vector<BSONElement> &fixed,
+        void _getKeysArrEltFixed(std::vector<const char*> &fieldNames, std::vector<BSONElement> &fixed,
                                  const BSONElement &arrEntry, BSONObjSet *keys,
                                  unsigned numNotFound, const BSONElement &arrObjElt,
-                                 const set<unsigned> &arrIdxs, bool mayExpandArrayUnembedded) const;
-        
+                                 const std::set<unsigned> &arrIdxs, bool mayExpandArrayUnembedded) const;
+
         BSONObj _undefinedObj;
         BSONElement _undefinedElt;
     };

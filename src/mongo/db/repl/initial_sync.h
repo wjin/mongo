@@ -31,13 +31,9 @@
 #include "mongo/db/repl/sync_tail.h"
 
 namespace mongo {
-namespace replset {
+namespace repl {
 
     class BackgroundSyncInterface;
-
-    // These free functions are used by the thread pool workers to write ops to the db.
-    void multiSyncApply(const std::vector<BSONObj>& ops, SyncTail* st);
-    void multiInitialSyncApply(const std::vector<BSONObj>& ops, SyncTail* st);
 
     /**
      * Initial clone and sync
@@ -48,11 +44,10 @@ namespace replset {
         InitialSync(BackgroundSyncInterface *q);
 
         /**
-         * Creates the initial oplog entry: applies applyGTEObj and writes it to the oplog.  Then
-         * this runs oplogApplySegment allowing recloning documents.
+         * applies up to endOpTime, fetching missing documents as needed.
          */
-        BSONObj oplogApplication(const BSONObj& applyGTEObj, const BSONObj& minValidObj);
+        void oplogApplication(OperationContext* txn, const OpTime& endOpTime);
     };
 
-} // namespace replset
+} // namespace repl
 } // namespace mongo

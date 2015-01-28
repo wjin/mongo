@@ -28,12 +28,13 @@
 
 #pragma once
 
-#include "mongo/db/diskloc.h"
-#include "mongo/db/jsobj.h"
+#include <boost/scoped_ptr.hpp>
+
 #include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/jsobj.h"
+#include "mongo/db/record_id.h"
 #include "mongo/s/chunk_version.h"
-#include "mongo/s/d_logic.h"
-#include "mongo/s/stale_exception.h"
+#include "mongo/s/d_state.h"
 
 namespace mongo {
 
@@ -80,15 +81,25 @@ namespace mongo {
         virtual bool isEOF();
         virtual StageState work(WorkingSetID* out);
 
-        virtual void prepareToYield();
-        virtual void recoverFromYield();
-        virtual void invalidate(const DiskLoc& dl, InvalidationType type);
+        virtual void saveState();
+        virtual void restoreState(OperationContext* opCtx);
+        virtual void invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type);
+
+        virtual std::vector<PlanStage*> getChildren() const;
+
+        virtual StageType stageType() const { return STAGE_SHARDING_FILTER; }
 
         virtual PlanStageStats* getStats();
 
+        virtual const CommonStats* getCommonStats();
+
+        virtual const SpecificStats* getSpecificStats();
+
+        static const char* kStageType;
+
     private:
         WorkingSet* _ws;
-        scoped_ptr<PlanStage> _child;
+        boost::scoped_ptr<PlanStage> _child;
 
         // Stats
         CommonStats _commonStats;

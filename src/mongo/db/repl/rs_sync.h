@@ -40,13 +40,9 @@
 #include "mongo/util/concurrency/thread_pool.h"
 
 namespace mongo {
-namespace replset {
+namespace repl {
+    // Body of the thread that will do the background sync.
+    void runSyncThread();
 
-    class BackgroundSyncInterface;
-
-
-    // TODO: move hbmsg into an error-keeping class (SERVER-4444)
-    void sethbmsg(const string& s, const int logLevel=0);
-
-} // namespace replset
+} // namespace repl
 } // namespace mongo

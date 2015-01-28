@@ -28,29 +28,32 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/db/d_concurrency.h"
 #include "mongo/db/dbwebserver.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/stats/snapshots.h"
 #include "mongo/util/mongoutils/html.h"
 
 namespace mongo {
 namespace {
 
-    using namespace mongoutils;
-    using namespace mongoutils::html;
+    using namespace html;
+
+    using std::auto_ptr;
+    using std::fixed;
+    using std::setprecision;
+    using std::string;
+    using std::stringstream;
 
     class WriteLockStatus : public WebStatusPlugin {
     public:
         WriteLockStatus() : WebStatusPlugin( "write lock" , 51 , "% time in write lock, by 4 sec periods" ) {}
         virtual void init() {}
 
-        virtual void run( stringstream& ss ) {
-            statsSnapshots.outputLockInfoHTML( ss );
-
+        virtual void run(OperationContext* txn, stringstream& ss) {
             ss << "<a "
                "href=\"http://dochub.mongodb.org/core/concurrency\" "
                "title=\"snapshot: was the db in the write lock when this page was generated?\">";
-            ss << "write locked now:</a> " << (Lock::isW() ? "true" : "false") << "\n";
+            ss << "write locked now:</a> " << (txn->lockState()->isW() ? "true" : "false") << "\n";
         }
 
     } writeLockStatus;
@@ -91,7 +94,7 @@ namespace {
             ss << "</tr>\n";
         }
 
-        void run( stringstream& ss ) {
+        void run(OperationContext* txn, stringstream& ss) {
             auto_ptr<SnapshotDelta> delta = statsSnapshots.computeDelta();
             if ( ! delta.get() )
                 return;
@@ -109,8 +112,6 @@ namespace {
                "<th colspan=2>Updates</th>"
                "<th colspan=2>Removes</th>";
             ss << "</tr>\n";
-
-            display( ss , (double) delta->elapsed() , "TOTAL" , delta->globalUsageDiff() );
 
             Top::UsageMap usage = delta->collectionUsageDiff();
             for ( Top::UsageMap::const_iterator i=usage.begin(); i != usage.end(); ++i ) {

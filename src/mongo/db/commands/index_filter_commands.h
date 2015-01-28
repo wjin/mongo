@@ -63,12 +63,14 @@ namespace mongo {
          * implement plan cache command functionality.
          */
 
-        bool run(const std::string& dbname, BSONObj& cmdObj, int options,
+        bool run(OperationContext* txn, const std::string& dbname, BSONObj& cmdObj, int options,
                  std::string& errmsg, BSONObjBuilder& result, bool fromRepl);
 
         virtual bool isWriteCommandForConfigServer() const;
 
         virtual bool slaveOk() const;
+
+        virtual bool slaveOverrideOk() const;
 
         virtual void help(std::stringstream& ss) const;
 
@@ -76,7 +78,8 @@ namespace mongo {
          * One action type defined for index filter commands:
          * - planCacheIndexFilter
          */
-        virtual Status checkAuthForCommand(ClientBasic* client, const std::string& dbname,
+        virtual Status checkAuthForCommand(ClientBasic* client,
+                                           const std::string& dbname,
                                            const BSONObj& cmdObj);
 
         /**
@@ -85,7 +88,9 @@ namespace mongo {
          * Should contain just enough logic to invoke run*Command() function
          * in query_settings.h
          */
-        virtual Status runIndexFilterCommand(const std::string& ns, BSONObj& cmdObj,
+        virtual Status runIndexFilterCommand(OperationContext* txn,
+                                             const std::string& ns,
+                                             BSONObj& cmdObj,
                                              BSONObjBuilder* bob) = 0;
 
     private:
@@ -102,7 +107,10 @@ namespace mongo {
     public:
         ListFilters();
 
-        virtual Status runIndexFilterCommand(const std::string& ns, BSONObj& cmdObj, BSONObjBuilder* bob);
+        virtual Status runIndexFilterCommand(OperationContext* txn,
+                                             const std::string& ns,
+                                             BSONObj& cmdObj,
+                                             BSONObjBuilder* bob);
 
         /**
          * Looks up index filters from collection's query settings.
@@ -121,7 +129,10 @@ namespace mongo {
     public:
         ClearFilters();
 
-        virtual Status runIndexFilterCommand(const std::string& ns, BSONObj& cmdObj, BSONObjBuilder* bob);
+        virtual Status runIndexFilterCommand(OperationContext* txn,
+                                             const std::string& ns,
+                                             BSONObj& cmdObj,
+                                             BSONObjBuilder* bob);
 
         /**
          * If query shape is provided, clears index filter for a query.
@@ -129,7 +140,10 @@ namespace mongo {
          * Namespace argument ns is ignored if we are clearing the entire cache.
          * Removes corresponding entries from plan cache.
          */
-        static Status clear(QuerySettings* querySettings, PlanCache* planCache, const std::string& ns,
+        static Status clear(OperationContext* txn,
+                            QuerySettings* querySettings,
+                            PlanCache* planCache,
+                            const std::string& ns,
                             const BSONObj& cmdObj);
     };
 
@@ -149,13 +163,19 @@ namespace mongo {
     public:
         SetFilter();
 
-        virtual Status runIndexFilterCommand(const std::string& ns, BSONObj& cmdObj, BSONObjBuilder* bob);
+        virtual Status runIndexFilterCommand(OperationContext* txn,
+                                             const std::string& ns,
+                                             BSONObj& cmdObj,
+                                             BSONObjBuilder* bob);
 
         /**
          * Sets index filter for a query shape.
          * Removes entry for query shape from plan cache.
          */
-        static Status set(QuerySettings* querySettings, PlanCache* planCache, const std::string& ns,
+        static Status set(OperationContext* txn,
+                          QuerySettings* querySettings,
+                          PlanCache* planCache,
+                          const std::string& ns,
                           const BSONObj& cmdObj);
     };
 

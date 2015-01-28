@@ -28,8 +28,10 @@
 
 #include "mongo/db/ops/delete.h"
 
-#include "mongo/db/ops/delete_executor.h"
+#include "mongo/db/exec/delete.h"
 #include "mongo/db/ops/delete_request.h"
+#include "mongo/db/ops/parsed_delete.h"
+#include "mongo/db/query/get_executor.h"
 
 namespace mongo {
 
@@ -38,21 +40,38 @@ namespace mongo {
        justOne: stop after 1 match
        god:     allow access to system namespaces, and don't yield
     */
-    long long deleteObjects(TransactionExperiment* txn,
+    long long deleteObjects(OperationContext* txn,
                             Database* db,
                             const StringData& ns,
                             BSONObj pattern,
+                            PlanExecutor::YieldPolicy policy,
                             bool justOne,
                             bool logop,
-                            bool god) {
+                            bool god,
+                            bool fromMigrate) {
         NamespaceString nsString(ns);
         DeleteRequest request(nsString);
         request.setQuery(pattern);
         request.setMulti(!justOne);
         request.setUpdateOpLog(logop);
         request.setGod(god);
-        DeleteExecutor executor(&request);
-        return executor.execute(txn, db);
+        request.setFromMigrate(fromMigrate);
+        request.setYieldPolicy(policy);
+
+        Collection* collection = NULL;
+        if (db) {
+            collection = db->getCollection(nsString.ns());
+        }
+
+        ParsedDelete parsedDelete(txn, &request);
+        uassertStatusOK(parsedDelete.parseRequest());
+
+        PlanExecutor* rawExec;
+        uassertStatusOK(getExecutorDelete(txn, collection, &parsedDelete, &rawExec));
+        boost::scoped_ptr<PlanExecutor> exec(rawExec);
+
+        uassertStatusOK(exec->executePlan());
+        return DeleteStage::getNumDeleted(exec.get());
     }
 
 }  // namespace mongo

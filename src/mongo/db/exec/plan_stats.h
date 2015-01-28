@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2013-2014 MongoDB Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -35,9 +35,10 @@
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/geo/hash.h"
 #include "mongo/db/query/stage_types.h"
 #include "mongo/platform/cstdint.h"
+#include "mongo/util/time_support.h"
+#include "mongo/util/net/listen.h" // for Listener::getElapsedTimeMillis()
 
 namespace mongo {
 
@@ -55,14 +56,19 @@ namespace mongo {
 
     // Every stage has CommonStats.
     struct CommonStats {
-        CommonStats() : works(0),
+        CommonStats(const char* type)
+                      : stageTypeStr(type),
+                        works(0),
                         yields(0),
                         unyields(0),
                         invalidates(0),
                         advanced(0),
                         needTime(0),
                         needFetch(0),
+                        executionTimeMillis(0),
                         isEOF(false) { }
+        // String giving the type of the stage. Not owned.
+        const char* stageTypeStr;
 
         // Count calls into the stage.
         size_t works;
@@ -75,15 +81,25 @@ namespace mongo {
         size_t needTime;
         size_t needFetch;
 
+        // BSON representation of a MatchExpression affixed to this node. If there
+        // is no filter affixed, then 'filter' should be an empty BSONObj.
+        BSONObj filter;
+
+        // Time elapsed while working inside this stage.
+        long long executionTimeMillis;
+
         // TODO: have some way of tracking WSM sizes (or really any series of #s).  We can measure
         // the size of our inputs and the size of our outputs.  We can do a lot with the WS here.
 
         // TODO: once we've picked a plan, collect different (or additional) stats for display to
         // the user, eg. time_t totalTimeSpent;
 
-        // TODO: keep track of total yield time / fetch time for a plan (done by runner)
+        // TODO: keep track of the total yield time / fetch time done for a plan.
 
         bool isEOF;
+    private:
+        // Default constructor is illegal.
+        CommonStats();
     };
 
     // The universal container for a stage's stats.
@@ -148,7 +164,7 @@ namespace mongo {
         size_t flaggedInProgress;
 
         // How many entries are in the map after each child?
-        // child 'i' produced children[i].common.advanced DiskLocs, of which mapAfterChild[i] were
+        // child 'i' produced children[i].common.advanced RecordIds, of which mapAfterChild[i] were
         // intersections.
         std::vector<size_t> mapAfterChild;
 
@@ -183,8 +199,16 @@ namespace mongo {
         size_t matchTested;
     };
 
+    struct CachedPlanStats : public SpecificStats {
+        CachedPlanStats() { }
+
+        virtual SpecificStats* clone() const {
+            return new CachedPlanStats(*this);
+        }
+    };
+
     struct CollectionScanStats : public SpecificStats {
-        CollectionScanStats() : docsTested(0) { }
+        CollectionScanStats() : docsTested(0), direction(1) { }
 
         virtual SpecificStats* clone() const {
             CollectionScanStats* specific = new CollectionScanStats(*this);
@@ -193,23 +217,90 @@ namespace mongo {
 
         // How many documents did we check against our filter?
         size_t docsTested;
+
+        // >0 if we're traversing the collection forwards. <0 if we're traversing it
+        // backwards.
+        int direction;
+    };
+
+    struct CountStats : public SpecificStats {
+        CountStats() : nCounted(0), nSkipped(0), trivialCount(false) { }
+
+        virtual SpecificStats* clone() const {
+            CountStats* specific = new CountStats(*this);
+            return specific;
+        }
+
+        // The result of the count.
+        long long nCounted;
+
+        // The number of results we skipped over.
+        long long nSkipped;
+
+        // A "trivial count" is one that we can answer by calling numRecords() on the
+        // collection, without actually going through any query logic.
+        bool trivialCount;
+    };
+
+    struct CountScanStats : public SpecificStats {
+        CountScanStats() : isMultiKey(false),
+                           keysExamined(0) { }
+
+        virtual ~CountScanStats() { }
+
+        virtual SpecificStats* clone() const {
+            CountScanStats* specific = new CountScanStats(*this);
+            // BSON objects have to be explicitly copied.
+            specific->keyPattern = keyPattern.getOwned();
+            return specific;
+        }
+
+        std::string indexName;
+
+        BSONObj keyPattern;
+
+        bool isMultiKey;
+
+        size_t keysExamined;
+
+    };
+
+    struct DeleteStats : public SpecificStats {
+        DeleteStats() : docsDeleted(0), nInvalidateSkips(0) { }
+
+        virtual SpecificStats* clone() const {
+            return new DeleteStats(*this);
+        }
+
+        size_t docsDeleted;
+
+        // Invalidated documents can be force-fetched, causing the now invalid RecordId to
+        // be thrown out. The delete stage skips over any results which do not have a RecordId.
+        size_t nInvalidateSkips;
     };
 
     struct DistinctScanStats : public SpecificStats {
         DistinctScanStats() : keysExamined(0) { }
 
         virtual SpecificStats* clone() const {
-            return new DistinctScanStats(*this);
+            DistinctScanStats* specific = new DistinctScanStats(*this);
+            specific->keyPattern = keyPattern.getOwned();
+            return specific;
         }
 
         // How many keys did we look at while distinct-ing?
         size_t keysExamined;
+
+        std::string indexName;
+
+        BSONObj keyPattern;
     };
 
     struct FetchStats : public SpecificStats {
         FetchStats() : alreadyHasObj(0),
                        forcedFetches(0),
-                       matchTested(0) { }
+                       matchTested(0),
+                       docsExamined(0) { }
 
         virtual ~FetchStats() { }
 
@@ -230,6 +321,42 @@ namespace mongo {
 
         // We know how many passed (it's the # of advanced) and therefore how many failed.
         size_t matchTested;
+
+        // The total number of full documents touched by the fetch stage.
+        size_t docsExamined;
+    };
+
+    struct GroupStats : public SpecificStats {
+        GroupStats() : nGroups(0) { }
+
+        virtual ~GroupStats() { }
+
+        virtual SpecificStats* clone() const {
+            GroupStats* specific = new GroupStats(*this);
+            return specific;
+        }
+
+        // The total number of groups.
+        size_t nGroups;
+    };
+
+    struct IDHackStats : public SpecificStats {
+        IDHackStats() : keysExamined(0),
+                        docsExamined(0) { }
+
+        virtual ~IDHackStats() { }
+
+        virtual SpecificStats* clone() const {
+            IDHackStats* specific = new IDHackStats(*this);
+            return specific;
+        }
+
+        // Number of entries retrieved from the index while executing the idhack.
+        size_t keysExamined;
+
+        // Number of documents retrieved from the collection while executing the idhack.
+        size_t docsExamined;
+
     };
 
     struct IndexScanStats : public SpecificStats {
@@ -263,9 +390,6 @@ namespace mongo {
         // used.
         BSONObj indexBounds;
 
-        // Contains same information as indexBounds with the addition of inclusivity of bounds.
-        std::string indexBoundsVerbose;
-
         // >1 if we're traversing the index along with its order. <1 if we're traversing it
         // against the order.
         int direction;
@@ -288,6 +412,33 @@ namespace mongo {
 
     };
 
+    struct LimitStats : public SpecificStats {
+        LimitStats() : limit(0) { }
+
+        virtual SpecificStats* clone() const {
+            LimitStats* specific = new LimitStats(*this);
+            return specific;
+        }
+
+        size_t limit;
+    };
+
+    struct MockStats : public SpecificStats {
+        MockStats() { }
+
+        virtual SpecificStats* clone() const {
+            return new MockStats(*this);
+        }
+    };
+
+    struct MultiPlanStats : public SpecificStats {
+        MultiPlanStats() { }
+
+        virtual SpecificStats* clone() const {
+            return new MultiPlanStats(*this);
+        }
+    };
+
     struct OrStats : public SpecificStats {
         OrStats() : dupsTested(0),
                     dupsDropped(0),
@@ -303,11 +454,23 @@ namespace mongo {
         size_t dupsTested;
         size_t dupsDropped;
 
-        // How many calls to invalidate(...) actually removed a DiskLoc from our deduping map?
+        // How many calls to invalidate(...) actually removed a RecordId from our deduping map?
         size_t locsForgotten;
 
         // We know how many passed (it's the # of advanced) and therefore how many failed.
         std::vector<size_t> matchTested;
+    };
+
+    struct ProjectionStats : public SpecificStats {
+        ProjectionStats() { }
+
+        virtual SpecificStats* clone() const {
+            ProjectionStats* specific = new ProjectionStats(*this);
+            return specific;
+        }
+
+        // Object specifying the projection transformation to apply.
+        BSONObj projObj;
     };
 
     struct SortStats : public SpecificStats {
@@ -328,6 +491,12 @@ namespace mongo {
 
         // What's our memory limit?
         size_t memLimit;
+
+        // The number of results to return from the sort.
+        size_t limit;
+
+        // The pattern according to which we are sorting.
+        BSONObj sortPattern;
     };
 
     struct MergeSortStats : public SpecificStats {
@@ -347,6 +516,9 @@ namespace mongo {
 
         // How many records were we forced to fetch as the result of an invalidation?
         size_t forcedFetches;
+
+        // The pattern according to which we are sorting.
+        BSONObj sortPattern;
     };
 
     struct ShardingFilterStats : public SpecificStats {
@@ -360,43 +532,110 @@ namespace mongo {
         size_t chunkSkips;
     };
 
-    struct TwoDStats : public SpecificStats {
-        TwoDStats() { }
+    struct SkipStats : public SpecificStats {
+        SkipStats() : skip(0) { }
 
         virtual SpecificStats* clone() const {
-            TwoDStats* specific = new TwoDStats(*this);
+            SkipStats* specific = new SkipStats(*this);
             return specific;
         }
 
-        // Type of GeoBrowse (box, circle, ...)
-        std::string type;
-
-        // Field name in 2d index.
-        std::string field;
-
-        // Geo hash converter parameters.
-        // Used to construct a geo hash converter to generate
-        // explain-style index bounds from geo hashes.
-        GeoHashConverter::Parameters converterParams;
-
-        // Geo hashes generated by GeoBrowse::fillStack.
-        // Raw data for explain index bounds.
-        std::vector<GeoHash> expPrefixes;
+        size_t skip;
     };
 
-    struct TwoDNearStats : public SpecificStats {
-        TwoDNearStats() : objectsLoaded(0), nscanned(0) { }
+    struct IntervalStats {
 
-        virtual SpecificStats* clone() const {
-            TwoDNearStats* specific = new TwoDNearStats(*this);
-            return specific;
+        IntervalStats() :
+            numResultsFound(0),
+            numResultsBuffered(0),
+            minDistanceAllowed(-1),
+            maxDistanceAllowed(-1),
+            inclusiveMaxDistanceAllowed(false),
+            minDistanceFound(-1),
+            maxDistanceFound(-1),
+            minDistanceBuffered(-1),
+            maxDistanceBuffered(-1) {
         }
 
-        size_t objectsLoaded;
+        long long numResultsFound;
+        long long numResultsBuffered;
 
-        // Since 2d's near does all its work in one go we can't divine the real nscanned from
-        // anything else.
-        size_t nscanned;
+        double minDistanceAllowed;
+        double maxDistanceAllowed;
+        bool inclusiveMaxDistanceAllowed;
+
+        double minDistanceFound;
+        double maxDistanceFound;
+        double minDistanceBuffered;
+        double maxDistanceBuffered;
+    };
+
+    class NearStats : public SpecificStats {
+    public:
+
+        NearStats() {}
+
+        virtual SpecificStats* clone() const {
+            return new NearStats(*this);
+        }
+
+        long long totalResultsFound() {
+            long long totalResultsFound = 0;
+            for (std::vector<IntervalStats>::iterator it = intervalStats.begin();
+                it != intervalStats.end(); ++it) {
+                totalResultsFound += it->numResultsFound;
+            }
+            return totalResultsFound;
+        }
+
+        std::vector<IntervalStats> intervalStats;
+        std::string indexName;
+        BSONObj keyPattern;
+    };
+
+    struct UpdateStats : public SpecificStats {
+        UpdateStats()
+            : nMatched(0),
+              nModified(0),
+              isDocReplacement(false),
+              fastmod(false),
+              fastmodinsert(false),
+              inserted(false),
+              nInvalidateSkips(0) { }
+
+        virtual SpecificStats* clone() const {
+            return new UpdateStats(*this);
+        }
+
+        // The number of documents which match the query part of the update.
+        size_t nMatched;
+
+        // The number of documents modified by this update.
+        size_t nModified;
+
+        // True iff this is a doc-replacement style update, as opposed to a $mod update.
+        bool isDocReplacement;
+
+        // A 'fastmod' update is an in-place update that does not have to modify
+        // any indices. It's "fast" because the only work needed is changing the bits
+        // inside the document.
+        bool fastmod;
+
+        // A 'fastmodinsert' is an insert resulting from an {upsert: true} update
+        // which is a doc-replacement style update. It's "fast" because we don't need
+        // to compute the document to insert based on the modifiers.
+        bool fastmodinsert;
+
+        // Is this an {upsert: true} update that did an insert?
+        bool inserted;
+
+        // The object that was inserted. This is an empty document if no insert was performed.
+        BSONObj objInserted;
+
+        // Invalidated documents can be force-fetched, causing the now invalid RecordId to
+        // be thrown out. The update stage skips over any results which do not have the
+        // RecordId to update.
+        size_t nInvalidateSkips;
     };
 
     struct TextStats : public SpecificStats {
@@ -407,12 +646,17 @@ namespace mongo {
             return specific;
         }
 
+        std::string indexName;
+
         size_t keysExamined;
 
         size_t fetches;
 
         // Human-readable form of the FTSQuery associated with the text stage.
         BSONObj parsedTextQuery;
+
+        // Index keys that precede the "text" index key.
+        BSONObj indexPrefix;
     };
 
 }  // namespace mongo

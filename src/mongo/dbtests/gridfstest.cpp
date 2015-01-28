@@ -26,9 +26,11 @@
  *    then also delete it in the license file.
  */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include "mongo/client/gridfs.h"
+#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/operation_context_impl.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/util/assert_util.h"
 
@@ -37,12 +39,14 @@ using mongo::GridFS;
 using mongo::MsgAssertionException;
 
 namespace {
-    DBDirectClient _client;
     
     class SetChunkSizeTest {
     public:
         virtual void run() {
-            GridFS grid( _client, "gridtest" );
+            OperationContextImpl txn;
+            DBDirectClient client(&txn);
+
+            GridFS grid(client, "gridtest");
             grid.setChunkSize( 5 );
 
             ASSERT_EQUALS( 5U, grid.getChunkSize() );
@@ -61,6 +65,8 @@ namespace {
         void setupTests() {
             add< SetChunkSizeTest >();
         }
-    } myall;
+    };
+
+    SuiteInstance<All> myall;
 }
 

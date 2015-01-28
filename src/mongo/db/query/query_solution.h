@@ -28,9 +28,10 @@
 
 #pragma once
 
+#include <boost/scoped_ptr.hpp>
+
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/expression.h"
-#include "mongo/db/geo/geoquery.h"
 #include "mongo/db/fts/fts_query.h"
 #include "mongo/db/query/index_bounds.h"
 #include "mongo/db/query/plan_cache.h"
@@ -39,6 +40,8 @@
 namespace mongo {
 
     using mongo::fts::FTSQuery;
+
+    class GeoNearExpression;
 
     /**
      * This is an abstract representation of a query plan.  It can be transcribed into a tree of
@@ -53,9 +56,9 @@ namespace mongo {
         }
 
         /**
-         * Return a string representation of this node and any children.
+         * Return a std::string representation of this node and any children.
          */
-        string toString() const;
+        std::string toString() const;
 
         /**
          * What stage should this be transcribed to?  See stage_types.h.
@@ -103,7 +106,7 @@ namespace mongo {
          *
          * TODO: 'field' is probably more appropriate as a FieldRef or string.
          */
-        virtual bool hasField(const string& field) const = 0;
+        virtual bool hasField(const std::string& field) const = 0;
 
         /**
          * Returns true if the tree rooted at this node provides data that is sorted by the
@@ -143,11 +146,11 @@ namespace mongo {
         }
 
         // These are owned here.
-        vector<QuerySolutionNode*> children;
+        std::vector<QuerySolutionNode*> children;
 
         // If a stage has a non-NULL filter all values outputted from that stage must pass that
         // filter.
-        scoped_ptr<MatchExpression> filter;
+        boost::scoped_ptr<MatchExpression> filter;
 
     protected:
         /**
@@ -175,7 +178,7 @@ namespace mongo {
         QuerySolution() : hasBlockingStage(false), indexFilterApplied(false) { }
 
         // Owned here.
-        scoped_ptr<QuerySolutionNode> root;
+        boost::scoped_ptr<QuerySolutionNode> root;
 
         // Any filters in root or below point into this object.  Must be owned.
         BSONObj filterData;
@@ -199,9 +202,9 @@ namespace mongo {
         boost::scoped_ptr<SolutionCacheData> cacheData;
 
         /**
-         * Output a human-readable string representing the plan.
+         * Output a human-readable std::string representing the plan.
          */
-        string toString() {
+        std::string toString() {
             if (NULL == root) {
                 return "empty query solution";
             }
@@ -222,9 +225,10 @@ namespace mongo {
 
         virtual void appendToString(mongoutils::str::stream* ss, int indent) const;
 
-        // text's return is LOC_AND_UNOWNED_OBJ so it's fetched and has all fields.
+        // Text's return is LOC_AND_UNOWNED_OBJ or LOC_AND_OWNED_OBJ so it's fetched and has all
+        // fields.
         bool fetched() const { return true; }
-        bool hasField(const string& field) const { return true; }
+        bool hasField(const std::string& field) const { return true; }
         bool sortedByDiskLoc() const { return false; }
         const BSONObjSet& getSort() const { return _sort; }
 
@@ -251,7 +255,7 @@ namespace mongo {
         virtual void appendToString(mongoutils::str::stream* ss, int indent) const;
 
         bool fetched() const { return true; }
-        bool hasField(const string& field) const { return true; }
+        bool hasField(const std::string& field) const { return true; }
         bool sortedByDiskLoc() const { return false; }
         const BSONObjSet& getSort() const { return _sort; }
 
@@ -260,7 +264,7 @@ namespace mongo {
         BSONObjSet _sort;
 
         // Name of the namespace.
-        string name;
+        std::string name;
 
         // Should we make a tailable cursor?
         bool tailable;
@@ -280,7 +284,7 @@ namespace mongo {
         virtual void appendToString(mongoutils::str::stream* ss, int indent) const;
 
         bool fetched() const;
-        bool hasField(const string& field) const;
+        bool hasField(const std::string& field) const;
         bool sortedByDiskLoc() const { return false; }
         const BSONObjSet& getSort() const { return children.back()->getSort(); }
 
@@ -298,7 +302,7 @@ namespace mongo {
         virtual void appendToString(mongoutils::str::stream* ss, int indent) const;
 
         bool fetched() const;
-        bool hasField(const string& field) const;
+        bool hasField(const std::string& field) const;
         bool sortedByDiskLoc() const { return true; }
         const BSONObjSet& getSort() const { return _sort; }
 
@@ -316,7 +320,7 @@ namespace mongo {
         virtual void appendToString(mongoutils::str::stream* ss, int indent) const;
 
         bool fetched() const;
-        bool hasField(const string& field) const;
+        bool hasField(const std::string& field) const;
         bool sortedByDiskLoc() const {
             // Even if our children are sorted by their diskloc or other fields, we don't maintain
             // any order on the output.
@@ -340,7 +344,7 @@ namespace mongo {
         virtual void appendToString(mongoutils::str::stream* ss, int indent) const;
 
         bool fetched() const;
-        bool hasField(const string& field) const;
+        bool hasField(const std::string& field) const;
         bool sortedByDiskLoc() const { return false; }
 
         const BSONObjSet& getSort() const { return _sorts; }
@@ -370,7 +374,7 @@ namespace mongo {
         virtual void appendToString(mongoutils::str::stream* ss, int indent) const;
 
         bool fetched() const { return true; }
-        bool hasField(const string& field) const { return true; }
+        bool hasField(const std::string& field) const { return true; }
         bool sortedByDiskLoc() const { return children[0]->sortedByDiskLoc(); }
         const BSONObjSet& getSort() const { return children[0]->getSort(); }
 
@@ -390,7 +394,7 @@ namespace mongo {
         virtual void appendToString(mongoutils::str::stream* ss, int indent) const;
 
         bool fetched() const { return false; }
-        bool hasField(const string& field) const;
+        bool hasField(const std::string& field) const;
         bool sortedByDiskLoc() const;
         const BSONObjSet& getSort() const { return _sorts; }
 
@@ -444,11 +448,11 @@ namespace mongo {
         virtual void appendToString(mongoutils::str::stream* ss, int indent) const;
 
         /**
-         * This node changes the type to OWNED_OBJ.  There's no fetching possible after this.
+         * Data from the projection node is considered fetch iff the child provides fetched data.
          */
-        bool fetched() const { return true; }
+        bool fetched() const { return children[0]->fetched(); }
 
-        bool hasField(const string& field) const {
+        bool hasField(const std::string& field) const {
             // TODO: Returning false isn't always the right answer -- we may either be including
             // certain fields, or we may be dropping fields (in which case hasField returns true).
             //
@@ -458,10 +462,10 @@ namespace mongo {
         }
 
         bool sortedByDiskLoc() const {
-            // Projections destroy the DiskLoc.  By returning true here, this kind of implies that a
+            // Projections destroy the RecordId.  By returning true here, this kind of implies that a
             // fetch could still be done upstream.
             //
-            // Perhaps this should be false to not imply that there *is* a DiskLoc?  Kind of a
+            // Perhaps this should be false to not imply that there *is* a RecordId?  Kind of a
             // corner case.
             return children[0]->sortedByDiskLoc();
         }
@@ -502,7 +506,7 @@ namespace mongo {
         virtual void appendToString(mongoutils::str::stream* ss, int indent) const;
 
         bool fetched() const { return children[0]->fetched(); }
-        bool hasField(const string& field) const { return children[0]->hasField(field); }
+        bool hasField(const std::string& field) const { return children[0]->hasField(field); }
         bool sortedByDiskLoc() const { return false; }
 
         const BSONObjSet& getSort() const { return _sorts; }
@@ -536,7 +540,7 @@ namespace mongo {
         virtual void appendToString(mongoutils::str::stream* ss, int indent) const;
 
         bool fetched() const { return children[0]->fetched(); }
-        bool hasField(const string& field) const { return children[0]->hasField(field); }
+        bool hasField(const std::string& field) const { return children[0]->hasField(field); }
         bool sortedByDiskLoc() const { return children[0]->sortedByDiskLoc(); }
         const BSONObjSet& getSort() const { return children[0]->getSort(); }
 
@@ -553,7 +557,7 @@ namespace mongo {
         virtual void appendToString(mongoutils::str::stream* ss, int indent) const;
 
         bool fetched() const { return children[0]->fetched(); }
-        bool hasField(const string& field) const { return children[0]->hasField(field); }
+        bool hasField(const std::string& field) const { return children[0]->hasField(field); }
         bool sortedByDiskLoc() const { return children[0]->sortedByDiskLoc(); }
         const BSONObjSet& getSort() const { return children[0]->getSort(); }
 
@@ -562,41 +566,16 @@ namespace mongo {
         int skip;
     };
 
-    //
-    // Geo nodes.  A thin wrapper above an IXSCAN until we can yank functionality out of
-    // the IXSCAN layer into the stage layer.
-    //
-
-    // TODO: This is probably an expression index.
-    struct Geo2DNode : public QuerySolutionNode {
-        Geo2DNode() { }
-        virtual ~Geo2DNode() { }
-
-        virtual StageType getType() const { return STAGE_GEO_2D; }
-        virtual void appendToString(mongoutils::str::stream* ss, int indent) const;
-
-        bool fetched() const { return false; }
-        bool hasField(const string& field) const;
-        bool sortedByDiskLoc() const { return false; }
-        const BSONObjSet& getSort() const { return _sorts; }
-        BSONObjSet _sorts;
-
-        QuerySolutionNode* clone() const;
-
-        BSONObj indexKeyPattern;
-        GeoQuery gq;
-    };
-
     // This is a standalone stage.
     struct GeoNear2DNode : public QuerySolutionNode {
-        GeoNear2DNode() : numWanted(100), addPointMeta(false), addDistMeta(false) { }
+        GeoNear2DNode() : addPointMeta(false), addDistMeta(false) { }
         virtual ~GeoNear2DNode() { }
 
         virtual StageType getType() const { return STAGE_GEO_NEAR_2D; }
         virtual void appendToString(mongoutils::str::stream* ss, int indent) const;
 
         bool fetched() const { return true; }
-        bool hasField(const string& field) const { return true; }
+        bool hasField(const std::string& field) const { return true; }
         bool sortedByDiskLoc() const { return false; }
         const BSONObjSet& getSort() const { return _sorts; }
 
@@ -604,8 +583,10 @@ namespace mongo {
 
         BSONObjSet _sorts;
 
-        NearQuery nq;
-        int numWanted;
+        // Not owned here
+        const GeoNearExpression* nq;
+        IndexBounds baseBounds;
+
         BSONObj indexKeyPattern;
         bool addPointMeta;
         bool addDistMeta;
@@ -620,7 +601,7 @@ namespace mongo {
         virtual void appendToString(mongoutils::str::stream* ss, int indent) const;
 
         bool fetched() const { return true; }
-        bool hasField(const string& field) const { return true; }
+        bool hasField(const std::string& field) const { return true; }
         bool sortedByDiskLoc() const { return false; }
         const BSONObjSet& getSort() const { return _sorts; }
 
@@ -628,7 +609,8 @@ namespace mongo {
 
         BSONObjSet _sorts;
 
-        NearQuery nq;
+        // Not owned here
+        const GeoNearExpression* nq;
         IndexBounds baseBounds;
 
         BSONObj indexKeyPattern;
@@ -654,7 +636,7 @@ namespace mongo {
         virtual void appendToString(mongoutils::str::stream* ss, int indent) const;
 
         bool fetched() const { return children[0]->fetched(); }
-        bool hasField(const string& field) const { return children[0]->hasField(field); }
+        bool hasField(const std::string& field) const { return children[0]->hasField(field); }
         bool sortedByDiskLoc() const { return children[0]->sortedByDiskLoc(); }
         const BSONObjSet& getSort() const { return children[0]->getSort(); }
 
@@ -677,7 +659,7 @@ namespace mongo {
         bool fetched() const { return children[0]->fetched(); }
 
         // Any flagged results are OWNED_OBJ and as such they'll have any field we need.
-        bool hasField(const string& field) const { return children[0]->hasField(field); }
+        bool hasField(const std::string& field) const { return children[0]->hasField(field); }
 
         bool sortedByDiskLoc() const { return false; }
         const BSONObjSet& getSort() const { return sorts; }
@@ -702,7 +684,7 @@ namespace mongo {
         // This stage is created "on top" of normal planning and as such the properties
         // below don't really matter.
         bool fetched() const { return false; }
-        bool hasField(const string& field) const { return !indexKeyPattern[field].eoo(); }
+        bool hasField(const std::string& field) const { return !indexKeyPattern[field].eoo(); }
         bool sortedByDiskLoc() const { return false; }
         const BSONObjSet& getSort() const { return sorts; }
 
@@ -725,11 +707,11 @@ namespace mongo {
         CountNode() { }
         virtual ~CountNode() { }
 
-        virtual StageType getType() const { return STAGE_COUNT; }
+        virtual StageType getType() const { return STAGE_COUNT_SCAN; }
         virtual void appendToString(mongoutils::str::stream* ss, int indent) const;
 
-        bool fetched() const { return true; }
-        bool hasField(const string& field) const { return true; }
+        bool fetched() const { return false; }
+        bool hasField(const std::string& field) const { return true; }
         bool sortedByDiskLoc() const { return false; }
         const BSONObjSet& getSort() const { return sorts; }
 

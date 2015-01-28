@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2013-2014 MongoDB Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -27,54 +27,62 @@
  */
 
 /**
- * This file tests db/exec/and_*.cpp and DiskLoc invalidation.  DiskLoc invalidation forces a fetch
+ * This file tests db/exec/and_*.cpp and RecordId invalidation.  RecordId invalidation forces a fetch
  * so we cannot test it outside of a dbtest.
  */
 
+#include <boost/scoped_ptr.hpp>
 #include <boost/shared_ptr.hpp>
 
 #include "mongo/client/dbclientcursor.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/dbdirectclient.h"
 #include "mongo/db/exec/and_hash.h"
 #include "mongo/db/exec/and_sorted.h"
+#include "mongo/db/exec/fetch.h"
 #include "mongo/db/exec/index_scan.h"
 #include "mongo/db/exec/plan_stage.h"
-#include "mongo/db/instance.h"
 #include "mongo/db/json.h"
 #include "mongo/db/matcher/expression_parser.h"
-#include "mongo/db/pdfile.h"
-#include "mongo/db/storage/mmap_v1/dur_transaction.h"
+#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace QueryStageAnd {
 
+    using boost::scoped_ptr;
+    using boost::shared_ptr;
+    using std::auto_ptr;
+    using std::set;
+
     class QueryStageAndBase {
     public:
-        QueryStageAndBase() { }
+        QueryStageAndBase() : _client(&_txn) { 
+
+        }
 
         virtual ~QueryStageAndBase() {
             _client.dropCollection(ns());
         }
 
         void addIndex(const BSONObj& obj) {
-            _client.ensureIndex(ns(), obj);
+            ASSERT_OK(dbtests::createIndex(&_txn, ns(), obj));
         }
 
         IndexDescriptor* getIndex(const BSONObj& obj, Collection* coll) {
-            IndexDescriptor* descriptor = coll->getIndexCatalog()->findIndexByKeyPattern( obj );
+            IndexDescriptor* descriptor = coll->getIndexCatalog()->findIndexByKeyPattern( &_txn, obj );
             if (NULL == descriptor) {
                 FAIL(mongoutils::str::stream() << "Unable to find index with key pattern " << obj);
             }
             return descriptor;
         }
 
-        void getLocs(set<DiskLoc>* out, Collection* coll) {
-            RecordIterator* it = coll->getIterator(DiskLoc(), false,
-                                                       CollectionScanParams::FORWARD);
+        void getLocs(set<RecordId>* out, Collection* coll) {
+            RecordIterator* it = coll->getIterator(&_txn, RecordId(),
+                                                   CollectionScanParams::FORWARD);
             while (!it->isEOF()) {
-                DiskLoc nextLoc = it->getNext();
+                RecordId nextLoc = it->getNext();
                 out->insert(nextLoc);
             }
             delete it;
@@ -107,31 +115,60 @@ namespace QueryStageAnd {
             return count;
         }
 
+        /**
+         * Gets the next result from 'stage'.
+         *
+         * Fails if the stage fails or returns DEAD, if the returned working
+         * set member is not fetched, or if there are no more results.
+         */
+        BSONObj getNext(PlanStage* stage, WorkingSet* ws) {
+            while (!stage->isEOF()) {
+                WorkingSetID id = WorkingSet::INVALID_ID;
+                PlanStage::StageState status = stage->work(&id);
+
+                // We shouldn't fail or be dead.
+                ASSERT(PlanStage::FAILURE != status);
+                ASSERT(PlanStage::DEAD != status);
+
+                if (PlanStage::ADVANCED != status) { continue; }
+
+                WorkingSetMember* member = ws->get(id);
+                ASSERT(member->hasObj());
+                return member->obj;
+            }
+
+            // We failed to produce a result.
+            ASSERT(false);
+            return BSONObj();
+        }
+
         static const char* ns() { return "unittests.QueryStageAnd"; }
 
-    private:
-        static DBDirectClient _client;
-    };
+    protected:
+        OperationContextImpl _txn;
 
-    DBDirectClient QueryStageAndBase::_client;
+    private:
+        DBDirectClient _client;
+    };
 
     //
     // Hash AND tests
     //
 
     /**
-     * Invalidate a DiskLoc held by a hashed AND before the AND finishes evaluating.  The AND should
-     * process all other data just fine and flag the invalidated DiskLoc in the WorkingSet.
+     * Invalidate a RecordId held by a hashed AND before the AND finishes evaluating.  The AND should
+     * process all other data just fine and flag the invalidated RecordId in the WorkingSet.
      */
     class QueryStageAndHashInvalidation : public QueryStageAndBase {
     public:
         void run() {
-            Client::WriteContext ctx(ns());
-            DurTransaction txn;
-            Database* db = ctx.ctx().db();
-            Collection* coll = db->getCollection(ns());
+            Client::WriteContext ctx(&_txn, ns());
+            Database* db = ctx.db();
+            Collection* coll = ctx.getCollection();
             if (!coll) {
-                coll = db->createCollection(&txn, ns());
+                WriteUnitOfWork wuow(&_txn);
+                coll = db->createCollection(&_txn, ns());
+                wuow.commit();
             }
 
             for (int i = 0; i < 50; ++i) {
@@ -152,7 +189,7 @@ namespace QueryStageAnd {
             params.bounds.endKey = BSONObj();
             params.bounds.endKeyInclusive = true;
             params.direction = -1;
-            ah->addChild(new IndexScan(params, &ws, NULL));
+            ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
             // Bar >= 10
             params.descriptor = getIndex(BSON("bar" << 1), coll);
@@ -160,7 +197,7 @@ namespace QueryStageAnd {
             params.bounds.endKey = BSONObj();
             params.bounds.endKeyInclusive = true;
             params.direction = 1;
-            ah->addChild(new IndexScan(params, &ws, NULL));
+            ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
             // ah reads the first child into its hash table.
             // ah should read foo=20, foo=19, ..., foo=0 in that order.
@@ -172,20 +209,20 @@ namespace QueryStageAnd {
             }
 
             // ...yield
-            ah->prepareToYield();
+            ah->saveState();
             // ...invalidate one of the read objects
-            set<DiskLoc> data;
+            set<RecordId> data;
             getLocs(&data, coll);
             size_t memUsageBefore = ah->getMemUsage();
-            for (set<DiskLoc>::const_iterator it = data.begin(); it != data.end(); ++it) {
-                if (coll->docFor(*it)["foo"].numberInt() == 15) {
-                    ah->invalidate(*it, INVALIDATION_DELETION);
-                    remove(coll->docFor(*it));
+            for (set<RecordId>::const_iterator it = data.begin(); it != data.end(); ++it) {
+                if (coll->docFor(&_txn, *it)["foo"].numberInt() == 15) {
+                    ah->invalidate(&_txn, *it, INVALIDATION_DELETION);
+                    remove(coll->docFor(&_txn, *it));
                     break;
                 }
             }
             size_t memUsageAfter = ah->getMemUsage();
-            ah->recoverFromYield();
+            ah->restoreState(&_txn);
 
             // Invalidating a read object should decrease memory usage.
             ASSERT_LESS_THAN(memUsageAfter, memUsageBefore);
@@ -228,12 +265,13 @@ namespace QueryStageAnd {
     class QueryStageAndHashInvalidateLookahead : public QueryStageAndBase {
     public:
         void run() {
-            Client::WriteContext ctx(ns());
-            DurTransaction txn;
-            Database* db = ctx.ctx().db();
-            Collection* coll = db->getCollection(ns());
+            Client::WriteContext ctx(&_txn, ns());
+            Database* db = ctx.db();
+            Collection* coll = ctx.getCollection();
             if (!coll) {
-                coll = db->createCollection(&txn, ns());
+                WriteUnitOfWork wuow(&_txn);
+                coll = db->createCollection(&_txn, ns());
+                wuow.commit();
             }
 
             for (int i = 0; i < 50; ++i) {
@@ -255,12 +293,12 @@ namespace QueryStageAnd {
             params.bounds.endKey = BSONObj();
             params.bounds.endKeyInclusive = true;
             params.direction = -1;
-            ah->addChild(new IndexScan(params, &ws, NULL));
+            ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
             // Bar <= 19 (descending)
             params.descriptor = getIndex(BSON("bar" << 1), coll);
             params.bounds.startKey = BSON("" << 19);
-            ah->addChild(new IndexScan(params, &ws, NULL));
+            ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
             // First call to work reads the first result from the children.
             // The first result is for the first scan over foo is {foo: 20, bar: 20, baz: 20}.
@@ -272,16 +310,16 @@ namespace QueryStageAnd {
             const unordered_set<WorkingSetID>& flagged = ws.getFlagged();
             ASSERT_EQUALS(size_t(0), flagged.size());
 
-            // "delete" deletedObj (by invalidating the DiskLoc of the obj that matches it).
+            // "delete" deletedObj (by invalidating the RecordId of the obj that matches it).
             BSONObj deletedObj = BSON("_id" << 20 << "foo" << 20 << "bar" << 20 << "baz" << 20);
-            ah->prepareToYield();
-            set<DiskLoc> data;
+            ah->saveState();
+            set<RecordId> data;
             getLocs(&data, coll);
 
             size_t memUsageBefore = ah->getMemUsage();
-            for (set<DiskLoc>::const_iterator it = data.begin(); it != data.end(); ++it) {
-                if (0 == deletedObj.woCompare(coll->docFor(*it))) {
-                    ah->invalidate(*it, INVALIDATION_DELETION);
+            for (set<RecordId>::const_iterator it = data.begin(); it != data.end(); ++it) {
+                if (0 == deletedObj.woCompare(coll->docFor(&_txn, *it))) {
+                    ah->invalidate(&_txn, *it, INVALIDATION_DELETION);
                     break;
                 }
             }
@@ -290,7 +328,7 @@ namespace QueryStageAnd {
             // Look ahead results do not count towards memory usage.
             ASSERT_EQUALS(memUsageBefore, memUsageAfter);
 
-            ah->recoverFromYield();
+            ah->restoreState(&_txn);
 
             // The deleted obj should show up in flagged.
             ASSERT_EQUALS(size_t(1), flagged.size());
@@ -302,7 +340,7 @@ namespace QueryStageAnd {
                 PlanStage::StageState status = ah->work(&id);
                 if (PlanStage::ADVANCED != status) { continue; }
                 WorkingSetMember* wsm = ws.get(id);
-                ASSERT_NOT_EQUALS(0, deletedObj.woCompare(coll->docFor(wsm->loc)));
+                ASSERT_NOT_EQUALS(0, deletedObj.woCompare(coll->docFor(&_txn, wsm->loc)));
                 ++count;
             }
 
@@ -314,12 +352,13 @@ namespace QueryStageAnd {
     class QueryStageAndHashTwoLeaf : public QueryStageAndBase {
     public:
         void run() {
-            Client::WriteContext ctx(ns());
-            DurTransaction txn;
-            Database* db = ctx.ctx().db();
-            Collection* coll = db->getCollection(ns());
+            Client::WriteContext ctx(&_txn, ns());
+            Database* db = ctx.db();
+            Collection* coll = ctx.getCollection();
             if (!coll) {
-                coll = db->createCollection(&txn, ns());
+                WriteUnitOfWork wuow(&_txn);
+                coll = db->createCollection(&_txn, ns());
+                wuow.commit();
             }
 
             for (int i = 0; i < 50; ++i) {
@@ -340,7 +379,7 @@ namespace QueryStageAnd {
             params.bounds.endKey = BSONObj();
             params.bounds.endKeyInclusive = true;
             params.direction = -1;
-            ah->addChild(new IndexScan(params, &ws, NULL));
+            ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
             // Bar >= 10
             params.descriptor = getIndex(BSON("bar" << 1), coll);
@@ -348,7 +387,7 @@ namespace QueryStageAnd {
             params.bounds.endKey = BSONObj();
             params.bounds.endKeyInclusive = true;
             params.direction = 1;
-            ah->addChild(new IndexScan(params, &ws, NULL));
+            ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
             // foo == bar == baz, and foo<=20, bar>=10, so our values are:
             // foo == 10, 11, 12, 13, 14, 15. 16, 17, 18, 19, 20
@@ -363,12 +402,13 @@ namespace QueryStageAnd {
     class QueryStageAndHashTwoLeafFirstChildLargeKeys : public QueryStageAndBase {
     public:
         void run() {
-            Client::WriteContext ctx(ns());
-            DurTransaction txn;
-            Database* db = ctx.ctx().db();
-            Collection* coll = db->getCollection(ns());
+            Client::WriteContext ctx(&_txn, ns());
+            Database* db = ctx.db();
+            Collection* coll = ctx.getCollection();
             if (!coll) {
-                coll = db->createCollection(&txn, ns());
+                WriteUnitOfWork wuow(&_txn);
+                coll = db->createCollection(&_txn, ns());
+                wuow.commit();
             }
 
             // Generate large keys for {foo: 1, big: 1} index.
@@ -394,7 +434,7 @@ namespace QueryStageAnd {
             params.bounds.endKey = BSONObj();
             params.bounds.endKeyInclusive = true;
             params.direction = -1;
-            ah->addChild(new IndexScan(params, &ws, NULL));
+            ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
             // Bar >= 10
             params.descriptor = getIndex(BSON("bar" << 1), coll);
@@ -402,7 +442,7 @@ namespace QueryStageAnd {
             params.bounds.endKey = BSONObj();
             params.bounds.endKeyInclusive = true;
             params.direction = 1;
-            ah->addChild(new IndexScan(params, &ws, NULL));
+            ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
             // Stage execution should fail.
             ASSERT_EQUALS(-1, countResults(ah.get()));
@@ -415,12 +455,13 @@ namespace QueryStageAnd {
     class QueryStageAndHashTwoLeafLastChildLargeKeys : public QueryStageAndBase {
     public:
         void run() {
-            Client::WriteContext ctx(ns());
-            DurTransaction txn;
-            Database* db = ctx.ctx().db();
-            Collection* coll = db->getCollection(ns());
+            Client::WriteContext ctx(&_txn, ns());
+            Database* db = ctx.db();
+            Collection* coll = ctx.getCollection();
             if (!coll) {
-                coll = db->createCollection(&txn, ns());
+                WriteUnitOfWork wuow(&_txn);
+                coll = db->createCollection(&_txn, ns());
+                wuow.commit();
             }
 
             // Generate large keys for {baz: 1, big: 1} index.
@@ -446,7 +487,7 @@ namespace QueryStageAnd {
             params.bounds.endKey = BSONObj();
             params.bounds.endKeyInclusive = true;
             params.direction = -1;
-            ah->addChild(new IndexScan(params, &ws, NULL));
+            ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
             // Bar >= 10
             params.descriptor = getIndex(BSON("bar" << 1 << "big" << 1), coll);
@@ -454,7 +495,7 @@ namespace QueryStageAnd {
             params.bounds.endKey = BSONObj();
             params.bounds.endKeyInclusive = true;
             params.direction = 1;
-            ah->addChild(new IndexScan(params, &ws, NULL));
+            ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
             // foo == bar == baz, and foo<=20, bar>=10, so our values are:
             // foo == 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20.
@@ -466,12 +507,13 @@ namespace QueryStageAnd {
     class QueryStageAndHashThreeLeaf : public QueryStageAndBase {
     public:
         void run() {
-            Client::WriteContext ctx(ns());
-            DurTransaction txn;
-            Database* db = ctx.ctx().db();
-            Collection* coll = db->getCollection(ns());
+            Client::WriteContext ctx(&_txn, ns());
+            Database* db = ctx.db();
+            Collection* coll = ctx.getCollection();
             if (!coll) {
-                coll = db->createCollection(&txn, ns());
+                WriteUnitOfWork wuow(&_txn);
+                coll = db->createCollection(&_txn, ns());
+                wuow.commit();
             }
 
             for (int i = 0; i < 50; ++i) {
@@ -493,7 +535,7 @@ namespace QueryStageAnd {
             params.bounds.endKey = BSONObj();
             params.bounds.endKeyInclusive = true;
             params.direction = -1;
-            ah->addChild(new IndexScan(params, &ws, NULL));
+            ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
             // Bar >= 10
             params.descriptor = getIndex(BSON("bar" << 1), coll);
@@ -501,7 +543,7 @@ namespace QueryStageAnd {
             params.bounds.endKey = BSONObj();
             params.bounds.endKeyInclusive = true;
             params.direction = 1;
-            ah->addChild(new IndexScan(params, &ws, NULL));
+            ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
             // 5 <= baz <= 15
             params.descriptor = getIndex(BSON("baz" << 1), coll);
@@ -509,7 +551,7 @@ namespace QueryStageAnd {
             params.bounds.endKey = BSON("" << 15);
             params.bounds.endKeyInclusive = true;
             params.direction = 1;
-            ah->addChild(new IndexScan(params, &ws, NULL));
+            ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
             // foo == bar == baz, and foo<=20, bar>=10, 5<=baz<=15, so our values are:
             // foo == 10, 11, 12, 13, 14, 15.
@@ -527,12 +569,13 @@ namespace QueryStageAnd {
     class QueryStageAndHashThreeLeafMiddleChildLargeKeys : public QueryStageAndBase {
     public:
         void run() {
-            Client::WriteContext ctx(ns());
-            DurTransaction txn;
-            Database* db = ctx.ctx().db();
-            Collection* coll = db->getCollection(ns());
+            Client::WriteContext ctx(&_txn, ns());
+            Database* db = ctx.db();
+            Collection* coll = ctx.getCollection();
             if (!coll) {
-                coll = db->createCollection(&txn, ns());
+                WriteUnitOfWork wuow(&_txn);
+                coll = db->createCollection(&_txn, ns());
+                wuow.commit();
             }
 
             // Generate large keys for {bar: 1, big: 1} index.
@@ -559,7 +602,7 @@ namespace QueryStageAnd {
             params.bounds.endKey = BSONObj();
             params.bounds.endKeyInclusive = true;
             params.direction = -1;
-            ah->addChild(new IndexScan(params, &ws, NULL));
+            ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
             // Bar >= 10
             params.descriptor = getIndex(BSON("bar" << 1 << "big" << 1), coll);
@@ -567,7 +610,7 @@ namespace QueryStageAnd {
             params.bounds.endKey = BSONObj();
             params.bounds.endKeyInclusive = true;
             params.direction = 1;
-            ah->addChild(new IndexScan(params, &ws, NULL));
+            ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
             // 5 <= baz <= 15
             params.descriptor = getIndex(BSON("baz" << 1), coll);
@@ -575,7 +618,7 @@ namespace QueryStageAnd {
             params.bounds.endKey = BSON("" << 15);
             params.bounds.endKeyInclusive = true;
             params.direction = 1;
-            ah->addChild(new IndexScan(params, &ws, NULL));
+            ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
             // Stage execution should fail.
             ASSERT_EQUALS(-1, countResults(ah.get()));
@@ -586,12 +629,13 @@ namespace QueryStageAnd {
     class QueryStageAndHashWithNothing : public QueryStageAndBase {
     public:
         void run() {
-            Client::WriteContext ctx(ns());
-            DurTransaction txn;
-            Database* db = ctx.ctx().db();
-            Collection* coll = db->getCollection(ns());
+            Client::WriteContext ctx(&_txn, ns());
+            Database* db = ctx.db();
+            Collection* coll = ctx.getCollection();
             if (!coll) {
-                coll = db->createCollection(&txn, ns());
+                WriteUnitOfWork wuow(&_txn);
+                coll = db->createCollection(&_txn, ns());
+                wuow.commit();
             }
 
             for (int i = 0; i < 50; ++i) {
@@ -612,7 +656,7 @@ namespace QueryStageAnd {
             params.bounds.endKey = BSONObj();
             params.bounds.endKeyInclusive = true;
             params.direction = -1;
-            ah->addChild(new IndexScan(params, &ws, NULL));
+            ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
             // Bar == 5.  Index scan should be eof.
             params.descriptor = getIndex(BSON("bar" << 1), coll);
@@ -620,7 +664,7 @@ namespace QueryStageAnd {
             params.bounds.endKey = BSON("" << 5);
             params.bounds.endKeyInclusive = true;
             params.direction = 1;
-            ah->addChild(new IndexScan(params, &ws, NULL));
+            ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
             int count = 0;
             int works = 0;
@@ -645,12 +689,13 @@ namespace QueryStageAnd {
     class QueryStageAndHashProducesNothing : public QueryStageAndBase {
     public:
         void run() {
-            Client::WriteContext ctx(ns());
-            DurTransaction txn;
-            Database* db = ctx.ctx().db();
-            Collection* coll = db->getCollection(ns());
+            Client::WriteContext ctx(&_txn, ns());
+            Database* db = ctx.db();
+            Collection* coll = ctx.getCollection();
             if (!coll) {
-                coll = db->createCollection(&txn, ns());
+                WriteUnitOfWork wuow(&_txn);
+                coll = db->createCollection(&_txn, ns());
+                wuow.commit();
             }
 
             for (int i = 0; i < 10; ++i) {
@@ -672,7 +717,7 @@ namespace QueryStageAnd {
             params.bounds.endKey = BSONObj();
             params.bounds.endKeyInclusive = true;
             params.direction = 1;
-            ah->addChild(new IndexScan(params, &ws, NULL));
+            ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
             // Bar <= 100
             params.descriptor = getIndex(BSON("bar" << 1), coll);
@@ -683,7 +728,7 @@ namespace QueryStageAnd {
             params.bounds.endKey = BSON("" << "");
             params.bounds.endKeyInclusive = false;
             params.direction = -1;
-            ah->addChild(new IndexScan(params, &ws, NULL));
+            ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
             ASSERT_EQUALS(0, countResults(ah.get()));
         }
@@ -693,12 +738,13 @@ namespace QueryStageAnd {
     class QueryStageAndHashWithMatcher : public QueryStageAndBase {
     public:
         void run() {
-            Client::WriteContext ctx(ns());
-            DurTransaction txn;
-            Database* db = ctx.ctx().db();
-            Collection* coll = db->getCollection(ns());
+            Client::WriteContext ctx(&_txn, ns());
+            Database* db = ctx.db();
+            Collection* coll = ctx.getCollection();
             if (!coll) {
-                coll = db->createCollection(&txn, ns());
+                WriteUnitOfWork wuow(&_txn);
+                coll = db->createCollection(&_txn, ns());
+                wuow.commit();
             }
 
             for (int i = 0; i < 50; ++i) {
@@ -723,7 +769,7 @@ namespace QueryStageAnd {
             params.bounds.endKey = BSONObj();
             params.bounds.endKeyInclusive = true;
             params.direction = -1;
-            ah->addChild(new IndexScan(params, &ws, NULL));
+            ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
             // Bar >= 95
             params.descriptor = getIndex(BSON("bar" << 1), coll);
@@ -731,30 +777,150 @@ namespace QueryStageAnd {
             params.bounds.endKey = BSONObj();
             params.bounds.endKeyInclusive = true;
             params.direction = 1;
-            ah->addChild(new IndexScan(params, &ws, NULL));
+            ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
             // Bar == 97
             ASSERT_EQUALS(1, countResults(ah.get()));
         }
     };
 
+    /**
+     * SERVER-14607: Check that hash-based intersection works when the first
+     * child returns fetched docs but the second child returns index keys.
+     */
+    class QueryStageAndHashFirstChildFetched : public QueryStageAndBase {
+    public:
+        void run() {
+            Client::WriteContext ctx(&_txn, ns());
+            Database* db = ctx.db();
+            Collection* coll = ctx.getCollection();
+            if (!coll) {
+                WriteUnitOfWork wuow(&_txn);
+                coll = db->createCollection(&_txn, ns());
+                wuow.commit();
+            }
+
+            for (int i = 0; i < 50; ++i) {
+                insert(BSON("foo" << i << "bar" << i));
+            }
+
+            addIndex(BSON("foo" << 1));
+            addIndex(BSON("bar" << 1));
+
+            WorkingSet ws;
+            scoped_ptr<AndHashStage> ah(new AndHashStage(&ws, NULL, coll));
+
+            // Foo <= 20
+            IndexScanParams params;
+            params.descriptor = getIndex(BSON("foo" << 1), coll);
+            params.bounds.isSimpleRange = true;
+            params.bounds.startKey = BSON("" << 20);
+            params.bounds.endKey = BSONObj();
+            params.bounds.endKeyInclusive = true;
+            params.direction = -1;
+            IndexScan* firstScan = new IndexScan(&_txn, params, &ws, NULL);
+
+            // First child of the AND_HASH stage is a Fetch. The NULL in the
+            // constructor means there is no filter.
+            FetchStage* fetch = new FetchStage(&_txn, &ws, firstScan, NULL, coll);
+            ah->addChild(fetch);
+
+            // Bar >= 10
+            params.descriptor = getIndex(BSON("bar" << 1), coll);
+            params.bounds.startKey = BSON("" << 10);
+            params.bounds.endKey = BSONObj();
+            params.bounds.endKeyInclusive = true;
+            params.direction = 1;
+            ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
+
+            // Check that the AndHash stage returns docs {foo: 10, bar: 10}
+            // through {foo: 20, bar: 20}.
+            for (int i = 10; i <= 20; i++) {
+                BSONObj obj = getNext(ah.get(), &ws);
+                ASSERT_EQUALS(i, obj["foo"].numberInt());
+                ASSERT_EQUALS(i, obj["bar"].numberInt());
+            }
+        }
+    };
+
+    /**
+     * SERVER-14607: Check that hash-based intersection works when the first
+     * child returns index keys but the second returns fetched docs.
+     */
+    class QueryStageAndHashSecondChildFetched : public QueryStageAndBase {
+    public:
+        void run() {
+            Client::WriteContext ctx(&_txn, ns());
+            Database* db = ctx.db();
+            Collection* coll = ctx.getCollection();
+            if (!coll) {
+                WriteUnitOfWork wuow(&_txn);
+                coll = db->createCollection(&_txn, ns());
+                wuow.commit();
+            }
+
+            for (int i = 0; i < 50; ++i) {
+                insert(BSON("foo" << i << "bar" << i));
+            }
+
+            addIndex(BSON("foo" << 1));
+            addIndex(BSON("bar" << 1));
+
+            WorkingSet ws;
+            scoped_ptr<AndHashStage> ah(new AndHashStage(&ws, NULL, coll));
+
+            // Foo <= 20
+            IndexScanParams params;
+            params.descriptor = getIndex(BSON("foo" << 1), coll);
+            params.bounds.isSimpleRange = true;
+            params.bounds.startKey = BSON("" << 20);
+            params.bounds.endKey = BSONObj();
+            params.bounds.endKeyInclusive = true;
+            params.direction = -1;
+            ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
+
+            // Bar >= 10
+            params.descriptor = getIndex(BSON("bar" << 1), coll);
+            params.bounds.startKey = BSON("" << 10);
+            params.bounds.endKey = BSONObj();
+            params.bounds.endKeyInclusive = true;
+            params.direction = 1;
+            IndexScan* secondScan = new IndexScan(&_txn, params, &ws, NULL);
+
+            // Second child of the AND_HASH stage is a Fetch. The NULL in the
+            // constructor means there is no filter.
+            FetchStage* fetch = new FetchStage(&_txn, &ws, secondScan, NULL, coll);
+            ah->addChild(fetch);
+
+            // Check that the AndHash stage returns docs {foo: 10, bar: 10}
+            // through {foo: 20, bar: 20}.
+            for (int i = 10; i <= 20; i++) {
+                BSONObj obj = getNext(ah.get(), &ws);
+                ASSERT_EQUALS(i, obj["foo"].numberInt());
+                ASSERT_EQUALS(i, obj["bar"].numberInt());
+            }
+        }
+    };
+
+
     //
     // Sorted AND tests
     //
 
     /**
-     * Invalidate a DiskLoc held by a sorted AND before the AND finishes evaluating.  The AND should
-     * process all other data just fine and flag the invalidated DiskLoc in the WorkingSet.
+     * Invalidate a RecordId held by a sorted AND before the AND finishes evaluating.  The AND should
+     * process all other data just fine and flag the invalidated RecordId in the WorkingSet.
      */
     class QueryStageAndSortedInvalidation : public QueryStageAndBase {
     public:
         void run() {
-            Client::WriteContext ctx(ns());
-            DurTransaction txn;
-            Database* db = ctx.ctx().db();
-            Collection* coll = db->getCollection(ns());
+            Client::WriteContext ctx(&_txn, ns());
+            Database* db = ctx.db();
+            Collection* coll = ctx.getCollection();
             if (!coll) {
-                coll = db->createCollection(&txn, ns());
+                WriteUnitOfWork wuow(&_txn);
+                coll = db->createCollection(&_txn, ns());
+                wuow.commit();
             }
 
             // Insert a bunch of data
@@ -775,31 +941,31 @@ namespace QueryStageAnd {
             params.bounds.endKey = BSON("" << 1);
             params.bounds.endKeyInclusive = true;
             params.direction = 1;
-            ah->addChild(new IndexScan(params, &ws, NULL));
+            ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
             // Scan over bar == 1
             params.descriptor = getIndex(BSON("bar" << 1), coll);
-            ah->addChild(new IndexScan(params, &ws, NULL));
+            ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
             // Get the set of disklocs in our collection to use later.
-            set<DiskLoc> data;
+            set<RecordId> data;
             getLocs(&data, coll);
 
             // We're making an assumption here that happens to be true because we clear out the
-            // collection before running this: increasing inserts have increasing DiskLocs.
+            // collection before running this: increasing inserts have increasing RecordIds.
             // This isn't true in general if the collection is not dropped beforehand.
             WorkingSetID id = WorkingSet::INVALID_ID;
 
             // Sorted AND looks at the first child, which is an index scan over foo==1.
             ah->work(&id);
 
-            // The first thing that the index scan returns (due to increasing DiskLoc trick) is the
+            // The first thing that the index scan returns (due to increasing RecordId trick) is the
             // very first insert, which should be the very first thing in data.  Let's invalidate it
             // and make sure it shows up in the flagged results.
-            ah->prepareToYield();
-            ah->invalidate(*data.begin(), INVALIDATION_DELETION);
-            remove(coll->docFor(*data.begin()));
-            ah->recoverFromYield();
+            ah->saveState();
+            ah->invalidate(&_txn, *data.begin(), INVALIDATION_DELETION);
+            remove(coll->docFor(&_txn, *data.begin()));
+            ah->restoreState(&_txn);
 
             // Make sure the nuked obj is actually in the flagged data.
             ASSERT_EQUALS(ws.getFlagged().size(), size_t(1));
@@ -811,7 +977,7 @@ namespace QueryStageAnd {
             ASSERT_TRUE(member->getFieldDotted("bar", &elt));
             ASSERT_EQUALS(1, elt.numberInt());
 
-            set<DiskLoc>::iterator it = data.begin();
+            set<RecordId>::iterator it = data.begin();
 
             // Proceed along, AND-ing results.
             int count = 0;
@@ -835,10 +1001,10 @@ namespace QueryStageAnd {
             for (int i = 0; i < count + 10; ++i) { ++it; }
             // Remove a result that's coming up.  It's not the 'target' result of the AND so it's
             // not flagged.
-            ah->prepareToYield();
-            ah->invalidate(*it, INVALIDATION_DELETION);
-            remove(coll->docFor(*it));
-            ah->recoverFromYield();
+            ah->saveState();
+            ah->invalidate(&_txn, *it, INVALIDATION_DELETION);
+            remove(coll->docFor(&_txn, *it));
+            ah->restoreState(&_txn);
 
             // Get all results aside from the two we killed.
             while (!ah->isEOF()) {
@@ -866,12 +1032,13 @@ namespace QueryStageAnd {
     class QueryStageAndSortedThreeLeaf : public QueryStageAndBase {
     public:
         void run() {
-            Client::WriteContext ctx(ns());
-            DurTransaction txn;
-            Database* db = ctx.ctx().db();
-            Collection* coll = db->getCollection(ns());
+            Client::WriteContext ctx(&_txn, ns());
+            Database* db = ctx.db();
+            Collection* coll = ctx.getCollection();
             if (!coll) {
-                coll = db->createCollection(&txn, ns());
+                WriteUnitOfWork wuow(&_txn);
+                coll = db->createCollection(&_txn, ns());
+                wuow.commit();
             }
 
             // Insert a bunch of data
@@ -901,15 +1068,15 @@ namespace QueryStageAnd {
             params.bounds.endKey = BSON("" << 1);
             params.bounds.endKeyInclusive = true;
             params.direction = 1;
-            ah->addChild(new IndexScan(params, &ws, NULL));
+            ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
             // bar == 1
             params.descriptor = getIndex(BSON("bar" << 1), coll);
-            ah->addChild(new IndexScan(params, &ws, NULL));
+            ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
             // baz == 1
             params.descriptor = getIndex(BSON("baz" << 1), coll);
-            ah->addChild(new IndexScan(params, &ws, NULL));
+            ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
             ASSERT_EQUALS(50, countResults(ah.get()));
         }
@@ -919,14 +1086,14 @@ namespace QueryStageAnd {
     class QueryStageAndSortedWithNothing : public QueryStageAndBase {
     public:
         void run() {
-            Client::WriteContext ctx(ns());
-            DurTransaction txn;
-            Database* db = ctx.ctx().db();
-            Collection* coll = db->getCollection(ns());
+            Client::WriteContext ctx(&_txn, ns());
+            Database* db = ctx.db();
+            Collection* coll = ctx.getCollection();
             if (!coll) {
-                coll = db->createCollection(&txn, ns());
+                WriteUnitOfWork wuow(&_txn);
+                coll = db->createCollection(&_txn, ns());
+                wuow.commit();
             }
-
 
             for (int i = 0; i < 50; ++i) {
                 insert(BSON("foo" << 8 << "bar" << 20));
@@ -946,7 +1113,7 @@ namespace QueryStageAnd {
             params.bounds.endKey = BSON("" << 7);
             params.bounds.endKeyInclusive = true;
             params.direction = 1;
-            ah->addChild(new IndexScan(params, &ws, NULL));
+            ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
             // Bar == 20, not EOF.
             params.descriptor = getIndex(BSON("bar" << 1), coll);
@@ -954,7 +1121,7 @@ namespace QueryStageAnd {
             params.bounds.endKey = BSON("" << 20);
             params.bounds.endKeyInclusive = true;
             params.direction = 1;
-            ah->addChild(new IndexScan(params, &ws, NULL));
+            ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
             ASSERT_EQUALS(0, countResults(ah.get()));
         }
@@ -964,12 +1131,13 @@ namespace QueryStageAnd {
     class QueryStageAndSortedProducesNothing : public QueryStageAndBase {
     public:
         void run() {
-            Client::WriteContext ctx(ns());
-            DurTransaction txn;
-            Database* db = ctx.ctx().db();
-            Collection* coll = db->getCollection(ns());
+            Client::WriteContext ctx(&_txn, ns());
+            Database* db = ctx.db();
+            Collection* coll = ctx.getCollection();
             if (!coll) {
-                coll = db->createCollection(&txn, ns());
+                WriteUnitOfWork wuow(&_txn);
+                coll = db->createCollection(&_txn, ns());
+                wuow.commit();
             }
 
             for (int i = 0; i < 50; ++i) {
@@ -994,7 +1162,7 @@ namespace QueryStageAnd {
             params.bounds.endKey = BSON("" << 7);
             params.bounds.endKeyInclusive = true;
             params.direction = 1;
-            ah->addChild(new IndexScan(params, &ws, NULL));
+            ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
             // bar == 20.
             params.descriptor = getIndex(BSON("bar" << 1), coll);
@@ -1002,7 +1170,7 @@ namespace QueryStageAnd {
             params.bounds.endKey = BSON("" << 20);
             params.bounds.endKeyInclusive = true;
             params.direction = 1;
-            ah->addChild(new IndexScan(params, &ws, NULL));
+            ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
             ASSERT_EQUALS(0, countResults(ah.get()));
         }
@@ -1012,12 +1180,13 @@ namespace QueryStageAnd {
     class QueryStageAndSortedWithMatcher : public QueryStageAndBase {
     public:
         void run() {
-            Client::WriteContext ctx(ns());
-            DurTransaction txn;
-            Database* db = ctx.ctx().db();
-            Collection* coll = db->getCollection(ns());
+            Client::WriteContext ctx(&_txn, ns());
+            Database* db = ctx.db();
+            Collection* coll = ctx.getCollection();
             if (!coll) {
-                coll = db->createCollection(&txn, ns());
+                WriteUnitOfWork wuow(&_txn);
+                coll = db->createCollection(&_txn, ns());
+                wuow.commit();
             }
 
             for (int i = 0; i < 50; ++i) {
@@ -1042,11 +1211,11 @@ namespace QueryStageAnd {
             params.bounds.endKey = BSON("" << 1);
             params.bounds.endKeyInclusive = true;
             params.direction = 1;
-            ah->addChild(new IndexScan(params, &ws, NULL));
+            ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
             // bar == 1
             params.descriptor = getIndex(BSON("bar" << 1), coll);
-            ah->addChild(new IndexScan(params, &ws, NULL));
+            ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
             // Filter drops everything.
             ASSERT_EQUALS(0, countResults(ah.get()));
@@ -1057,12 +1226,13 @@ namespace QueryStageAnd {
     class QueryStageAndSortedByLastChild : public QueryStageAndBase {
     public:
         void run() {
-            Client::WriteContext ctx(ns());
-            DurTransaction txn;
-            Database* db = ctx.ctx().db();
-            Collection* coll = db->getCollection(ns());
+            Client::WriteContext ctx(&_txn, ns());
+            Database* db = ctx.db();
+            Collection* coll = ctx.getCollection();
             if (!coll) {
-                coll = db->createCollection(&txn, ns());
+                WriteUnitOfWork wuow(&_txn);
+                coll = db->createCollection(&_txn, ns());
+                wuow.commit();
             }
 
             for (int i = 0; i < 50; ++i) {
@@ -1083,13 +1253,13 @@ namespace QueryStageAnd {
             params.bounds.endKey = BSON("" << 1);
             params.bounds.endKeyInclusive = true;
             params.direction = 1;
-            ah->addChild(new IndexScan(params, &ws, NULL));
+            ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
             // Intersect with 7 <= bar < 10000
             params.descriptor = getIndex(BSON("bar" << 1), coll);
             params.bounds.startKey = BSON("" << 7);
             params.bounds.endKey = BSON("" << 10000);
-            ah->addChild(new IndexScan(params, &ws, NULL));
+            ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
             WorkingSetID lastId = WorkingSet::INVALID_ID;
 
@@ -1098,17 +1268,125 @@ namespace QueryStageAnd {
                 WorkingSetID id = WorkingSet::INVALID_ID;
                 PlanStage::StageState status = ah->work(&id);
                 if (PlanStage::ADVANCED != status) { continue; }
-                BSONObj thisObj = coll->docFor(ws.get(id)->loc);
+                BSONObj thisObj = coll->docFor(&_txn, ws.get(id)->loc);
                 ASSERT_EQUALS(7 + count, thisObj["bar"].numberInt());
                 ++count;
                 if (WorkingSet::INVALID_ID != lastId) {
-                    BSONObj lastObj = coll->docFor(ws.get(lastId)->loc);
+                    BSONObj lastObj = coll->docFor(&_txn, ws.get(lastId)->loc);
                     ASSERT_LESS_THAN(lastObj["bar"].woCompare(thisObj["bar"]), 0);
                 }
                 lastId = id;
             }
 
             ASSERT_EQUALS(count, 43);
+        }
+    };
+
+    /**
+     * SERVER-14607: Check that sort-based intersection works when the first
+     * child returns fetched docs but the second child returns index keys.
+     */
+    class QueryStageAndSortedFirstChildFetched : public QueryStageAndBase {
+    public:
+        void run() {
+            Client::WriteContext ctx(&_txn, ns());
+            Database* db = ctx.db();
+            Collection* coll = ctx.getCollection();
+            if (!coll) {
+                WriteUnitOfWork wuow(&_txn);
+                coll = db->createCollection(&_txn, ns());
+                wuow.commit();
+            }
+
+            // Insert a bunch of data
+            for (int i = 0; i < 50; ++i) {
+                insert(BSON("foo" << 1 << "bar" << 1));
+            }
+
+            addIndex(BSON("foo" << 1));
+            addIndex(BSON("bar" << 1));
+
+            WorkingSet ws;
+            scoped_ptr<AndSortedStage> as(new AndSortedStage(&ws, NULL, coll));
+
+            // Scan over foo == 1
+            IndexScanParams params;
+            params.descriptor = getIndex(BSON("foo" << 1), coll);
+            params.bounds.isSimpleRange = true;
+            params.bounds.startKey = BSON("" << 1);
+            params.bounds.endKey = BSON("" << 1);
+            params.bounds.endKeyInclusive = true;
+            params.direction = 1;
+            IndexScan* firstScan = new IndexScan(&_txn, params, &ws, NULL);
+
+            // First child of the AND_SORTED stage is a Fetch. The NULL in the
+            // constructor means there is no filter.
+            FetchStage* fetch = new FetchStage(&_txn, &ws, firstScan, NULL, coll);
+            as->addChild(fetch);
+
+            // bar == 1
+            params.descriptor = getIndex(BSON("bar" << 1), coll);
+            as->addChild(new IndexScan(&_txn, params, &ws, NULL));
+
+            for (int i = 0; i < 50; i++) {
+                BSONObj obj = getNext(as.get(), &ws);
+                ASSERT_EQUALS(1, obj["foo"].numberInt());
+                ASSERT_EQUALS(1, obj["bar"].numberInt());
+            }
+        }
+    };
+
+    /**
+     * SERVER-14607: Check that sort-based intersection works when the first
+     * child returns index keys but the second returns fetched docs.
+     */
+    class QueryStageAndSortedSecondChildFetched : public QueryStageAndBase {
+    public:
+        void run() {
+            Client::WriteContext ctx(&_txn, ns());
+            Database* db = ctx.db();
+            Collection* coll = ctx.getCollection();
+            if (!coll) {
+                WriteUnitOfWork wuow(&_txn);
+                coll = db->createCollection(&_txn, ns());
+                wuow.commit();
+            }
+
+            // Insert a bunch of data
+            for (int i = 0; i < 50; ++i) {
+                insert(BSON("foo" << 1 << "bar" << 1));
+            }
+
+            addIndex(BSON("foo" << 1));
+            addIndex(BSON("bar" << 1));
+
+            WorkingSet ws;
+            scoped_ptr<AndSortedStage> as(new AndSortedStage(&ws, NULL, coll));
+
+            // Scan over foo == 1
+            IndexScanParams params;
+            params.descriptor = getIndex(BSON("foo" << 1), coll);
+            params.bounds.isSimpleRange = true;
+            params.bounds.startKey = BSON("" << 1);
+            params.bounds.endKey = BSON("" << 1);
+            params.bounds.endKeyInclusive = true;
+            params.direction = 1;
+            as->addChild(new IndexScan(&_txn, params, &ws, NULL));
+
+            // bar == 1
+            params.descriptor = getIndex(BSON("bar" << 1), coll);
+            IndexScan* secondScan = new IndexScan(&_txn, params, &ws, NULL);
+
+            // Second child of the AND_SORTED stage is a Fetch. The NULL in the
+            // constructor means there is no filter.
+            FetchStage* fetch = new FetchStage(&_txn, &ws, secondScan, NULL, coll);
+            as->addChild(fetch);
+
+            for (int i = 0; i < 50; i++) {
+                BSONObj obj = getNext(as.get(), &ws);
+                ASSERT_EQUALS(1, obj["foo"].numberInt());
+                ASSERT_EQUALS(1, obj["bar"].numberInt());
+            }
         }
     };
 
@@ -1128,13 +1406,19 @@ namespace QueryStageAnd {
             add<QueryStageAndHashProducesNothing>();
             add<QueryStageAndHashWithMatcher>();
             add<QueryStageAndHashInvalidateLookahead>();
+            add<QueryStageAndHashFirstChildFetched>();
+            add<QueryStageAndHashSecondChildFetched>();
             add<QueryStageAndSortedInvalidation>();
             add<QueryStageAndSortedThreeLeaf>();
             add<QueryStageAndSortedWithNothing>();
             add<QueryStageAndSortedProducesNothing>();
             add<QueryStageAndSortedWithMatcher>();
             add<QueryStageAndSortedByLastChild>();
+            add<QueryStageAndSortedFirstChildFetched>();
+            add<QueryStageAndSortedSecondChildFetched>();
         }
-    }  queryStageAndAll;
+    };
+
+    SuiteInstance<All> queryStageAndAll;
 
 }  // namespace QueryStageAnd

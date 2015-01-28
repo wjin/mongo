@@ -36,6 +36,9 @@
 
 namespace mongo {
 
+    using std::max;
+    using std::string;
+
     ProjectionExec::ProjectionExec()
         : _include(true),
           _special(false),
@@ -49,7 +52,9 @@ namespace mongo {
           _hasReturnKey(false) { }
 
 
-    ProjectionExec::ProjectionExec(const BSONObj& spec, const MatchExpression* queryExpression)
+    ProjectionExec::ProjectionExec(const BSONObj& spec, 
+                                   const MatchExpression* queryExpression,
+                                   const MatchExpressionParser::WhereCallback& whereCallback)
         : _include(true),
           _special(false),
           _source(spec),
@@ -112,7 +117,8 @@ namespace mongo {
                     BSONObj elemMatchObj = e.wrap();
                     verify(elemMatchObj.isOwned());
                     _elemMatchObjs.push_back(elemMatchObj);
-                    StatusWithMatchExpression swme = MatchExpressionParser::parse(elemMatchObj);
+                    StatusWithMatchExpression swme = MatchExpressionParser::parse(elemMatchObj, 
+                                                                                  whereCallback);
                     verify(swme.isOK());
                     // And store it in _matchers.
                     _matchers[mongoutils::str::before(e.fieldName(), '.').c_str()]
@@ -244,7 +250,7 @@ namespace mongo {
             member->state = WorkingSetMember::OWNED_OBJ;
             member->obj = keyObj;
             member->keyData.clear();
-            member->loc = DiskLoc();
+            member->loc = RecordId();
             return Status::OK();
         }
 
@@ -333,7 +339,11 @@ namespace mongo {
                 }
             }
             else if (META_DISKLOC == it->second) {
-                bob.append(it->first, member->loc.toBSONObj());
+                // For compatibility with old versions, we output as a split DiskLoc.
+                const int64_t repr = member->loc.repr();
+                BSONObjBuilder sub(bob.subobjStart(it->first));
+                sub.append("file", int(repr >> 32));
+                sub.append("offset", int(uint32_t(repr)));
             }
         }
 
@@ -341,7 +351,7 @@ namespace mongo {
         member->state = WorkingSetMember::OWNED_OBJ;
         member->obj = newObj;
         member->keyData.clear();
-        member->loc = DiskLoc();
+        member->loc = RecordId();
 
         return Status::OK();
     }

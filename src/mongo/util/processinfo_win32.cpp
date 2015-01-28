@@ -2,27 +2,44 @@
 
 /*    Copyright 2009 10gen Inc.
  *
- *    Licensed under the Apache License, Version 2.0 (the "License");
- *    you may not use this file except in compliance with the License.
- *    You may obtain a copy of the License at
+ *    This program is free software: you can redistribute it and/or  modify
+ *    it under the terms of the GNU Affero General Public License, version 3,
+ *    as published by the Free Software Foundation.
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License for more details.
  *
- *    Unless required by applicable law or agreed to in writing, software
- *    distributed under the License is distributed on an "AS IS" BASIS,
- *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *    See the License for the specific language governing permissions and
- *    limitations under the License.
+ *    You should have received a copy of the GNU Affero General Public License
+ *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
  */
 
-#include "mongo/pch.h"
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
 
+#include "mongo/platform/basic.h"
+
+#include <boost/scoped_array.hpp>
 #include <iostream>
 #include <psapi.h>
 
 #include "mongo/util/processinfo.h"
+#include "mongo/util/log.h"
 
 using namespace std;
+using boost::scoped_array;
 
 namespace mongo {
 
@@ -93,6 +110,95 @@ namespace mongo {
             info.append("availPageFileMB", static_cast<int>(mse.ullAvailPageFile / 1024 / 1024));
             info.append("ramMB", static_cast<int>(mse.ullTotalPhys / 1024 / 1024));
         }
+
+#ifndef _WIN64
+        BOOL wow64Process;
+        BOOL retWow64 = IsWow64Process(GetCurrentProcess(), &wow64Process);
+        info.append("wow64Process", static_cast<bool>(retWow64 && wow64Process));
+#endif
+    }
+
+    bool getFileVersion(const char *filePath, DWORD &fileVersionMS, DWORD &fileVersionLS) {
+        DWORD verSize = GetFileVersionInfoSizeA(filePath, NULL);
+        if (verSize == 0) {
+            DWORD gle = GetLastError();
+            warning() << "GetFileVersionInfoSizeA on " << filePath << " failed with " << errnoWithDescription(gle);
+            return false;
+        }
+
+        boost::scoped_array<char> verData(new char[verSize]);
+        if (GetFileVersionInfoA(filePath, NULL, verSize, verData.get()) == 0) {
+            DWORD gle = GetLastError();
+            warning() << "GetFileVersionInfoSizeA on " << filePath << " failed with " << errnoWithDescription(gle);
+            return false;
+        }
+
+        UINT size;
+        VS_FIXEDFILEINFO *verInfo;
+        if (VerQueryValueA(verData.get(), "\\", (LPVOID *)&verInfo, &size) == 0) {
+            DWORD gle = GetLastError();
+            warning() << "VerQueryValueA on " << filePath << " failed with " << errnoWithDescription(gle);
+            return false;
+        }
+    
+        if (size != sizeof(VS_FIXEDFILEINFO)) {
+            warning() << "VerQueryValueA on " << filePath << " returned structure with unexpected size";
+            return false;
+        }
+
+        fileVersionMS = verInfo->dwFileVersionMS;
+        fileVersionLS = verInfo->dwFileVersionLS;
+        return true;
+    }
+
+    // If the version of the ntfs.sys driver shows that the KB2731284 hotfix or a later update
+    // is installed, zeroing out data files is unnecessary. The file version numbers used below
+    // are taken from the Hotfix File Information at http://support.microsoft.com/kb/2731284.
+    bool isKB2731284OrLaterUpdateInstalled() {
+        UINT pathBufferSize = GetSystemDirectoryA(NULL, 0);
+        if (pathBufferSize == 0) {
+            DWORD gle = GetLastError();
+            warning() << "GetSystemDirectoryA failed with " << errnoWithDescription(gle);
+            return false;
+        }
+
+        boost::scoped_array<char> systemDirectory(new char[pathBufferSize]);
+        UINT systemDirectoryPathLen;
+        systemDirectoryPathLen = GetSystemDirectoryA(systemDirectory.get(), pathBufferSize);
+        if (systemDirectoryPathLen == 0) {
+            DWORD gle = GetLastError();
+            warning() << "GetSystemDirectoryA failed with " << errnoWithDescription(gle);
+            return false;
+        }
+
+        if (systemDirectoryPathLen != pathBufferSize - 1) {
+            warning() << "GetSystemDirectoryA returned unexpected path length";
+            return false;
+        }
+
+        string ntfsDotSysPath = systemDirectory.get();
+        if (ntfsDotSysPath.back() != '\\') {
+            ntfsDotSysPath.append("\\");
+        }
+        ntfsDotSysPath.append("drivers\\ntfs.sys");
+        DWORD fileVersionMS;
+        DWORD fileVersionLS;
+        if (getFileVersion(ntfsDotSysPath.c_str(), fileVersionMS, fileVersionLS)) {
+            WORD fileVersionFirstNumber = HIWORD(fileVersionMS);
+            WORD fileVersionSecondNumber = LOWORD(fileVersionMS);
+            WORD fileVersionThirdNumber = HIWORD(fileVersionLS);
+            WORD fileVersionFourthNumber = LOWORD(fileVersionLS);
+
+            if (fileVersionFirstNumber == 6 && fileVersionSecondNumber == 1 && fileVersionThirdNumber == 7600 &&
+                    fileVersionFourthNumber >= 21296 && fileVersionFourthNumber <= 21999) {
+                return true; 
+            } else if (fileVersionFirstNumber == 6 && fileVersionSecondNumber == 1 && fileVersionThirdNumber == 7601 &&
+                    fileVersionFourthNumber >= 22083 && fileVersionFourthNumber <= 22999) {
+                return true; 
+            }
+        }
+
+        return false;
     }
 
     void ProcessInfo::SystemInfo::collectSystemInfo() {
@@ -153,7 +259,13 @@ namespace mongo {
                         // http://support.microsoft.com/kb/2731284.
                         //
                         if ((osvi.wServicePackMajor >= 0) && (osvi.wServicePackMajor < 2)) {
-                            fileZeroNeeded = true;
+                            if (isKB2731284OrLaterUpdateInstalled()) {
+                                log() << "Hotfix KB2731284 or later update is installed, no need to zero-out data files";
+                                fileZeroNeeded = false;
+                            } else {
+                                log() << "Hotfix KB2731284 or later update is not installed, will zero-out data files";
+                                fileZeroNeeded = true;
+                            }
                         }
                         break;
                     case 0:

@@ -26,6 +26,8 @@
 *    it in the license file.
 */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kIndex
+
 #include "mongo/db/index/s2_access_method.h"
 
 #include <vector>
@@ -33,18 +35,19 @@
 #include "mongo/base/status.h"
 #include "mongo/db/geo/geoparser.h"
 #include "mongo/db/geo/geoconstants.h"
-#include "mongo/db/geo/s2common.h"
+#include "mongo/db/index/s2_common.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/index/expression_keys_private.h"
 #include "mongo/db/index/expression_params.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
 
     static const string kIndexVersionFieldName("2dsphereIndexVersion");
 
-    S2AccessMethod::S2AccessMethod(IndexCatalogEntry* btreeState)
-        : BtreeBasedAccessMethod(btreeState) {
+    S2AccessMethod::S2AccessMethod(IndexCatalogEntry* btreeState, SortedDataInterface* btree)
+        : BtreeBasedAccessMethod(btreeState, btree) {
 
         const IndexDescriptor* descriptor = btreeState->descriptor();
 

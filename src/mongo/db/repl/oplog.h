@@ -28,29 +28,34 @@
 
 #pragma once
 
-namespace mongo {
+#include <cstddef>
+#include <deque>
+#include <string>
 
+namespace mongo {
     class BSONObj;
     class Database;
-    class TransactionExperiment;
+    class OperationContext;
     class OpTime;
 
-    // These functions redefine the function for logOp(),
-    // for either master/slave or replica sets.
+namespace repl {
+
+    // Redefines the function for logOp() to master/slave.
     void oldRepl();  // master-slave
-    void newRepl();  // replica set starting up 
-    void newReplUp();// replica set after startup
 
     // Create a new capped collection for the oplog if it doesn't yet exist.
     // This will be either local.oplog.rs (replica sets) or local.oplog.$main (master/slave)
     // If the collection already exists, set the 'last' OpTime if master/slave (side effect!)
-    void createOplog();
+    void createOplog(OperationContext* txn);
 
-    // This poorly-named function writes an op into the replica-set oplog;
-    // used internally by replication secondaries after they have applied an op
-    void _logOpObjRS(const BSONObj& op);
+    // This function writes ops into the replica-set oplog;
+    // used internally by replication secondaries after they have applied ops.  Updates the global
+    // optime.
+    // Returns the optime for the last op inserted.
+    OpTime writeOpsToOplog(OperationContext* txn, const std::deque<BSONObj>& ops);
 
     const char rsoplog[] = "local.oplog.rs";
+    static const int OPLOG_VERSION = 2;
 
     /** Log an operation to the local oplog 
 
@@ -68,27 +73,29 @@ namespace mongo {
 
        See _logOp() in oplog.cpp for more details.
     */
-    void logOp( TransactionExperiment* txn,
+    void logOp( OperationContext* txn,
                 const char *opstr,
                 const char *ns,
                 const BSONObj& obj,
                 BSONObj *patt = NULL,
                 bool *b = NULL,
-                bool fromMigrate = false,
-                const BSONObj* fullObj = NULL );
+                bool fromMigrate = false);
 
     // Log an empty no-op operation to the local oplog
-    void logKeepalive();
+    void logKeepalive(OperationContext* txn);
 
     /** puts obj in the oplog as a comment (a no-op).  Just for diags.
         convention is
           { msg : "text", ... }
     */
-    void logOpComment(const BSONObj& obj);
+    void logOpComment(OperationContext* txn, const BSONObj& obj);
+    
+    // Same as logOpComment, except only works for replsets
+    void logOpInitiate(OperationContext* txn, const BSONObj& obj);
 
     // Flush out the cached pointers to the local database and oplog.
     // Used by the closeDatabase command to ensure we don't cache closed things.
-    void oplogCheckCloseDatabase( Database * db );
+    void oplogCheckCloseDatabase(OperationContext* txn, Database * db);
 
     /**
      * take an op and apply locally
@@ -97,20 +104,25 @@ namespace mongo {
      * @param convertUpdateToUpsert convert some updates to upserts for idempotency reasons
      * Returns if the op was an update that could not be applied (true on failure)
      */
-    bool applyOperation_inlock(TransactionExperiment* txn,
+    bool applyOperation_inlock(OperationContext* txn,
                                Database* db,
                                const BSONObj& op,
                                bool fromRepl = true,
                                bool convertUpdateToUpsert = false);
 
     /**
-     * Waits until the given timeout for the OpTime from the oplog to change.
-     * Returns true if the OpTime changed occured before the timeout.
+     * Waits one second for the OpTime from the oplog to change.
      */
-    bool waitForOptimeChange(const OpTime& referenceTime, unsigned timeoutMillis);
+    void waitUpToOneSecondForOptimeChange(const OpTime& referenceTime);
 
     /**
      * Initializes the global OpTime with the value from the timestamp of the last oplog entry.
      */
-    void initOpTimeFromOplog(const std::string& oplogNS);
-}
+    void initOpTimeFromOplog(OperationContext* txn, const std::string& oplogNS);
+
+    /**
+     * Sets the global OpTime to be 'newTime'.
+     */
+    void setNewOptime(const OpTime& newTime);
+} // namespace repl
+} // namespace mongo

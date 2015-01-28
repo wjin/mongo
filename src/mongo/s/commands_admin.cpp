@@ -26,9 +26,14 @@
 *    then also delete it in the license file.
 */
 
-#include "mongo/pch.h"
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+
+#include "mongo/platform/basic.h"
 
 #include "mongo/db/commands.h"
+
+#include <boost/scoped_ptr.hpp>
+#include <boost/shared_ptr.hpp>
 
 #include "mongo/client/connpool.h"
 #include "mongo/client/dbclientcursor.h"
@@ -45,26 +50,30 @@
 #include "mongo/db/hasher.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/query/lite_parsed_query.h"
+#include "mongo/db/lasterror.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/wire_version.h"
 #include "mongo/db/write_concern.h"
+#include "mongo/db/write_concern_options.h"
 #include "mongo/s/chunk.h"
 #include "mongo/s/client_info.h"
 #include "mongo/s/cluster_write.h"
 #include "mongo/s/config.h"
 #include "mongo/s/dbclient_multi_command.h"
 #include "mongo/s/dbclient_shard_resolver.h"
+#include "mongo/s/distlock.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/strategy.h"
 #include "mongo/s/type_chunk.h"
 #include "mongo/s/type_database.h"
 #include "mongo/s/type_shard.h"
-#include "mongo/s/writeback_listener.h"
 #include "mongo/s/write_ops/batch_downconvert.h"
 #include "mongo/s/write_ops/batch_write_exec.h"
 #include "mongo/s/write_ops/batched_command_request.h"
+#include "mongo/util/log.h"
 #include "mongo/util/net/listen.h"
 #include "mongo/util/net/message.h"
+#include "mongo/util/print.h"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/ramlog.h"
 #include "mongo/util/stringutils.h"
@@ -72,6 +81,17 @@
 #include "mongo/util/version.h"
 
 namespace mongo {
+
+    using boost::scoped_ptr;
+    using boost::shared_ptr;
+    using std::auto_ptr;
+    using std::endl;
+    using std::list;
+    using std::map;
+    using std::set;
+    using std::string;
+    using std::stringstream;
+    using std::vector;
 
     namespace dbgrid_cmds {
 
@@ -91,7 +111,7 @@ namespace mongo {
 
             bool okForConfigChanges( string& errmsg ) {
                 string e;
-                if ( ! configServer.allUp(e) ) {
+                if (!configServer.allUp(false, e)) {
                     errmsg = str::stream() << "not all config servers are up: " << e;
                     return false;
                 }
@@ -114,7 +134,7 @@ namespace mongo {
                 actions.addAction(ActionType::netstat);
                 out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
             }
-            bool run(const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+            bool run(OperationContext* txn, const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
                 result.append("configserver", configServer.getPrimary().getConnString() );
                 result.append("isdbgrid", 1);
                 return true;
@@ -134,7 +154,7 @@ namespace mongo {
                 actions.addAction(ActionType::flushRouterConfig);
                 out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
             }
-            bool run(const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+            bool run(OperationContext* txn, const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
                 grid.flushConfig();
                 result.appendBool( "flushed" , true );
                 return true;
@@ -151,7 +171,7 @@ namespace mongo {
                 actions.addAction(ActionType::fsync);
                 out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
             }
-            bool run(const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+            bool run(OperationContext* txn, const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
                 if ( cmdObj["lock"].trueValue() ) {
                     errmsg = "can't do lock through mongos";
                     return false;
@@ -205,7 +225,7 @@ namespace mongo {
             virtual std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const {
                 return cmdObj.firstElement().valuestrsafe();
             }
-            bool run(const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+            bool run(OperationContext* txn, const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
                 string dbname = parseNs("admin", cmdObj);
 
                 if ( dbname.size() == 0 ) {
@@ -400,7 +420,7 @@ namespace mongo {
             virtual std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const {
                 return cmdObj.firstElement().valuestrsafe();
             }
-            bool run(const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+            bool run(OperationContext* txn, const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
                 string dbname = parseNs("admin", cmdObj);
                 if ( dbname.size() == 0 ) {
                     errmsg = "no db";
@@ -459,7 +479,7 @@ namespace mongo {
             virtual std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const {
                 return parseNsFullyQualified(dbname, cmdObj);
             }
-            bool run(const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+            bool run(OperationContext* txn, const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
                 const string ns = parseNs(dbname, cmdObj);
                 if ( ns.size() == 0 ) {
                     errmsg = "no ns";
@@ -483,41 +503,32 @@ namespace mongo {
                     return false;
                 }
 
-                BSONObj proposedKey = cmdObj.getObjectField( "key" );
+                // NOTE: We *must* take ownership of the key here - otherwise the shared BSONObj
+                // becomes corrupt as soon as the command ends.
+                BSONObj proposedKey = cmdObj.getObjectField( "key" ).getOwned();
                 if ( proposedKey.isEmpty() ) {
                     errmsg = "no shard key";
                     return false;
                 }
 
-                bool isHashedShardKey = // br
-                        ( IndexNames::findPluginName( proposedKey ) == IndexNames::HASHED );
+                ShardKeyPattern proposedKeyPattern(proposedKey);
+                if (!proposedKeyPattern.isValid()) {
+                    errmsg = str::stream() << "Unsupported shard key pattern.  Pattern must"
+                                           << " either be a single hashed field, or a list"
+                                           << " of ascending fields.";
+                    return false;
+                }
 
-                // Currently the allowable shard keys are either
-                // i) a hashed single field, e.g. { a : "hashed" }, or
-                // ii) a compound list of ascending fields, e.g. { a : 1 , b : 1 }
-                if ( isHashedShardKey ) {
-                    // case i)
-                    if ( proposedKey.nFields() > 1 ) {
-                        errmsg = "hashed shard keys currently only support single field keys";
-                        return false;
-                    }
-                    if ( cmdObj["unique"].trueValue() ) {
-                        // it's possible to ensure uniqueness on the hashed field by
-                        // declaring an additional (non-hashed) unique index on the field,
-                        // but the hashed shard key itself should not be declared unique
-                        errmsg = "hashed shard keys cannot be declared unique.";
-                        return false;
-                    }
-                } else {
-                    // case ii)
-                    BSONForEach(e, proposedKey) {
-                        if (!e.isNumber() || e.number() != 1.0) {
-                            errmsg = str::stream() << "Unsupported shard key pattern.  Pattern must"
-                                                   << " either be a single hashed field, or a list"
-                                                   << " of ascending fields.";
-                            return false;
-                        }
-                    }
+                bool isHashedShardKey = proposedKeyPattern.isHashedPattern();
+
+                if (isHashedShardKey && cmdObj["unique"].trueValue()) {
+                    dassert(proposedKey.nFields() == 1);
+
+                    // it's possible to ensure uniqueness on the hashed field by
+                    // declaring an additional (non-hashed) unique index on the field,
+                    // but the hashed shard key itself should not be declared unique
+                    errmsg = "hashed shard keys cannot be declared unique.";
+                    return false;
                 }
 
                 if ( ns.find( ".system." ) != string::npos ) {
@@ -532,8 +543,15 @@ namespace mongo {
                 ScopedDbConnection conn(config->getPrimary().getConnString());
 
                 //check that collection is not capped
-                BSONObj res = conn->findOne( config->getName() + ".system.namespaces",
-                                             BSON( "name" << ns ) );
+                BSONObj res;
+                {
+                    std::list<BSONObj> all = conn->getCollectionInfos( config->getName(),
+                                                                       BSON( "name" << nsToCollectionSubstring( ns ) ) );
+                    if ( !all.empty() ) {
+                        res = all.front().getOwned();
+                    }
+                }
+
                 if ( res["options"].type() == Object &&
                      res["options"].embeddedObject()["capped"].trueValue() ) {
                     errmsg = "can't shard capped collection";
@@ -568,18 +586,15 @@ namespace mongo {
                 // 5. If the collection is empty, and it's still possible to create an index
                 //    on the proposed key, we go ahead and do so.
 
-                string indexNS = config->getName() + ".system.indexes";
+                list<BSONObj> indexes = conn->getIndexSpecs( ns );
 
                 // 1.  Verify consistency with existing unique indexes
-                BSONObj uniqueQuery = BSON( "ns" << ns << "unique" << true );
-                auto_ptr<DBClientCursor> uniqueQueryResult =
-                                conn->query( indexNS , uniqueQuery );
-
-                ShardKeyPattern proposedShardKey( proposedKey );
-                while ( uniqueQueryResult->more() ) {
-                    BSONObj idx = uniqueQueryResult->next();
+                ShardKeyPattern proposedShardKey(proposedKey);
+                for ( list<BSONObj>::iterator it = indexes.begin(); it != indexes.end(); ++it ) {
+                    BSONObj idx = *it;
                     BSONObj currentKey = idx["key"].embeddedObject();
-                    if( ! proposedShardKey.isUniqueIndexCompatible( currentKey ) ) {
+                    bool isUnique = idx["unique"].trueValue();
+                    if (isUnique && !proposedShardKey.isUniqueIndexCompatible(currentKey)) {
                         errmsg = str::stream() << "can't shard collection '" << ns << "' "
                                                << "with unique index on " << currentKey << " "
                                                << "and proposed shard key " << proposedKey << ". "
@@ -593,14 +608,8 @@ namespace mongo {
                 // 2. Check for a useful index
                 bool hasUsefulIndexForKey = false;
 
-                BSONObj allQuery = BSON( "ns" << ns );
-                auto_ptr<DBClientCursor> allQueryResult =
-                                conn->query( indexNS , allQuery );
-
-                BSONArrayBuilder allIndexes;
-                while ( allQueryResult->more() ) {
-                    BSONObj idx = allQueryResult->next();
-                    allIndexes.append( idx );
+                for ( list<BSONObj>::iterator it = indexes.begin(); it != indexes.end(); ++it ) {
+                    BSONObj idx = *it;
                     BSONObj currentKey = idx["key"].embeddedObject();
                     // Check 2.i. and 2.ii.
                     if ( ! idx["sparse"].trueValue() && proposedKey.isPrefixOf( currentKey ) ) {
@@ -628,7 +637,14 @@ namespace mongo {
                 bool careAboutUnique = cmdObj["unique"].trueValue();
                 if ( hasUsefulIndexForKey && careAboutUnique ) {
                     BSONObj eqQuery = BSON( "ns" << ns << "key" << proposedKey );
-                    BSONObj eqQueryResult = conn->findOne( indexNS, eqQuery );
+                    BSONObj eqQueryResult;
+                    for ( list<BSONObj>::iterator it = indexes.begin(); it != indexes.end(); ++it ) {
+                        BSONObj idx = *it;
+                        if ( idx["key"].embeddedObject() == proposedKey ) {
+                            eqQueryResult = idx;
+                            break;
+                        }
+                    }
                     if ( eqQueryResult.isEmpty() ) {
                         hasUsefulIndexForKey = false;  // if no exact match, index not useful,
                                                        // but still possible to create one later
@@ -664,7 +680,7 @@ namespace mongo {
                     errmsg = str::stream() << "please create an index that starts with the "
                                            << "shard key before sharding.";
                     result.append( "proposedKey" , proposedKey );
-                    result.appendArray( "curIndexes" , allIndexes.done() );
+                    result.append( "curIndexes" , indexes );
                     conn.done();
                     return false;
                 }
@@ -744,10 +760,17 @@ namespace mongo {
                     }
                 }
 
-                MONGO_TLOG(0) << "CMD: shardcollection: " << cmdObj << endl;
+                LOG(0) << "CMD: shardcollection: " << cmdObj << endl;
 
-                audit::logShardCollection(ClientBasic::getCurrent(), ns, proposedKey, careAboutUnique);
-                config->shardCollection( ns , proposedKey , careAboutUnique , &initSplits );
+                audit::logShardCollection(ClientBasic::getCurrent(),
+                                          ns,
+                                          proposedKey,
+                                          careAboutUnique);
+
+                config->shardCollection(ns,
+                                        proposedShardKey,
+                                        careAboutUnique,
+                                        &initSplits);
 
                 result << "collectionsharded" << ns;
 
@@ -769,12 +792,13 @@ namespace mongo {
                             continue;
 
                         BSONObj moveResult;
+                        WriteConcernOptions noThrottle;
                         if (!chunk->moveAndCommit(to, Chunk::MaxChunkSize,
-                                false, true, 0, moveResult)) {
-                            warning().stream()
-                                      << "Couldn't move chunk " << chunk << " to shard "  << to
-                                      << " while sharding collection " << ns << ". Reason: "
-                                      <<  moveResult << endl;
+                                                  &noThrottle, true, 0, moveResult)) {
+                            warning() << "couldn't move chunk " << chunk->toString()
+                                      << " to shard " << to
+                                      << " while sharding collection " << ns
+                                      << ". Reason: " <<  moveResult;
                         }
                     }
 
@@ -791,14 +815,14 @@ namespace mongo {
                     vector<BSONObj> subSplits;
                     for ( unsigned i = 0 ; i <= allSplits.size(); i++){
                         if ( i == allSplits.size() ||
-                                ! currentChunk->containsPoint( allSplits[i] ) ) {
+                                ! currentChunk->containsKey( allSplits[i] ) ) {
                             if ( ! subSplits.empty() ){
-                                Status status = currentChunk->multiSplit( subSplits );
+                                Status status = currentChunk->multiSplit(subSplits, NULL);
                                 if ( !status.isOK() ){
-                                    warning().stream()
-                                        << "Couldn't split chunk " << currentChunk
-                                        << " while sharding collection " << ns << ". Reason: "
-                                        << status << endl;
+                                    warning() << "couldn't split chunk "
+                                              << currentChunk->toString()
+                                              << " while sharding collection " << ns
+                                              << causedBy(status);
                                 }
                                 subSplits.clear();
                             }
@@ -844,7 +868,7 @@ namespace mongo {
             virtual std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const {
                 return parseNsFullyQualified(dbname, cmdObj);
             }
-            bool run(const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+            bool run(OperationContext* txn, const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
                 string ns = parseNs(dbname, cmdObj);
                 if ( ns.size() == 0 ) {
                     errmsg = "need to specify fully namespace";
@@ -895,7 +919,7 @@ namespace mongo {
             virtual std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const {
                 return parseNsFullyQualified(dbname, cmdObj);
             }
-            bool run(const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+            bool run(OperationContext* txn, const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
                 if ( ! okForConfigChanges( errmsg ) )
                     return false;
 
@@ -975,20 +999,74 @@ namespace mongo {
                 ChunkPtr chunk;
 
                 if (!find.isEmpty()) {
-                    chunk = info->findChunkForDoc(find);
+
+                    StatusWith<BSONObj> status =
+                        info->getShardKeyPattern().extractShardKeyFromQuery(find);
+
+                    // Bad query
+                    if (!status.isOK())
+                        return appendCommandStatus(result, status.getStatus());
+
+                    BSONObj shardKey = status.getValue();
+
+                    if (shardKey.isEmpty()) {
+                        errmsg = stream() << "no shard key found in chunk query " << find;
+                        return false;
+                    }
+
+                    chunk = info->findIntersectingChunk(shardKey);
+                    verify(chunk.get());
                 }
                 else if (!bounds.isEmpty()) {
-                    chunk = info->findIntersectingChunk(bounds[0].Obj());
+
+                    if (!info->getShardKeyPattern().isShardKey(bounds[0].Obj())
+                        || !info->getShardKeyPattern().isShardKey(bounds[1].Obj())) {
+                        errmsg = stream() << "shard key bounds " << "[" << bounds[0].Obj() << ","
+                                          << bounds[1].Obj() << ")"
+                                          << " are not valid for shard key pattern "
+                                          << info->getShardKeyPattern().toBSON();
+                        return false;
+                    }
+
+                    BSONObj minKey = info->getShardKeyPattern().normalizeShardKey(bounds[0].Obj());
+                    BSONObj maxKey = info->getShardKeyPattern().normalizeShardKey(bounds[1].Obj());
+
+                    chunk = info->findIntersectingChunk(minKey);
                     verify(chunk.get());
 
-                    if (chunk->getMin() != bounds[0].Obj() ||
-                        chunk->getMax() != bounds[1].Obj()) {
-                        errmsg = "no chunk found from the given upper and lower bounds";
+                    if (chunk->getMin().woCompare(minKey) != 0
+                        || chunk->getMax().woCompare(maxKey) != 0) {
+                        errmsg = stream() << "no chunk found with the shard key bounds " << "["
+                                          << minKey << "," << maxKey << ")";
                         return false;
                     }
                 }
                 else { // middle
+
+                    if (!info->getShardKeyPattern().isShardKey(middle)) {
+                        errmsg = stream() << "new split key " << middle
+                                          << " is not valid for shard key pattern "
+                                          << info->getShardKeyPattern().toBSON();
+                        return false;
+                    }
+
+                    middle = info->getShardKeyPattern().normalizeShardKey(middle);
+
+                    // Check shard key size when manually provided
+                    Status status = ShardKeyPattern::checkShardKeySize(middle);
+                    if (!status.isOK())
+                        return appendCommandStatus(result, status);
+
                     chunk = info->findIntersectingChunk(middle);
+                    verify(chunk.get());
+
+                    if (chunk->getMin().woCompare(middle) == 0
+                        || chunk->getMax().woCompare(middle) == 0) {
+                        errmsg = stream() << "new split key " << middle
+                                          << " is a boundary key of existing chunk " << "["
+                                          << chunk->getMin() << "," << chunk->getMax() << ")";
+                        return false;
+                    }
                 }
 
                 verify(chunk.get());
@@ -998,8 +1076,9 @@ namespace mongo {
 
                 BSONObj res;
                 if ( middle.isEmpty() ) {
-                    Status status = chunk->split( true /* force a split even if not enough data */,
-                                                  NULL );
+                    Status status = chunk->split(Chunk::atMedian,
+                                                 NULL,
+                                                 NULL);
                     if ( !status.isOK() ) {
                         errmsg = "split failed";
                         result.append( "cause", status.toString() );
@@ -1007,20 +1086,9 @@ namespace mongo {
                     }
                 }
                 else {
-                    // sanity check if the key provided is a valid split point
-                    if ( ( middle == chunk->getMin() ) || ( middle == chunk->getMax() ) ) {
-                        errmsg = "cannot split on initial or final chunk's key";
-                        return false;
-                    }
-
-                    if (!fieldsMatch(middle, info->getShardKey().key())){
-                        errmsg = "middle has different fields (or different order) than shard key";
-                        return false;
-                    }
-
                     vector<BSONObj> splitPoints;
                     splitPoints.push_back( middle );
-                    Status status = chunk->multiSplit( splitPoints );
+                    Status status = chunk->multiSplit(splitPoints, NULL);
 
                     if ( !status.isOK() ) {
                         errmsg = "split failed";
@@ -1057,7 +1125,7 @@ namespace mongo {
             virtual std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const {
                 return parseNsFullyQualified(dbname, cmdObj);
             }
-            bool run(const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+            bool run(OperationContext* txn, const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
                 if ( ! okForConfigChanges( errmsg ) )
                     return false;
 
@@ -1104,24 +1172,60 @@ namespace mongo {
 
                 // This refreshes the chunk metadata if stale.
                 ChunkManagerPtr info = config->getChunkManager( ns, true );
-                ChunkPtr c = find.isEmpty() ?
-                                info->findIntersectingChunk( bounds[0].Obj() ) :
-                                info->findChunkForDoc( find );
+                ChunkPtr chunk;
 
-                if ( ! bounds.isEmpty() && ( c->getMin() != bounds[0].Obj() ||
-                                             c->getMax() != bounds[1].Obj() ) ) {
-                    errmsg = "no chunk found with those upper and lower bounds";
-                    return false;
+                if (!find.isEmpty()) {
+
+                    StatusWith<BSONObj> status =
+                        info->getShardKeyPattern().extractShardKeyFromQuery(find);
+
+                    // Bad query
+                    if (!status.isOK())
+                        return appendCommandStatus(result, status.getStatus());
+
+                    BSONObj shardKey = status.getValue();
+
+                    if (shardKey.isEmpty()) {
+                        errmsg = stream() << "no shard key found in chunk query " << find;
+                        return false;
+                    }
+
+                    chunk = info->findIntersectingChunk(shardKey);
+                    verify(chunk.get());
+                }
+                else { // bounds
+
+                    if (!info->getShardKeyPattern().isShardKey(bounds[0].Obj())
+                        || !info->getShardKeyPattern().isShardKey(bounds[1].Obj())) {
+                        errmsg = stream() << "shard key bounds " << "[" << bounds[0].Obj() << ","
+                                          << bounds[1].Obj() << ")"
+                                          << " are not valid for shard key pattern "
+                                          << info->getShardKeyPattern().toBSON();
+                        return false;
+                    }
+
+                    BSONObj minKey = info->getShardKeyPattern().normalizeShardKey(bounds[0].Obj());
+                    BSONObj maxKey = info->getShardKeyPattern().normalizeShardKey(bounds[1].Obj());
+
+                    chunk = info->findIntersectingChunk(minKey);
+                    verify(chunk.get());
+
+                    if (chunk->getMin().woCompare(minKey) != 0
+                        || chunk->getMax().woCompare(maxKey) != 0) {
+                        errmsg = stream() << "no chunk found with the shard key bounds " << "["
+                                          << minKey << "," << maxKey << ")";
+                        return false;
+                    }
                 }
 
-                const Shard& from = c->getShard();
+                const Shard& from = chunk->getShard();
 
                 if ( from == to ) {
                     errmsg = "that chunk is already on that shard";
                     return false;
                 }
 
-                MONGO_TLOG(0) << "CMD: movechunk: " << cmdObj << endl;
+                LOG(0) << "CMD: movechunk: " << cmdObj << endl;
 
                 StatusWith<int> maxTimeMS = LiteParsedQuery::parseMaxTimeMSCommand(cmdObj);
 
@@ -1130,13 +1234,26 @@ namespace mongo {
                     return false;
                 }
 
+                scoped_ptr<WriteConcernOptions> writeConcern(new WriteConcernOptions());
+                Status status = writeConcern->parseSecondaryThrottle(cmdObj, NULL);
+
+                if (!status.isOK()){
+                    if (status.code() != ErrorCodes::WriteConcernNotDefined) {
+                        errmsg = status.toString();
+                        return false;
+                    }
+
+                    // Let the shard decide what write concern to use.
+                    writeConcern.reset();
+                }
+
                 BSONObj res;
-                if (!c->moveAndCommit(to,
-                                      maxChunkSizeBytes,
-                                      cmdObj["_secondaryThrottle"].trueValue(),
-                                      cmdObj["_waitForDelete"].trueValue(),
-                                      maxTimeMS.getValue(),
-                                      res)) {
+                if (!chunk->moveAndCommit(to,
+                                          maxChunkSizeBytes,
+                                          writeConcern.get(),
+                                          cmdObj["_waitForDelete"].trueValue(),
+                                          maxTimeMS.getValue(),
+                                          res)) {
                     errmsg = "move failed";
                     result.append( "cause" , res );
                     if ( !res["code"].eoo() ) {
@@ -1165,7 +1282,7 @@ namespace mongo {
                 actions.addAction(ActionType::listShards);
                 out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
             }
-            bool run(const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+            bool run(OperationContext* txn, const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
                 ScopedDbConnection conn(configServer.getPrimary().getConnString(), 30);
 
                 vector<BSONObj> all;
@@ -1196,7 +1313,7 @@ namespace mongo {
                 actions.addAction(ActionType::addShard);
                 out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
             }
-            bool run(const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+            bool run(OperationContext* txn, const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
                 errmsg.clear();
 
                 // get replica set component hosts
@@ -1221,7 +1338,8 @@ namespace mongo {
 
                     // it's fine if mongods of a set all use default port
                     if ( ! serverAddrs[i].hasPort() ) {
-                        serverAddrs[i].setPort(ServerGlobalParams::ShardServerPort);
+                        serverAddrs[i] = HostAndPort(serverAddrs[i].host(),
+                                                     ServerGlobalParams::ShardServerPort);
                     }
                 }
 
@@ -1265,7 +1383,7 @@ namespace mongo {
                 actions.addAction(ActionType::removeShard);
                 out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
             }
-            bool run(const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+            bool run(OperationContext* txn, const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
                 string target = cmdObj.firstElement().valuestrsafe();
                 Shard s = Shard::make( target );
                 if ( ! grid.knowAboutShard( s.getConnString() ) ) {
@@ -1443,7 +1561,7 @@ namespace mongo {
                                                const BSONObj& cmdObj,
                                                std::vector<Privilege>* out) {} // No auth required
             IsDbGridCmd() : Command("isdbgrid") { }
-            bool run(const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+            bool run(OperationContext* txn, const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
                 result.append("isdbgrid", 1);
                 result.append("hostname", getHostNameCached());
                 return true;
@@ -1463,7 +1581,7 @@ namespace mongo {
                                                const BSONObj& cmdObj,
                                                std::vector<Privilege>* out) {} // No auth required
             CmdIsMaster() : Command("isMaster" , false , "ismaster") { }
-            virtual bool run(const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+            virtual bool run(OperationContext* txn, const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
                 result.appendBool("ismaster", true );
                 result.append("msg", "isdbgrid");
                 result.appendNumber("maxBsonObjectSize", BSONObjMaxUserSize);
@@ -1494,8 +1612,8 @@ namespace mongo {
             virtual void help( stringstream &help ) const {
                 help << "{whatsmyuri:1}";
             }
-            virtual bool run(const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
-                result << "you" << ClientInfo::get()->getRemote();
+            virtual bool run(OperationContext* txn, const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+                result << "you" << ClientInfo::get()->getRemote().toString();
                 return true;
             }
         } cmdWhatsMyUri;
@@ -1514,7 +1632,7 @@ namespace mongo {
                                                const BSONObj& cmdObj,
                                                std::vector<Privilege>* out) {} // No auth required
             CmdShardingGetPrevError() : Command( "getPrevError" , false , "getpreverror") { }
-            virtual bool run(const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+            virtual bool run(OperationContext* txn, const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
                 errmsg += "getpreverror not supported for sharded environments";
                 return false;
             }
@@ -1534,7 +1652,7 @@ namespace mongo {
                                                std::vector<Privilege>* out) {} // No auth required
             CmdShardingGetLastError() : Command("getLastError" , false , "getlasterror") { }
 
-            virtual bool run( const string& dbName,
+            virtual bool run(OperationContext* txn, const string& dbName,
                               BSONObj& cmdObj,
                               int,
                               string& errmsg,
@@ -1687,7 +1805,7 @@ namespace mongo {
         virtual void addRequiredPrivileges(const std::string& dbname,
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) {} // No auth required
-        bool run(const string& dbName , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool /*fromRepl*/) {
+        bool run(OperationContext* txn, const string& dbName , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool /*fromRepl*/) {
             LastError *le = lastError.get();
             if ( le )
                 le->reset();
@@ -1725,7 +1843,7 @@ namespace mongo {
             out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
         }
 
-        bool run(const string& , BSONObj& jsobj, int, string& errmsg, BSONObjBuilder& result, bool /*fromRepl*/) {
+        bool run(OperationContext* txn, const string& , BSONObj& jsobj, int, string& errmsg, BSONObjBuilder& result, bool /*fromRepl*/) {
             vector<Shard> shards;
             Shard::getAllShards( shards );
 
@@ -1836,28 +1954,6 @@ namespace mongo {
 
     } cmdListDatabases;
 
-    class CmdCloseAllDatabases : public Command {
-    public:
-        CmdCloseAllDatabases() : Command("closeAllDatabases", false , "closeAllDatabases" ) {}
-        virtual bool slaveOk() const { return true; }
-        virtual bool slaveOverrideOk() const { return true; }
-        virtual bool adminOnly() const { return true; }
-        virtual bool isWriteCommandForConfigServer() const { return false; }
-        virtual void help( stringstream& help ) const { help << "Not supported sharded"; }
-        virtual void addRequiredPrivileges(const std::string& dbname,
-                                           const BSONObj& cmdObj,
-                                           std::vector<Privilege>* out) {
-            ActionSet actions;
-            actions.addAction(ActionType::closeAllDatabases);
-            out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
-        }
-
-        bool run(const string& , BSONObj& jsobj, int, string& errmsg, BSONObjBuilder& /*result*/, bool /*fromRepl*/) {
-            errmsg = "closeAllDatabases isn't supported through mongos";
-            return false;
-        }
-    } cmdCloseAllDatabases;
-
 
     class CmdReplSetGetStatus : public Command {
     public:
@@ -1871,7 +1967,7 @@ namespace mongo {
                                            const BSONObj& cmdObj) {
             return Status::OK(); // Require no auth since this command isn't supported in mongos
         }
-        bool run(const string& , BSONObj& jsobj, int, string& errmsg, BSONObjBuilder& result, bool /*fromRepl*/) {
+        bool run(OperationContext* txn, const string& , BSONObj& jsobj, int, string& errmsg, BSONObjBuilder& result, bool /*fromRepl*/) {
             if ( jsobj["forShell"].trueValue() ) {
                 lastError.disableForCommand();
                 ClientInfo::get()->disableForCommand();
@@ -1890,8 +1986,9 @@ namespace mongo {
              << "either (1) ran from localhost or (2) authenticated.";
     }
 
-    bool CmdShutdown::run(const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
-        return shutdownHelper();
+    bool CmdShutdown::run(OperationContext* txn, const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+        shutdownHelper();
+        return true;
     }
 
 } // namespace mongo

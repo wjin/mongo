@@ -17,22 +17,21 @@ var getDirectShardedConn = function( st, collName ) {
 
     var shardConnWithVersion = new Mongo( st.shard0.host );
 
-    var mockServerId = new ObjectId();
     var configConnStr = st._configDB;
 
     var maxChunk = st.s0.getCollection( "config.chunks" )
                    .find({ ns : collName }).sort({ lastmod : -1 }).next();
-    
-    var ssvInitCmd = { setShardVersion : collName, 
-                       configdb : configConnStr, 
-                       serverID : mockServerId,
+
+    var ssvInitCmd = { setShardVersion : collName,
+                       authoritative : true,
+                       configdb : configConnStr,
                        version : maxChunk.lastmod,
                        versionEpoch : maxChunk.lastmodEpoch };
-    
+
     printjson( ssvInitCmd );
 
     assert.commandWorked( shardConnWithVersion.getDB( "admin" ).runCommand( ssvInitCmd ) );
-    
+
     return shardConnWithVersion;
 }
 

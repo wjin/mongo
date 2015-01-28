@@ -31,6 +31,7 @@
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/expression.h"
+#include "mongo/db/matcher/expression_parser.h"
 #include "mongo/util/string_map.h"
 
 namespace mongo {
@@ -66,7 +67,10 @@ namespace mongo {
         typedef StringMap<MatchExpression*> Matchers;
         typedef StringMap<MetaProjection> MetaMap;
 
-        ProjectionExec(const BSONObj& spec, const MatchExpression* queryExpression);
+        ProjectionExec(const BSONObj& spec, 
+                       const MatchExpression* queryExpression,
+                       const MatchExpressionParser::WhereCallback& whereCallback =
+                                    MatchExpressionParser::WhereCallback());
         ~ProjectionExec();
 
         /**
@@ -92,12 +96,12 @@ namespace mongo {
         /**
          * Add 'field' as a field name that is included or excluded as part of the projection.
          */
-        void add(const string& field, bool include);
+        void add(const std::string& field, bool include);
 
         /**
          * Add 'field' as a field name that is sliced as part of the projection.
          */
-        void add(const string& field, int skip, int limit);
+        void add(const std::string& field, int skip, int limit);
 
         //
         // Execution
@@ -152,7 +156,7 @@ namespace mongo {
         bool _special; 
 
         // We must group projections with common prefixes together.
-        // TODO: benchmark vector<pair> vs map
+        // TODO: benchmark std::vector<pair> vs map
         //
         // Projection is a rooted tree.  If we have {a.b: 1, a.c: 1} we don't want to
         // double-traverse the document when we're projecting it.  Instead, we have an entry in
@@ -173,7 +177,7 @@ namespace mongo {
         Matchers _matchers;
 
         // The matchers above point into BSONObjs and this is where those objs live.
-        vector<BSONObj> _elemMatchObjs;
+        std::vector<BSONObj> _elemMatchObjs;
 
         ArrayOpType _arrayOpType;
 

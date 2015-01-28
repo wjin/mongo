@@ -25,7 +25,6 @@ function dotest( useIndex ) {
     assert.docEq( { _id : 5, a: 4, x : 4 }, t.findOne() );
 
     op = getLastOp();
-    assert( op.fastmod );
 }
 
 dotest( false );
@@ -36,10 +35,11 @@ dotest( true );
 t.drop();
 
 res = t.update( {_id: 1} , { $setOnInsert: { "_id.a": new Date() } } , true );
-assert(res.hasWriteError(), "$setOnInsert _id.a - " + res.toString() + tojson(t.findOne()));
+assert.writeError(res, "$setOnInsert _id.a worked" );
 
 res = t.update( {"_id.a": 4} , { $setOnInsert: { "_id.b": 1 } } , true );
-assert(res.hasWriteError(), "$setOnInsert _id.b - " + res.toString() + tojson(t.findOne()));
+assert.writeError(res, "$setOnInsert _id.a/b worked" );
 
 res = t.update( {"_id.a": 4} , { $setOnInsert: { "_id": {a:4, b:1} } } , true );
-assert(res.hasWriteError(), "$setOnInsert _id 3 - " + res.toString() + tojson(t.findOne()));
+assert.writeError(res, "$setOnInsert _id.a/a+b worked" );
+db.setProfilingLevel( 0 );

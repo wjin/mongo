@@ -32,7 +32,6 @@
 
 #include "mongo/db/field_ref.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -127,6 +126,17 @@ namespace mongo {
         _sub->debugString( debug, level + 1 );
     }
 
+    void ElemMatchObjectMatchExpression::toBSON(BSONObjBuilder* out) const {
+        BSONObjBuilder subBob;
+        _sub->toBSON(&subBob);
+        if (path().empty()) {
+            out->append("$elemMatch", subBob.obj());
+        }
+        else {
+            out->append(path(), BSON("$elemMatch" << subBob.obj()));
+        }
+    }
+
 
     // -------
 
@@ -190,89 +200,17 @@ namespace mongo {
         }
     }
 
-
-    // ------
-
-    AllElemMatchOp::~AllElemMatchOp() {
-        for ( unsigned i = 0; i < _list.size(); i++ )
-            delete _list[i];
-        _list.clear();
-    }
-
-    Status AllElemMatchOp::init( const StringData& path ) {
-        _path = path;
-        Status s = _elementPath.init( _path );
-        _elementPath.setTraverseLeafArray( false );
-        return s;
-    }
-
-    void AllElemMatchOp::add( ArrayMatchingMatchExpression* expr ) {
-        verify( expr );
-        _list.push_back( expr );
-    }
-
-    bool AllElemMatchOp::matches( const MatchableDocument* doc, MatchDetails* details ) const {
-        MatchableDocument::IteratorHolder cursor( doc, &_elementPath );
-        while ( cursor->more() ) {
-            ElementIterator::Context e = cursor->next();
-            if ( e.element().type() != Array )
-                continue;
-            if ( _allMatch( e.element().Obj() ) )
-                return true;
+    void ElemMatchValueMatchExpression::toBSON(BSONObjBuilder* out) const {
+        BSONObjBuilder emBob;
+        for ( unsigned i = 0; i < _subs.size(); i++ ) {
+            _subs[i]->toBSON(&emBob);
         }
-        return false;
-    }
-
-    bool AllElemMatchOp::matchesSingleElement( const BSONElement& e ) const {
-        if ( e.type() != Array )
-            return false;
-
-        return _allMatch( e.Obj() );
-    }
-
-    bool AllElemMatchOp::_allMatch( const BSONObj& anArray ) const {
-        if ( _list.size() == 0 )
-            return false;
-        for ( unsigned i = 0; i < _list.size(); i++ ) {
-            if ( !static_cast<ArrayMatchingMatchExpression*>(_list[i])->matchesArray(
-                     anArray, NULL ) )
-                return false;
+        if (path().empty()) {
+            out->append("$elemMatch", emBob.obj());
         }
-        return true;
-    }
-
-
-    void AllElemMatchOp::debugString( StringBuilder& debug, int level ) const {
-        _debugAddSpace( debug, level );
-        debug << _path << " AllElemMatchOp:";
-        MatchExpression::TagData* td = getTag();
-        if (NULL != td) {
-            debug << " ";
-            td->debugString(&debug);
+        else {
+            out->append(path(), BSON("$elemMatch" << emBob.obj()));
         }
-        debug << "\n";
-        for ( size_t i = 0; i < _list.size(); i++ ) {
-            _list[i]->debugString( debug, level + 1);
-        }
-
-    }
-
-    bool AllElemMatchOp::equivalent( const MatchExpression* other ) const {
-        if ( matchType() != other->matchType() )
-            return false;
-
-        const AllElemMatchOp* realOther = static_cast<const AllElemMatchOp*>( other );
-        if ( _path != realOther->_path )
-            return false;
-
-        if ( _list.size() != realOther->_list.size() )
-            return false;
-
-        for ( unsigned i = 0; i < _list.size(); i++ )
-            if ( !_list[i]->equivalent( realOther->_list[i] ) )
-                return false;
-
-        return true;
     }
 
 
@@ -298,6 +236,10 @@ namespace mongo {
             debug << " ";
             td->debugString(&debug);
         }
+    }
+
+    void SizeMatchExpression::toBSON(BSONObjBuilder* out) const {
+        out->append(path(), BSON("$size" << _size));
     }
 
     bool SizeMatchExpression::equivalent( const MatchExpression* other ) const {

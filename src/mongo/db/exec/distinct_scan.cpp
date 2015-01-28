@@ -29,6 +29,7 @@
 #include "mongo/db/exec/distinct_scan.h"
 
 #include "mongo/db/exec/filter.h"
+#include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set_computed_data.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_cursor.h"
@@ -36,15 +37,30 @@
 
 namespace mongo {
 
-    DistinctScan::DistinctScan(const DistinctParams& params, WorkingSet* workingSet)
-        : _workingSet(workingSet),
+    using std::auto_ptr;
+    using std::vector;
+
+    // static
+    const char* DistinctScan::kStageType = "DISTINCT";
+
+    DistinctScan::DistinctScan(OperationContext* txn, const DistinctParams& params, WorkingSet* workingSet)
+        : _txn(txn),
+          _workingSet(workingSet),
           _descriptor(params.descriptor),
           _iam(params.descriptor->getIndexCatalog()->getIndex(params.descriptor)),
           _btreeCursor(NULL),
-          _hitEnd(false),
-          _params(params) { }
+          _scanState(INITIALIZING),
+          _params(params),
+          _commonStats(kStageType) {
+        _specificStats.keyPattern = _params.descriptor->keyPattern();
+        _specificStats.indexName = _params.descriptor->indexName();
+    }
 
     void DistinctScan::initIndexCursor() {
+        // This function transitions from the initializing state to CHECKING_END. If
+        // the initialization fails, however, then the state transitions to HIT_END.
+        invariant(INITIALIZING == _scanState);
+
         // Create an IndexCursor over the btree we're distinct-ing over.
         CursorOptions cursorOptions;
 
@@ -56,12 +72,11 @@ namespace mongo {
         }
 
         IndexCursor *cursor;
-        Status s = _iam->newCursor(&cursor);
+        Status s = _iam->newCursor(_txn, cursorOptions, &cursor);
         verify(s.isOK());
         verify(cursor);
         // Is this assumption always valid?  See SERVER-12397
         _btreeCursor.reset(static_cast<BtreeIndexCursor*>(cursor));
-        _btreeCursor->setOptions(cursorOptions);
 
         // Create a new bounds checker.  The bounds checker gets our start key and assists in
         // executing the scan and staying within the required bounds.
@@ -81,91 +96,118 @@ namespace mongo {
             _keyEltsInc.resize(nFields);
         }
         else {
-            _hitEnd = true;
+            _scanState = HIT_END;
+        }
+
+        // This method may throw an exception while it's doing initialization. If we've gotten
+        // here, then we've done all the initialization without an exception being thrown. This
+        // means it is safe to transition to the CHECKING_END state. In error cases, we transition
+        // to HIT_END, so we should not change state again here.
+        if (HIT_END != _scanState) {
+            _scanState = CHECKING_END;
         }
     }
 
     PlanStage::StageState DistinctScan::work(WorkingSetID* out) {
         ++_commonStats.works;
 
-        if (NULL == _btreeCursor.get()) {
-            // First call to work().  Perform cursor init.
+        // Adds the amount of time taken by work() to executionTimeMillis.
+        ScopedTimer timer(&_commonStats.executionTimeMillis);
+
+        if (INITIALIZING == _scanState) {
+            invariant(NULL == _btreeCursor.get());
             initIndexCursor();
+        }
+
+        if (CHECKING_END == _scanState) {
             checkEnd();
         }
 
-        if (isEOF()) { return PlanStage::IS_EOF; }
+        if (isEOF()) {
+            _commonStats.isEOF = true;
+            return PlanStage::IS_EOF;
+        }
 
-        // Grab the next (key, value) from the index.
-        BSONObj ownedKeyObj = _btreeCursor->getKey().getOwned();
-        DiskLoc loc = _btreeCursor->getValue();
+        if (GETTING_NEXT == _scanState) {
+            // Grab the next (key, value) from the index.
+            BSONObj ownedKeyObj = _btreeCursor->getKey().getOwned();
+            RecordId loc = _btreeCursor->getValue();
 
-        // The underlying IndexCursor points at the *next* thing we want to return.  We do this so
-        // that if we're scanning an index looking for docs to delete we don't continually clobber
-        // the thing we're pointing at.
+            // The underlying IndexCursor points at the *next* thing we want to return.  We do this
+            // so that if we're scanning an index looking for docs to delete we don't continually
+            // clobber the thing we're pointing at.
 
-        // We skip to the next value of the _params.fieldNo-th field in the index key pattern.
-        // This is the field we're distinct-ing over.
-        _btreeCursor->skip(_btreeCursor->getKey(),
-                           _params.fieldNo + 1,
-                           true,
-                           _keyElts,
-                           _keyEltsInc);
+            // We skip to the next value of the _params.fieldNo-th field in the index key pattern.
+            // This is the field we're distinct-ing over.
+            _btreeCursor->skip(_btreeCursor->getKey(),
+                               _params.fieldNo + 1,
+                               true,
+                               _keyElts,
+                               _keyEltsInc);
 
-        // And make sure we're within the bounds.
-        checkEnd();
+            // On the next call to work, make sure that the cursor is still within the bounds.
+            _scanState = CHECKING_END;
 
-        // Package up the result for the caller.
-        WorkingSetID id = _workingSet->allocate();
-        WorkingSetMember* member = _workingSet->get(id);
-        member->loc = loc;
-        member->keyData.push_back(IndexKeyDatum(_descriptor->keyPattern(), ownedKeyObj));
-        member->state = WorkingSetMember::LOC_AND_IDX;
+            // Package up the result for the caller.
+            WorkingSetID id = _workingSet->allocate();
+            WorkingSetMember* member = _workingSet->get(id);
+            member->loc = loc;
+            member->keyData.push_back(IndexKeyDatum(_descriptor->keyPattern(), ownedKeyObj));
+            member->state = WorkingSetMember::LOC_AND_IDX;
 
-        *out = id;
-        ++_commonStats.advanced;
-        return PlanStage::ADVANCED;
+            *out = id;
+            ++_commonStats.advanced;
+            return PlanStage::ADVANCED;
+        }
+
+        ++_commonStats.needTime;
+        return PlanStage::NEED_TIME;
     }
 
     bool DistinctScan::isEOF() {
-        if (NULL == _btreeCursor.get()) {
+        if (INITIALIZING == _scanState) {
             // Have to call work() at least once.
             return false;
         }
 
-        return _hitEnd || _btreeCursor->isEOF();
+        return HIT_END == _scanState || _btreeCursor->isEOF();
     }
 
-    void DistinctScan::prepareToYield() {
+    void DistinctScan::saveState() {
+        _txn = NULL;
         ++_commonStats.yields;
 
-        if (isEOF() || (NULL == _btreeCursor.get())) { return; }
+        if (HIT_END == _scanState || INITIALIZING == _scanState) { return; }
         // We save these so that we know if the cursor moves during the yield.  If it moves, we have
         // to make sure its ending position is valid w.r.t. our bounds.
-        _savedKey = _btreeCursor->getKey().getOwned();
-        _savedLoc = _btreeCursor->getValue();
+        if (!_btreeCursor->isEOF()) {
+            _savedKey = _btreeCursor->getKey().getOwned();
+            _savedLoc = _btreeCursor->getValue();
+        }
         _btreeCursor->savePosition();
     }
 
-    void DistinctScan::recoverFromYield() {
+    void DistinctScan::restoreState(OperationContext* opCtx) {
+        invariant(_txn == NULL);
+        _txn = opCtx;
         ++_commonStats.unyields;
 
-        if (isEOF() || (NULL == _btreeCursor.get())) { return; }
+        if (HIT_END == _scanState || INITIALIZING == _scanState) { return; }
 
         // We can have a valid position before we check isEOF(), restore the position, and then be
         // EOF upon restore.
-        if (!_btreeCursor->restorePosition().isOK() || _btreeCursor->isEOF()) {
-            _hitEnd = true;
+        if (!_btreeCursor->restorePosition( opCtx ).isOK() || _btreeCursor->isEOF()) {
+            _scanState = HIT_END;
             return;
         }
 
         if (!_savedKey.binaryEqual(_btreeCursor->getKey()) || _savedLoc != _btreeCursor->getValue()) {
             // Our restored position might be past endKey, see if we've hit the end.
-            checkEnd();
+            _scanState = CHECKING_END;
         }
     }
 
-    void DistinctScan::invalidate(const DiskLoc& dl, InvalidationType type) {
+    void DistinctScan::invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type) {
         ++_commonStats.invalidates;
     }
 
@@ -176,36 +218,39 @@ namespace mongo {
         }
 
         // Use _checker to see how things are.
-        for (;;) {
-            IndexBoundsChecker::KeyState keyState;
-            keyState = _checker->checkKey(_btreeCursor->getKey(),
-                                          &_keyEltsToUse,
-                                          &_movePastKeyElts,
-                                          &_keyElts,
-                                          &_keyEltsInc);
+        IndexBoundsChecker::KeyState keyState;
+        keyState = _checker->checkKey(_btreeCursor->getKey(),
+                                      &_keyEltsToUse,
+                                      &_movePastKeyElts,
+                                      &_keyElts,
+                                      &_keyEltsInc);
 
-            if (IndexBoundsChecker::DONE == keyState) {
-                _hitEnd = true;
-                break;
-            }
-
-            // This seems weird but it's the old definition of nscanned.
-            ++_specificStats.keysExamined;
-
-            if (IndexBoundsChecker::VALID == keyState) {
-                break;
-            }
-
-            verify(IndexBoundsChecker::MUST_ADVANCE == keyState);
-            _btreeCursor->skip(_btreeCursor->getKey(), _keyEltsToUse, _movePastKeyElts,
-                               _keyElts, _keyEltsInc);
-
-            // Must check underlying cursor EOF after every cursor movement.
-            if (_btreeCursor->isEOF()) {
-                _hitEnd = true;
-                break;
-            }
+        if (IndexBoundsChecker::DONE == keyState) {
+            _scanState = HIT_END;
+            return;
         }
+
+        // This seems weird but it's the old definition of nscanned.
+        ++_specificStats.keysExamined;
+
+        if (IndexBoundsChecker::VALID == keyState) {
+            _scanState = GETTING_NEXT;
+            return;
+        }
+
+        verify(IndexBoundsChecker::MUST_ADVANCE == keyState);
+        _btreeCursor->skip(_btreeCursor->getKey(), _keyEltsToUse, _movePastKeyElts,
+                           _keyElts, _keyEltsInc);
+
+        // Must check underlying cursor EOF after every cursor movement.
+        if (_btreeCursor->isEOF()) {
+            _scanState = HIT_END;
+        }
+    }
+
+    vector<PlanStage*> DistinctScan::getChildren() const {
+        vector<PlanStage*> empty;
+        return empty;
     }
 
     PlanStageStats* DistinctScan::getStats() {
@@ -213,6 +258,14 @@ namespace mongo {
         auto_ptr<PlanStageStats> ret(new PlanStageStats(_commonStats, STAGE_DISTINCT));
         ret->specific.reset(new DistinctScanStats(_specificStats));
         return ret.release();
+    }
+
+    const CommonStats* DistinctScan::getCommonStats() {
+        return &_commonStats;
+    }
+
+    const SpecificStats* DistinctScan::getSpecificStats() {
+        return &_specificStats;
     }
 
 }  // namespace mongo

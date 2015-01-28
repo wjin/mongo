@@ -26,15 +26,21 @@
  *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+
 #include "mongo/db/query/index_bounds_builder.h"
 
 #include <limits>
+
+#include "mongo/base/string_data.h"
 #include "mongo/db/geo/geoconstants.h"
-#include "mongo/db/geo/s2common.h"
-#include "mongo/db/index/expression_index.h"
 #include "mongo/db/matcher/expression_geo.h"
+#include "mongo/db/query/expression_index.h"
+#include "mongo/db/query/expression_index_knobs.h"
 #include "mongo/db/query/indexability.h"
 #include "mongo/db/query/qlog.h"
+#include "mongo/db/query/query_knobs.h"
+#include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/db/geo/s2.h"
 #include "third_party/s2/s2cell.h"
@@ -60,6 +66,11 @@ namespace mongo {
             return r;
         }
 
+        // A regex with the "|" character is never considered a simple regular expression.
+        if (StringData(regex).find('|') != std::string::npos) {
+            return "";
+        }
+
         bool extended = false;
         while (*flags) {
             switch (*(flags++)) {
@@ -80,15 +91,15 @@ namespace mongo {
 
         while(*regex) {
             char c = *(regex++);
+
+            // We should have bailed out early above if '|' is in the regex.
+            invariant(c != '|');
+
             if ( c == '*' || c == '?' ) {
                 // These are the only two symbols that make the last char optional
                 r = ss;
                 r = r.substr( 0 , r.size() - 1 );
                 return r; //breaking here fails with /^a?/
-            }
-            else if (c == '|') {
-                // whole match so far is optional. Nothing we can do here.
-                return string();
             }
             else if (c == '\\') {
                 c = *(regex++);
@@ -197,7 +208,14 @@ namespace mongo {
                                                const IndexEntry& index,
                                                OrderedIntervalList* oilOut,
                                                BoundsTightness* tightnessOut) {
-        translate(expr, elt, index, oilOut, tightnessOut);
+        OrderedIntervalList arg;
+        translate(expr, elt, index, &arg, tightnessOut);
+
+        // Append the new intervals to oilOut.
+        oilOut->intervals.insert(oilOut->intervals.end(), arg.intervals.begin(),
+                                 arg.intervals.end());
+
+        // Union the appended intervals with the existing ones.
         unionize(oilOut);
     }
 
@@ -216,6 +234,9 @@ namespace mongo {
                                        const IndexEntry& index,
                                        OrderedIntervalList* oilOut,
                                        BoundsTightness* tightnessOut) {
+        // We expect that the OIL we are constructing starts out empty.
+        invariant(oilOut->intervals.empty());
+
         oilOut->name = elt.fieldName();
 
         bool isHashed = false;
@@ -254,6 +275,9 @@ namespace mongo {
             *tightnessOut = IndexBoundsBuilder::INEXACT_FETCH;
         }
         else if (MatchExpression::NOT == expr->matchType()) {
+            // A NOT is indexed by virtue of its child. If we're here then the NOT's child
+            // must be a kind of node for which we can index negations. It can't be things like
+            // $mod, $regex, or $type.
             MatchExpression* child = expr->getChild(0);
 
             // If we have a NOT -> EXISTS, we must handle separately.
@@ -265,32 +289,20 @@ namespace mongo {
                 bob.appendNull("");
                 BSONObj dataObj = bob.obj();
                 oilOut->intervals.push_back(makeRangeInterval(dataObj, true, true));
-                
+
                 *tightnessOut = IndexBoundsBuilder::INEXACT_FETCH;
                 return;
             }
-            else if (Indexability::nodeCanUseIndexOnOwnField(child)) {
-                // We have a NOT of a bounds-generating expression. Get the
-                // bounds of the NOT's child and then complement them.
-                translate(expr->getChild(0), elt, index, oilOut, tightnessOut);
-                oilOut->complement();
 
-                // If the index is multikey, it doesn't matter what the tightness
-                // of the child is, we must return INEXACT_FETCH. Consider a multikey
-                // index on 'a' with document {a: [1, 2, 3]} and query {a: {$ne: 3}}.
-                // If we treated the bounds [MinKey, 3), (3, MaxKey] as exact, then
-                // we would erroneously return the document!
-                if (index.multikey) {
-                    *tightnessOut = INEXACT_FETCH;
-                }
-            }
-            else {
-                // TODO: In the future we shouldn't need this. We handle this case for the time
-                // being because we have some deficiencies in tree normalization (see SERVER-12735).
-                //
-                // For example, we will get here if there is an index {a: 1}
-                // and the query is {a: {$elemMatch: {$not: {$gte: 6}}}}.
-                oilOut->intervals.push_back(allValues());
+            translate(child, elt, index, oilOut, tightnessOut);
+            oilOut->complement();
+
+            // If the index is multikey, it doesn't matter what the tightness
+            // of the child is, we must return INEXACT_FETCH. Consider a multikey
+            // index on 'a' with document {a: [1, 2, 3]} and query {a: {$ne: 3}}.
+            // If we treated the bounds [MinKey, 3), (3, MaxKey] as exact, then
+            // we would erroneously return the document!
+            if (index.multikey) {
                 *tightnessOut = INEXACT_FETCH;
             }
         }
@@ -562,17 +574,31 @@ namespace mongo {
             unionize(oilOut);
         }
         else if (MatchExpression::GEO == expr->matchType()) {
+
             const GeoMatchExpression* gme = static_cast<const GeoMatchExpression*>(expr);
-            // Can only do this for 2dsphere.
-            if (!mongoutils::str::equals("2dsphere", elt.valuestrsafe())) {
-                warning() << "Planner error, trying to build geo bounds for non-2dsphere"
-                          << " index element: "  << elt.toString() << endl;
+
+            if (mongoutils::str::equals("2dsphere", elt.valuestrsafe())) {
+                verify(gme->getGeoExpression().getGeometry().hasS2Region());
+                const S2Region& region = gme->getGeoExpression().getGeometry().getS2Region();
+                ExpressionMapping::cover2dsphere(region, index.infoObj, oilOut);
+                *tightnessOut = IndexBoundsBuilder::INEXACT_FETCH;
+            }
+            else if (mongoutils::str::equals("2d", elt.valuestrsafe())) {
+                verify(gme->getGeoExpression().getGeometry().hasR2Region());
+                const R2Region& region = gme->getGeoExpression().getGeometry().getR2Region();
+
+                ExpressionMapping::cover2d(region,
+                                           index.infoObj,
+                                           internalGeoPredicateQuery2DMaxCoveringCells,
+                                           oilOut);
+
+                *tightnessOut = IndexBoundsBuilder::INEXACT_FETCH;
+            }
+            else {
+                warning() << "Planner error trying to build geo bounds for " << elt.toString()
+                          << " index element.";
                 verify(0);
             }
-
-            const S2Region& region = gme->getGeoQuery().getRegion();
-            ExpressionMapping::cover2dsphere(region, index.infoObj, oilOut);
-            *tightnessOut = IndexBoundsBuilder::INEXACT_FETCH;
         }
         else {
             warning() << "Planner error, trying to build bounds for expression: "
@@ -881,7 +907,7 @@ namespace mongo {
         }
 
         if (!bounds->isValidFor(kp, scanDir)) {
-            QLOG() << "INVALID BOUNDS: " << bounds->toString() << endl
+            log() << "INVALID BOUNDS: " << bounds->toString() << endl
                    << "kp = " << kp.toString() << endl
                    << "scanDir = " << scanDir << endl;
             verify(0);

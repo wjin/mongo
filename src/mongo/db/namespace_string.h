@@ -70,6 +70,23 @@ namespace mongo {
          */
         NamespaceString( const StringData& dbName, const StringData& collectionName );
 
+        /**
+         * Note that these values are derived from the mmap_v1 implementation and that
+         * is the only reason they are constrained as such.
+         */
+        enum MaxNsLenValue {
+            // Maximum possible length of name any namespace, including special ones like $extra.
+            // This includes rum for the NUL byte so it can be used when sizing buffers.
+            MaxNsLenWithNUL = 128,
+
+            // MaxNsLenWithNUL excluding the NUL byte. Use this when comparing std::string lengths.
+            MaxNsLen = MaxNsLenWithNUL - 1,
+
+            // Maximum allowed length of fully qualified namespace name of any real collection.
+            // Does not include NUL so it can be directly compared to std::string lengths.
+            MaxNsCollectionLen = MaxNsLen - 7/*strlen(".$extra")*/,
+        };
+
         StringData db() const;
         StringData coll() const;
 
@@ -80,6 +97,10 @@ namespace mongo {
 
         size_t size() const { return _ns.size(); }
 
+        //
+        // The following methods assume isValid() is true for this NamespaceString.
+        //
+
         bool isSystem() const { return coll().startsWith( "system." ); }
         bool isSystemDotIndexes() const { return coll() == "system.indexes"; }
         bool isConfigDB() const { return db() == "config"; }
@@ -88,6 +109,14 @@ namespace mongo {
         bool isSpecialCommand() const { return coll().startsWith("$cmd.sys"); }
         bool isSpecial() const { return special( _ns ); }
         bool isNormal() const { return normal( _ns ); }
+        bool isListCollectionsGetMore() const;
+        bool isListIndexesGetMore() const;
+
+        /**
+         * Given a NamespaceString for which isListIndexesGetMore() returns true, returns the
+         * NamespaceString for the collection that the "listIndexesGetMore" targets.
+         */
+        NamespaceString getTargetNSForListIndexesGetMore() const;
 
         /**
          * @return true if the namespace is valid. Special namespaces for internal use are considered as valid.
@@ -95,6 +124,7 @@ namespace mongo {
         bool isValid() const { return validDBName( db() ) && !coll().empty(); }
 
         bool operator==( const std::string& nsIn ) const { return nsIn == _ns; }
+        bool operator==( const StringData& nsIn ) const { return nsIn == _ns; }
         bool operator==( const NamespaceString& nsIn ) const { return nsIn._ns == _ns; }
 
         bool operator!=( const std::string& nsIn ) const { return nsIn != _ns; }
@@ -204,10 +234,35 @@ namespace mongo {
         return ns.substr( i + 1 );
     }
 
+    /**
+     * foo = false
+     * foo. = false
+     * foo.a = true
+     */
+    inline bool nsIsFull( const StringData& ns ) {
+        size_t i = ns.find( '.' );
+        if ( i == std::string::npos )
+            return false;
+        if ( i == ns.size() - 1 )
+            return false;
+        return true;
+    }
+
+    /**
+     * foo = true
+     * foo. = false
+     * foo.a = false
+     */
+    inline bool nsIsDbOnly(const StringData& ns) {
+        size_t i = ns.find('.');
+        if (i == std::string::npos)
+            return true;
+        return false;
+    }
 
     /**
      * NamespaceDBHash and NamespaceDBEquals allow you to do something like
-     * unordered_map<string,int,NamespaceDBHash,NamespaceDBEquals>
+     * unordered_map<std::string,int,NamespaceDBHash,NamespaceDBEquals>
      * and use the full namespace for the string
      * but comparisons are done only on the db piece
      */

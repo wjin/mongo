@@ -28,11 +28,20 @@
 
 #include "mongo/db/exec/merge_sort.h"
 
+#include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
+
+    using std::auto_ptr;
+    using std::list;
+    using std::string;
+    using std::vector;
+
+    // static
+    const char* MergeSortStage::kStageType = "SORT_MERGE";
 
     MergeSortStage::MergeSortStage(const MergeSortStageParams& params,
                                    WorkingSet* ws,
@@ -41,7 +50,8 @@ namespace mongo {
           _ws(ws),
           _pattern(params.pattern),
           _dedup(params.dedup),
-          _merging(StageWithValueComparison(ws, params.pattern)) { }
+          _merging(StageWithValueComparison(ws, params.pattern)),
+          _commonStats(kStageType) { }
 
     MergeSortStage::~MergeSortStage() {
         for (size_t i = 0; i < _children.size(); ++i) { delete _children[i]; }
@@ -63,6 +73,9 @@ namespace mongo {
     PlanStage::StageState MergeSortStage::work(WorkingSetID* out) {
         ++_commonStats.works;
 
+        // Adds the amount of time taken by work() to executionTimeMillis.
+        ScopedTimer timer(&_commonStats.executionTimeMillis);
+
         if (isEOF()) { return PlanStage::IS_EOF; }
 
         if (!_noResultToMerge.empty()) {
@@ -78,13 +91,13 @@ namespace mongo {
                     WorkingSetMember* member = _ws->get(id);
 
                     if (!member->hasLoc()) {
-                        // Can't dedup data unless there's a DiskLoc.  We go ahead and use its
+                        // Can't dedup data unless there's a RecordId.  We go ahead and use its
                         // result.
                         _noResultToMerge.pop();
                     }
                     else {
                         ++_specificStats.dupsTested;
-                        // ...and there's a diskloc and and we've seen the DiskLoc before
+                        // ...and there's a diskloc and and we've seen the RecordId before
                         if (_seen.end() != _seen.find(member->loc)) {
                             // ...drop it.
                             _ws->free(id);
@@ -140,13 +153,14 @@ namespace mongo {
                 return code;
             }
             else {
-                if (PlanStage::NEED_FETCH == code) {
+                if (PlanStage::NEED_TIME == code) {
+                    ++_commonStats.needTime;
+                }
+                else if (PlanStage::NEED_FETCH == code) {
                     *out = id;
                     ++_commonStats.needFetch;
                 }
-                else if (PlanStage::NEED_TIME == code) {
-                    ++_commonStats.needTime;
-                }
+
                 return code;
             }
         }
@@ -172,31 +186,32 @@ namespace mongo {
 
         // But don't return it if it's flagged.
         if (_ws->isFlagged(*out)) {
-            _ws->free(*out);
             return PlanStage::NEED_TIME;
         }
 
         return PlanStage::ADVANCED;
     }
 
-    void MergeSortStage::prepareToYield() {
+    void MergeSortStage::saveState() {
         ++_commonStats.yields;
         for (size_t i = 0; i < _children.size(); ++i) {
-            _children[i]->prepareToYield();
+            _children[i]->saveState();
         }
     }
 
-    void MergeSortStage::recoverFromYield() {
+    void MergeSortStage::restoreState(OperationContext* opCtx) {
         ++_commonStats.unyields;
         for (size_t i = 0; i < _children.size(); ++i) {
-            _children[i]->recoverFromYield();
+            _children[i]->restoreState(opCtx);
         }
     }
 
-    void MergeSortStage::invalidate(const DiskLoc& dl, InvalidationType type) {
+    void MergeSortStage::invalidate(OperationContext* txn,
+                                    const RecordId& dl,
+                                    InvalidationType type) {
         ++_commonStats.invalidates;
         for (size_t i = 0; i < _children.size(); ++i) {
-            _children[i]->invalidate(dl, type);
+            _children[i]->invalidate(txn, dl, type);
         }
 
         // Go through our data and see if we're holding on to the invalidated loc.
@@ -204,7 +219,7 @@ namespace mongo {
             WorkingSetMember* member = _ws->get(valueIt->id);
             if (member->hasLoc() && (dl == member->loc)) {
                 // Force a fetch and flag.  We could possibly merge this result back in later.
-                WorkingSetCommon::fetchAndInvalidateLoc(member, _collection);
+                WorkingSetCommon::fetchAndInvalidateLoc(txn, member, _collection);
                 _ws->flagForReview(valueIt->id);
                 ++_specificStats.forcedFetches;
             }
@@ -246,8 +261,14 @@ namespace mongo {
         return false;
     }
 
+    vector<PlanStage*> MergeSortStage::getChildren() const {
+        return _children;
+    }
+
     PlanStageStats* MergeSortStage::getStats() {
         _commonStats.isEOF = isEOF();
+
+        _specificStats.sortPattern = _pattern;
 
         auto_ptr<PlanStageStats> ret(new PlanStageStats(_commonStats, STAGE_SORT_MERGE));
         ret->specific.reset(new MergeSortStats(_specificStats));
@@ -255,6 +276,14 @@ namespace mongo {
             ret->children.push_back(_children[i]->getStats());
         }
         return ret.release();
+    }
+
+    const CommonStats* MergeSortStage::getCommonStats() {
+        return &_commonStats;
+    }
+
+    const SpecificStats* MergeSortStage::getSpecificStats() {
+        return &_specificStats;
     }
 
 }  // namespace mongo

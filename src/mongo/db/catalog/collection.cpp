@@ -1,7 +1,7 @@
 // collection.cpp
 
 /**
-*    Copyright (C) 2013 10gen Inc.
+*    Copyright (C) 2013-2014 MongoDB Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -28,32 +28,39 @@
 *    it in the license file.
 */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/catalog/collection.h"
+
+#include <boost/scoped_ptr.hpp>
 
 #include "mongo/base/counter.h"
 #include "mongo/base/owned_pointer_map.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/curop.h"
-#include "mongo/db/catalog/database.h"
+#include "mongo/db/catalog/collection_catalog_entry.h"
+#include "mongo/db/catalog/database_catalog_entry.h"
 #include "mongo/db/catalog/index_create.h"
-#include "mongo/db/dbhelpers.h"
 #include "mongo/db/index/index_access_method.h"
-#include "mongo/db/ops/update.h"
-#include "mongo/db/storage/transaction.h"
-#include "mongo/db/structure/catalog/namespace_details.h"
-#include "mongo/db/structure/catalog/namespace_details_rsv1_metadata.h"
-#include "mongo/db/structure/record_store_v1_capped.h"
-#include "mongo/db/structure/record_store_v1_simple.h"
-#include "mongo/db/repl/rs.h"
-#include "mongo/db/storage/extent.h"
-#include "mongo/db/storage/extent_manager.h"
-#include "mongo/db/storage/mmap_v1/mmap_v1_extent_manager.h"
-#include "mongo/db/storage/record.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/storage/mmap_v1/mmap_v1_options.h"
+#include "mongo/db/storage/record_fetcher.h"
 
 #include "mongo/db/auth/user_document_parser.h" // XXX-ANDY
+#include "mongo/util/log.h"
 
 namespace mongo {
+
+    using boost::scoped_ptr;
+    using std::endl;
+    using std::string;
+    using std::vector;
+
+    using logger::LogComponent;
 
     std::string CompactOptions::toString() const {
         std::stringstream ss;
@@ -76,35 +83,23 @@ namespace mongo {
 
     // ----
 
-    Collection::Collection( TransactionExperiment* txn,
+    Collection::Collection( OperationContext* txn,
                             const StringData& fullNS,
-                            NamespaceDetails* details,
-                            Database* database )
+                            CollectionCatalogEntry* details,
+                            RecordStore* recordStore,
+                            DatabaseCatalogEntry* dbce )
         : _ns( fullNS ),
+          _details( details ),
+          _recordStore( recordStore ),
+          _dbce( dbce ),
           _infoCache( this ),
-          _indexCatalog( this, details ),
-          _cursorCache( fullNS ) {
-
-        _details = details;
-        _database = database;
-
-        if ( details->isCapped() ) {
-            _recordStore.reset( new CappedRecordStoreV1( txn,
-                                                         this,
-                                                         _ns.ns(),
-                                                         new NamespaceDetailsRSV1MetaData( details ),
-                                                         database->getExtentManager(),
-                                                         _ns.coll() == "system.indexes" ) );
-        }
-        else {
-            _recordStore.reset( new SimpleRecordStoreV1( txn,
-                                                         _ns.ns(),
-                                                         new NamespaceDetailsRSV1MetaData( details ),
-                                                         database->getExtentManager(),
-                                                         _ns.coll() == "system.indexes" ) );
-        }
+          _indexCatalog( this ),
+          _cursorManager( fullNS ) {
         _magic = 1357924;
         _indexCatalog.init(txn);
+        if ( isCapped() )
+            _recordStore->setCappedDeleteCallback( this );
+        _infoCache.reset(txn);
     }
 
     Collection::~Collection() {
@@ -119,10 +114,13 @@ namespace mongo {
             return false;
         }
 
-        if ( _ns == _database->_namespacesName ||
-             _ns == _database->_indexesName ||
-             _ns == _database->_profileName ) {
-            return false;
+        if ( _ns.isSystem() ) {
+            StringData shortName = _ns.coll().substr( _ns.coll().find( '.' )  + 1 );
+            if ( shortName == "indexes" ||
+                 shortName == "namespaces" ||
+                 shortName == "profile" ) {
+                return false;
+            }
         }
 
         if ( _ns.db() == "local" ) {
@@ -139,24 +137,29 @@ namespace mongo {
         return true;
     }
 
-    RecordIterator* Collection::getIterator( const DiskLoc& start, bool tailable,
-                                                     const CollectionScanParams::Direction& dir) const {
+    RecordIterator* Collection::getIterator( OperationContext* txn,
+                                             const RecordId& start,
+                                             const CollectionScanParams::Direction& dir) const {
+        dassert(txn->lockState()->isCollectionLockedForMode(ns().toString(), MODE_IS));
         invariant( ok() );
-        return _recordStore->getIterator( start, tailable, dir );
+
+        return _recordStore->getIterator( txn, start, dir );
     }
 
-    vector<RecordIterator*> Collection::getManyIterators() const {
-        return _recordStore->getManyIterators();
+    vector<RecordIterator*> Collection::getManyIterators( OperationContext* txn ) const {
+        dassert(txn->lockState()->isCollectionLockedForMode(ns().toString(), MODE_IS));
+
+        return _recordStore->getManyIterators(txn);
     }
 
-    int64_t Collection::countTableScan( const MatchExpression* expression ) {
-        scoped_ptr<RecordIterator> iterator( getIterator( DiskLoc(),
-                                                              false,
-                                                              CollectionScanParams::FORWARD ) );
+    int64_t Collection::countTableScan( OperationContext* txn, const MatchExpression* expression ) {
+        scoped_ptr<RecordIterator> iterator( getIterator( txn,
+                                                          RecordId(),
+                                                          CollectionScanParams::FORWARD ) );
         int64_t count = 0;
         while ( !iterator->isEOF() ) {
-            DiskLoc loc = iterator->getNext();
-            BSONObj obj = docFor( loc );
+            RecordId loc = iterator->getNext();
+            BSONObj obj = docFor( txn, loc );
             if ( expression->matchesBSON( obj ) )
                 count++;
         }
@@ -164,125 +167,134 @@ namespace mongo {
         return count;
     }
 
-    BSONObj Collection::docFor(const DiskLoc& loc) const {
-        Record* rec = _recordStore->recordFor( loc );
-        return BSONObj( rec->data() );
+    BSONObj Collection::docFor(OperationContext* txn, const RecordId& loc) const {
+        return  _recordStore->dataFor( txn, loc ).releaseToBson();
     }
 
-    StatusWith<DiskLoc> Collection::insertDocument( TransactionExperiment* txn,
+    bool Collection::findDoc(OperationContext* txn, const RecordId& loc, BSONObj* out) const {
+        dassert(txn->lockState()->isCollectionLockedForMode(ns().toString(), MODE_IS));
+
+        RecordData rd;
+        if ( !_recordStore->findRecord( txn, loc, &rd ) )
+            return false;
+        *out = rd.releaseToBson();
+        return true;
+    }
+
+    StatusWith<RecordId> Collection::insertDocument( OperationContext* txn,
                                                     const DocWriter* doc,
                                                     bool enforceQuota ) {
-        verify( _indexCatalog.numIndexesTotal() == 0 ); // eventually can implement, just not done
+        dassert(txn->lockState()->isCollectionLockedForMode(ns().toString(), MODE_IX));
+        invariant( !_indexCatalog.haveAnyIndexes() ); // eventually can implement, just not done
 
-        StatusWith<DiskLoc> loc = _recordStore->insertRecord( txn,
+        StatusWith<RecordId> loc = _recordStore->insertRecord( txn,
                                                               doc,
-                                                              enforceQuota
-                                                                 ? largestFileNumberInQuota()
-                                                                 : 0 );
+                                                              _enforceQuota( enforceQuota ) );
         if ( !loc.isOK() )
             return loc;
 
-        return StatusWith<DiskLoc>( loc );
+        return StatusWith<RecordId>( loc );
     }
 
-    StatusWith<DiskLoc> Collection::insertDocument( TransactionExperiment* txn,
+    StatusWith<RecordId> Collection::insertDocument( OperationContext* txn,
                                                     const BSONObj& docToInsert,
                                                     bool enforceQuota ) {
-        if ( _indexCatalog.findIdIndex() ) {
+
+        uint64_t txnId = txn->recoveryUnit()->getMyTransactionCount();
+
+        if ( _indexCatalog.findIdIndex( txn ) ) {
             if ( docToInsert["_id"].eoo() ) {
-                return StatusWith<DiskLoc>( ErrorCodes::InternalError,
+                return StatusWith<RecordId>( ErrorCodes::InternalError,
                                             str::stream() << "Collection::insertDocument got "
                                             "document without _id for ns:" << _ns.ns() );
             }
         }
 
-        if ( _details->isCapped() ) {
-            // TOOD: old god not done
-            Status ret = _indexCatalog.checkNoIndexConflicts( docToInsert );
-            if ( !ret.isOK() )
-                return StatusWith<DiskLoc>( ret );
-        }
-
-        StatusWith<DiskLoc> status = _insertDocument( txn, docToInsert, enforceQuota );
-        if ( status.isOK() ) {
-            _details->paddingFits();
-        }
-
-        return status;
+        StatusWith<RecordId> res = _insertDocument( txn, docToInsert, enforceQuota );
+        invariant( txnId == txn->recoveryUnit()->getMyTransactionCount() );
+        return res;
     }
 
-    StatusWith<DiskLoc> Collection::insertDocument( TransactionExperiment* txn,
+    StatusWith<RecordId> Collection::insertDocument( OperationContext* txn,
                                                     const BSONObj& doc,
-                                                    MultiIndexBlock& indexBlock ) {
-        StatusWith<DiskLoc> loc = _recordStore->insertRecord( txn,
+                                                    MultiIndexBlock* indexBlock,
+                                                    bool enforceQuota ) {
+        dassert(txn->lockState()->isCollectionLockedForMode(ns().toString(), MODE_IX));
+
+        StatusWith<RecordId> loc = _recordStore->insertRecord( txn,
                                                               doc.objdata(),
                                                               doc.objsize(),
-                                                              0 );
+                                                              _enforceQuota(enforceQuota) );
 
         if ( !loc.isOK() )
             return loc;
 
-        InsertDeleteOptions indexOptions;
-        indexOptions.logIfError = false;
-        indexOptions.dupsAllowed = true; // in repair we should be doing no checking
-
-        Status status = indexBlock.insert( doc, loc.getValue(), indexOptions );
+        Status status = indexBlock->insert( doc, loc.getValue() );
         if ( !status.isOK() )
-            return StatusWith<DiskLoc>( status );
+            return StatusWith<RecordId>( status );
 
         return loc;
     }
 
+    RecordFetcher* Collection::documentNeedsFetch( OperationContext* txn,
+                                                   const RecordId& loc ) const {
+        return _recordStore->recordNeedsFetch( txn, loc );
+    }
 
-    StatusWith<DiskLoc> Collection::_insertDocument( TransactionExperiment* txn,
+
+    StatusWith<RecordId> Collection::_insertDocument( OperationContext* txn,
                                                      const BSONObj& docToInsert,
                                                      bool enforceQuota ) {
+        dassert(txn->lockState()->isCollectionLockedForMode(ns().toString(), MODE_IX));
 
         // TODO: for now, capped logic lives inside NamespaceDetails, which is hidden
         //       under the RecordStore, this feels broken since that should be a
         //       collection access method probably
 
-        StatusWith<DiskLoc> loc = _recordStore->insertRecord( txn,
+        StatusWith<RecordId> loc = _recordStore->insertRecord( txn,
                                                               docToInsert.objdata(),
                                                               docToInsert.objsize(),
-                                                              enforceQuota ? largestFileNumberInQuota() : 0 );
+                                                              _enforceQuota( enforceQuota ) );
         if ( !loc.isOK() )
             return loc;
 
+        invariant( RecordId::min() < loc.getValue() );
+        invariant( loc.getValue() < RecordId::max() );
+
         _infoCache.notifyOfWriteOp();
 
-        try {
-            _indexCatalog.indexRecord(txn, docToInsert, loc.getValue());
-        }
-        catch ( AssertionException& e ) {
-            if ( _details->isCapped() ) {
-                return StatusWith<DiskLoc>( ErrorCodes::InternalError,
-                                            str::stream() << "unexpected index insertion failure on"
-                                            << " capped collection" << e.toString()
-                                            << " - collection and its index will not match" );
-            }
-
-            // indexRecord takes care of rolling back indexes
-            // so we just have to delete the main storage
-            _recordStore->deleteRecord( txn, loc.getValue() );
-            return StatusWith<DiskLoc>( e.toStatus( "insertDocument" ) );
-        }
+        Status s = _indexCatalog.indexRecord(txn, docToInsert, loc.getValue());
+        if (!s.isOK())
+            return StatusWith<RecordId>(s);
 
         return loc;
     }
 
-    void Collection::deleteDocument( TransactionExperiment* txn,
-                                     const DiskLoc& loc,
+    Status Collection::aboutToDeleteCapped( OperationContext* txn,
+                                            const RecordId& loc,
+                                            RecordData data ) {
+
+        /* check if any cursors point to us.  if so, advance them. */
+        _cursorManager.invalidateDocument(txn, loc, INVALIDATION_DELETION);
+
+        BSONObj doc = data.releaseToBson();
+        _indexCatalog.unindexRecord(txn, doc, loc, false);
+
+        return Status::OK();
+    }
+
+    void Collection::deleteDocument( OperationContext* txn,
+                                     const RecordId& loc,
                                      bool cappedOK,
                                      bool noWarn,
                                      BSONObj* deletedId ) {
-        if ( _details->isCapped() && !cappedOK ) {
+        if ( isCapped() && !cappedOK ) {
             log() << "failing remove on a capped ns " << _ns << endl;
             uasserted( 10089,  "cannot remove from a capped collection" );
             return;
         }
 
-        BSONObj doc = docFor( loc );
+        BSONObj doc = docFor( txn, loc );
 
         if ( deletedId ) {
             BSONElement e = doc["_id"];
@@ -292,7 +304,7 @@ namespace mongo {
         }
 
         /* check if any cursors point to us.  if so, advance them. */
-        _cursorCache.invalidateDocument(loc, INVALIDATION_DELETION);
+        _cursorManager.invalidateDocument(txn, loc, INVALIDATION_DELETION);
 
         _indexCatalog.unindexRecord(txn, doc, loc, noWarn);
 
@@ -304,69 +316,68 @@ namespace mongo {
     Counter64 moveCounter;
     ServerStatusMetricField<Counter64> moveCounterDisplay( "record.moves", &moveCounter );
 
-    StatusWith<DiskLoc> Collection::updateDocument( TransactionExperiment* txn,
-                                                    const DiskLoc& oldLocation,
-                                                    const BSONObj& objNew,
-                                                    bool enforceQuota,
-                                                    OpDebug* debug ) {
+    StatusWith<RecordId> Collection::updateDocument( OperationContext* txn,
+                                                     const RecordId& oldLocation,
+                                                     const BSONObj& objOld,
+                                                     const BSONObj& objNew,
+                                                     bool enforceQuota,
+                                                     bool indexesAffected,
+                                                     OpDebug* debug ) {
+        dassert(txn->lockState()->isCollectionLockedForMode(ns().toString(), MODE_IX));
 
-        Record* oldRecord = _recordStore->recordFor( oldLocation );
-        BSONObj objOld( oldRecord->data() );
+        uint64_t txnId = txn->recoveryUnit()->getMyTransactionCount();
 
-        if ( objOld.hasElement( "_id" ) ) {
-            BSONElement oldId = objOld["_id"];
-            BSONElement newId = objNew["_id"];
-            if ( oldId != newId )
-                return StatusWith<DiskLoc>( ErrorCodes::InternalError,
-                                            "in Collection::updateDocument _id mismatch",
-                                            13596 );
-        }
+        BSONElement oldId = objOld["_id"];
+        if ( !oldId.eoo() && ( oldId != objNew["_id"] ) )
+            return StatusWith<RecordId>( ErrorCodes::InternalError,
+                                         "in Collection::updateDocument _id mismatch",
+                                         13596 );
 
-        if ( ns().coll() == "system.users" ) {
-            // XXX - andy and spencer think this should go away now
-            V2UserDocumentParser parser;
-            Status s = parser.checkValidUserDocument(objNew);
-            if ( !s.isOK() )
-                return StatusWith<DiskLoc>( s );
-        }
-
-        /* duplicate key check. we descend the btree twice - once for this check, and once for the actual inserts, further
-           below.  that is suboptimal, but it's pretty complicated to do it the other way without rollbacks...
-        */
+        // At the end of this step, we will have a map of UpdateTickets, one per index, which
+        // represent the index updates needed to be done, based on the changes between objOld and
+        // objNew.
         OwnedPointerMap<IndexDescriptor*,UpdateTicket> updateTickets;
-        IndexCatalog::IndexIterator ii = _indexCatalog.getIndexIterator( true );
-        while ( ii.more() ) {
-            IndexDescriptor* descriptor = ii.next();
-            IndexAccessMethod* iam = _indexCatalog.getIndex( descriptor );
+        if ( indexesAffected ) {
+            IndexCatalog::IndexIterator ii = _indexCatalog.getIndexIterator( txn, true );
+            while ( ii.more() ) {
+                IndexDescriptor* descriptor = ii.next();
+                IndexAccessMethod* iam = _indexCatalog.getIndex( descriptor );
 
-            InsertDeleteOptions options;
-            options.logIfError = false;
-            options.dupsAllowed =
-                !(KeyPattern::isIdKeyPattern(descriptor->keyPattern()) || descriptor->unique())
-                || ignoreUniqueIndex(descriptor);
-            UpdateTicket* updateTicket = new UpdateTicket();
-            updateTickets.mutableMap()[descriptor] = updateTicket;
-            Status ret = iam->validateUpdate(objOld, objNew, oldLocation, options, updateTicket );
-            if ( !ret.isOK() ) {
-                return StatusWith<DiskLoc>( ret );
+                InsertDeleteOptions options;
+                options.logIfError = false;
+                options.dupsAllowed =
+                    !(KeyPattern::isIdKeyPattern(descriptor->keyPattern()) || descriptor->unique())
+                    || repl::getGlobalReplicationCoordinator()->shouldIgnoreUniqueIndex(descriptor);
+                UpdateTicket* updateTicket = new UpdateTicket();
+                updateTickets.mutableMap()[descriptor] = updateTicket;
+                Status ret = iam->validateUpdate(
+                    txn, objOld, objNew, oldLocation, options, updateTicket );
+                if ( !ret.isOK() ) {
+                    return StatusWith<RecordId>( ret );
+                }
             }
         }
 
-        if ( oldRecord->netLength() < objNew.objsize() ) {
-            // doesn't fit, have to move to new location
+        // This can call back into Collection::recordStoreGoingToMove.  If that happens, the old
+        // object is removed from all indexes.
+        StatusWith<RecordId> newLocation = _recordStore->updateRecord( txn,
+                                                                      oldLocation,
+                                                                      objNew.objdata(),
+                                                                      objNew.objsize(),
+                                                                      _enforceQuota( enforceQuota ),
+                                                                      this );
 
-            if ( _details->isCapped() )
-                return StatusWith<DiskLoc>( ErrorCodes::InternalError,
-                                            "failing update: objects in a capped ns cannot grow",
-                                            10003 );
+        if ( !newLocation.isOK() ) {
+            return newLocation;
+        }
 
-            moveCounter.increment();
-            _details->paddingTooSmall();
+        // At this point, the old object may or may not still be indexed, depending on if it was
+        // moved.
 
-            // unindex old record, don't delete
-            // this way, if inserting new doc fails, we can re-index this one
-            _cursorCache.invalidateDocument(oldLocation, INVALIDATION_DELETION);
-            _indexCatalog.unindexRecord(txn, objOld, oldLocation, true);
+        _infoCache.notifyOfWriteOp();
+
+        // If the object did move, we need to add the new location to all indexes.
+        if ( newLocation.getValue() != oldLocation ) {
 
             if ( debug ) {
                 if (debug->nmoved == -1) // default of -1 rather than 0
@@ -375,155 +386,120 @@ namespace mongo {
                     debug->nmoved += 1;
             }
 
-            StatusWith<DiskLoc> loc = _insertDocument( txn, objNew, enforceQuota );
-
-            if ( loc.isOK() ) {
-                // insert successful, now lets deallocate the old location
-                // remember its already unindexed
-                _recordStore->deleteRecord( txn, oldLocation );
-            }
-            else {
-                // new doc insert failed, so lets re-index the old document and location
-                _indexCatalog.indexRecord(txn, objOld, oldLocation);
-            }
-
-            return loc;
+            Status s = _indexCatalog.indexRecord(txn, objNew, newLocation.getValue());
+            if (!s.isOK())
+                return StatusWith<RecordId>(s);
+            invariant( txnId == txn->recoveryUnit()->getMyTransactionCount() );
+            return newLocation;
         }
 
-        _infoCache.notifyOfWriteOp();
-        _details->paddingFits();
+        // Object did not move.  We update each index with each respective UpdateTicket.
 
         if ( debug )
             debug->keyUpdates = 0;
 
-        ii = _indexCatalog.getIndexIterator( true );
-        while ( ii.more() ) {
-            IndexDescriptor* descriptor = ii.next();
-            IndexAccessMethod* iam = _indexCatalog.getIndex( descriptor );
+        if ( indexesAffected ) {
+            IndexCatalog::IndexIterator ii = _indexCatalog.getIndexIterator( txn, true );
+            while ( ii.more() ) {
+                IndexDescriptor* descriptor = ii.next();
+                IndexAccessMethod* iam = _indexCatalog.getIndex( descriptor );
 
-            int64_t updatedKeys;
-            Status ret = iam->update(txn, *updateTickets.mutableMap()[descriptor], &updatedKeys);
-            if ( !ret.isOK() )
-                return StatusWith<DiskLoc>( ret );
-            if ( debug )
-                debug->keyUpdates += updatedKeys;
+                int64_t updatedKeys;
+                Status ret = iam->update(
+                    txn, *updateTickets.mutableMap()[descriptor], &updatedKeys);
+                if ( !ret.isOK() )
+                    return StatusWith<RecordId>( ret );
+                if ( debug )
+                    debug->keyUpdates += updatedKeys;
+            }
         }
 
-        // Broadcast the mutation so that query results stay correct.
-        _cursorCache.invalidateDocument(oldLocation, INVALIDATION_MUTATION);
-
-        //  update in place
-        int sz = objNew.objsize();
-        memcpy(txn->writingPtr(oldRecord->data(), sz), objNew.objdata(), sz);
-
-        return StatusWith<DiskLoc>( oldLocation );
+        invariant( txnId == txn->recoveryUnit()->getMyTransactionCount() );
+        return newLocation;
     }
 
-    Status Collection::updateDocumentWithDamages( TransactionExperiment* txn,
-                                                  const DiskLoc& loc,
-                                                  const char* damangeSource,
-                                                  const mutablebson::DamageVector& damages ) {
-
-        // Broadcast the mutation so that query results stay correct.
-        _cursorCache.invalidateDocument(loc, INVALIDATION_MUTATION);
-
-        _details->paddingFits();
-
-        Record* rec = _recordStore->recordFor( loc );
-        char* root = rec->data();
-
-        // All updates were in place. Apply them via durability and writing pointer.
-        mutablebson::DamageVector::const_iterator where = damages.begin();
-        const mutablebson::DamageVector::const_iterator end = damages.end();
-        for( ; where != end; ++where ) {
-            const char* sourcePtr = damangeSource + where->sourceOffset;
-            void* targetPtr = txn->writingPtr(root + where->targetOffset, where->size);
-            std::memcpy(targetPtr, sourcePtr, where->size);
-        }
-
+    Status Collection::recordStoreGoingToMove( OperationContext* txn,
+                                               const RecordId& oldLocation,
+                                               const char* oldBuffer,
+                                               size_t oldSize ) {
+        moveCounter.increment();
+        _cursorManager.invalidateDocument(txn, oldLocation, INVALIDATION_DELETION);
+        _indexCatalog.unindexRecord(txn, BSONObj(oldBuffer), oldLocation, true);
         return Status::OK();
     }
 
-    int64_t Collection::storageSize( int* numExtents, BSONArrayBuilder* extentInfo ) const {
-        if ( _details->firstExtent().isNull() ) {
-            if ( numExtents )
-                *numExtents = 0;
-            return 0;
-        }
-
-        Extent* e = getExtentManager()->getExtent( _details->firstExtent() );
-
-        long long total = 0;
-        int n = 0;
-        while ( e ) {
-            total += e->length;
-            n++;
-
-            if ( extentInfo ) {
-                extentInfo->append( BSON( "len" << e->length << "loc: " << e->myLoc.toBSONObj() ) );
-            }
-
-            if ( e->xnext.isNull() )
-                e = NULL;
-            else
-                e = getExtentManager()->getExtent( e->xnext );
-
-        }
-
-        if ( numExtents )
-            *numExtents = n;
-
-        return total;
+    Status Collection::recordStoreGoingToUpdateInPlace( OperationContext* txn,
+                                                        const RecordId& loc ) {
+        // Broadcast the mutation so that query results stay correct.
+        _cursorManager.invalidateDocument(txn, loc, INVALIDATION_MUTATION);
+        return Status::OK();
     }
 
-    ExtentManager* Collection::getExtentManager() {
-        verify( ok() );
-        return _database->getExtentManager();
+
+    Status Collection::updateDocumentWithDamages( OperationContext* txn,
+                                                  const RecordId& loc,
+                                                  const RecordData& oldRec,
+                                                  const char* damageSource,
+                                                  const mutablebson::DamageVector& damages ) {
+        dassert(txn->lockState()->isCollectionLockedForMode(ns().toString(), MODE_IX));
+
+        // Broadcast the mutation so that query results stay correct.
+        _cursorManager.invalidateDocument(txn, loc, INVALIDATION_MUTATION);
+
+        return _recordStore->updateWithDamages( txn, loc, oldRec, damageSource, damages );
     }
 
-    const ExtentManager* Collection::getExtentManager() const {
-        verify( ok() );
-        return _database->getExtentManager();
-    }
+    bool Collection::_enforceQuota( bool userEnforeQuota ) const {
+        if ( !userEnforeQuota )
+            return false;
 
-    void Collection::increaseStorageSize(TransactionExperiment* txn, int size, bool enforceQuota) {
-        _recordStore->increaseStorageSize(txn, size, enforceQuota ? largestFileNumberInQuota() : 0);
-    }
-
-    int Collection::largestFileNumberInQuota() const {
-        if ( !storageGlobalParams.quota )
-            return 0;
+        if ( !mmapv1GlobalOptions.quota )
+            return false;
 
         if ( _ns.db() == "local" )
-            return 0;
+            return false;
 
         if ( _ns.isSpecial() )
-            return 0;
+            return false;
 
-        return storageGlobalParams.quotaFiles;
-    }
-
-    void Collection::appendCustomStats( BSONObjBuilder* result, double scale ) const {
-        result->append( "lastExtentSize", _details->lastExtentSize() / scale );
-        result->append( "paddingFactor", _details->paddingFactor() );
-        result->append( "userFlags", _details->userFlags() );
-
-        if ( isCapped() ) {
-            result->appendBool( "capped", true );
-            result->appendNumber( "max", _details->maxCappedDocs() );
-        }
+        return true;
     }
 
     bool Collection::isCapped() const {
-        return _details->isCapped();
+        return _recordStore->isCapped();
     }
 
-    uint64_t Collection::numRecords() const {
-        return _details->numRecords();
+    uint64_t Collection::numRecords( OperationContext* txn ) const {
+        return _recordStore->numRecords( txn );
     }
 
-    uint64_t Collection::dataSize() const {
-        return _details->dataSize();
+    uint64_t Collection::dataSize( OperationContext* txn ) const {
+        return _recordStore->dataSize( txn );
+    }
+
+    uint64_t Collection::getIndexSize(OperationContext* opCtx,
+                                      BSONObjBuilder* details,
+                                      int scale) {
+
+        IndexCatalog* idxCatalog = getIndexCatalog();
+
+        IndexCatalog::IndexIterator ii = idxCatalog->getIndexIterator(opCtx, true);
+
+        uint64_t totalSize = 0;
+
+        while (ii.more()) {
+            IndexDescriptor* d = ii.next();
+            IndexAccessMethod* iam = idxCatalog->getIndex(d);
+
+            long long ds = iam->getSpaceUsedBytes(opCtx);
+
+            totalSize += ds;
+            if (details) {
+                details->appendNumber(d->indexName(), ds / scale);
+            }
+        }
+
+        return totalSize;
     }
 
     /**
@@ -533,13 +509,14 @@ namespace mongo {
      * 3) truncate record store
      * 4) re-write indexes
      */
-    Status Collection::truncate(TransactionExperiment* txn) {
-        massert( 17445, "index build in progress", _indexCatalog.numIndexesInProgress() == 0 );
+    Status Collection::truncate(OperationContext* txn) {
+        dassert(txn->lockState()->isCollectionLockedForMode(ns().toString(), MODE_X));
+        massert( 17445, "index build in progress", _indexCatalog.numIndexesInProgress( txn ) == 0 );
 
         // 1) store index specs
         vector<BSONObj> indexSpecs;
         {
-            IndexCatalog::IndexIterator ii = _indexCatalog.getIndexIterator( false );
+            IndexCatalog::IndexIterator ii = _indexCatalog.getIndexIterator( txn, false );
             while ( ii.more() ) {
                 const IndexDescriptor* idx = ii.next();
                 indexSpecs.push_back( idx->infoObj().getOwned() );
@@ -550,8 +527,8 @@ namespace mongo {
         Status status = _indexCatalog.dropAllIndexes(txn, true);
         if ( !status.isOK() )
             return status;
-        _cursorCache.invalidateAll( false );
-        _infoCache.reset();
+        _cursorManager.invalidateAll( false );
+        _infoCache.reset( txn );
 
         // 3) truncate record store
         status = _recordStore->truncate(txn);
@@ -560,7 +537,7 @@ namespace mongo {
 
         // 4) re-create indexes
         for ( size_t i = 0; i < indexSpecs.size(); i++ ) {
-            status = _indexCatalog.createIndex(txn, indexSpecs[i], false);
+            status = _indexCatalog.createIndexOnEmptyCollection(txn, indexSpecs[i]);
             if ( !status.isOK() )
                 return status;
         }
@@ -568,12 +545,13 @@ namespace mongo {
         return Status::OK();
     }
 
-    void Collection::temp_cappedTruncateAfter(TransactionExperiment* txn,
-                                              DiskLoc end,
+    void Collection::temp_cappedTruncateAfter(OperationContext* txn,
+                                              RecordId end,
                                               bool inclusive) {
+        dassert(txn->lockState()->isCollectionLockedForMode(ns().toString(), MODE_IX));
         invariant( isCapped() );
-        reinterpret_cast<CappedRecordStoreV1*>(
-            _recordStore.get())->temp_cappedTruncateAfter( txn, end, inclusive );
+
+        _recordStore->temp_cappedTruncateAfter( txn, end, inclusive );
     }
 
     namespace {
@@ -581,8 +559,8 @@ namespace mongo {
         public:
             virtual ~MyValidateAdaptor(){}
 
-            virtual Status validate( Record* record, size_t* dataSize ) {
-                BSONObj obj = BSONObj( record->data() );
+            virtual Status validate( const RecordData& record, size_t* dataSize ) {
+                BSONObj obj = record.toBson();
                 const Status status = validateBSON(obj.objdata(), obj.objsize());
                 if ( status.isOK() )
                     *dataSize = obj.objsize();
@@ -592,9 +570,10 @@ namespace mongo {
         };
     }
 
-    Status Collection::validate( TransactionExperiment* txn,
+    Status Collection::validate( OperationContext* txn,
                                  bool full, bool scanData,
                                  ValidateResults* results, BSONObjBuilder* output ){
+        dassert(txn->lockState()->isCollectionLockedForMode(ns().toString(), MODE_IS));
 
         MyValidateAdaptor adaptor;
         Status status = _recordStore->validate( txn, full, scanData, &adaptor, results, output );
@@ -602,24 +581,36 @@ namespace mongo {
             return status;
 
         { // indexes
-            output->append("nIndexes", _indexCatalog.numIndexesReady() );
+            output->append("nIndexes", _indexCatalog.numIndexesReady( txn ) );
             int idxn = 0;
             try  {
+                // Only applicable when 'full' validation is requested.
+                boost::scoped_ptr<BSONObjBuilder> indexDetails(full ? new BSONObjBuilder() : NULL);
                 BSONObjBuilder indexes; // not using subObjStart to be exception safe
-                IndexCatalog::IndexIterator i = _indexCatalog.getIndexIterator(false);
+
+                IndexCatalog::IndexIterator i = _indexCatalog.getIndexIterator(txn, false);
                 while( i.more() ) {
                     const IndexDescriptor* descriptor = i.next();
-                    log() << "validating index " << descriptor->indexNamespace() << endl;
+                    log(LogComponent::kIndex) << "validating index " << descriptor->indexNamespace() << endl;
                     IndexAccessMethod* iam = _indexCatalog.getIndex( descriptor );
                     invariant( iam );
 
+                    boost::scoped_ptr<BSONObjBuilder> bob(
+                        indexDetails.get() ? new BSONObjBuilder(
+                            indexDetails->subobjStart(descriptor->indexNamespace())) :
+                        NULL);
+
                     int64_t keys;
-                    iam->validate(&keys);
+                    iam->validate(txn, full, &keys, bob.get());
                     indexes.appendNumber(descriptor->indexNamespace(),
                                          static_cast<long long>(keys));
                     idxn++;
                 }
+
                 output->append("keysPerIndex", indexes.done());
+                if (indexDetails.get()) {
+                    output->append("indexDetails", indexDetails->done());
+                }
             }
             catch ( DBException& exc ) {
                 string err = str::stream() <<
@@ -634,20 +625,20 @@ namespace mongo {
         return Status::OK();
     }
 
-    Status Collection::touch( TransactionExperiment* txn,
+    Status Collection::touch( OperationContext* txn,
                               bool touchData, bool touchIndexes,
                               BSONObjBuilder* output ) const {
         if ( touchData ) {
             BSONObjBuilder b;
             Status status = _recordStore->touch( txn, &b );
-            output->append( "data", b.obj() );
             if ( !status.isOK() )
                 return status;
+            output->append( "data", b.obj() );
         }
 
         if ( touchIndexes ) {
             Timer t;
-            IndexCatalog::IndexIterator ii = _indexCatalog.getIndexIterator( false );
+            IndexCatalog::IndexIterator ii = _indexCatalog.getIndexIterator( txn, false );
             while ( ii.more() ) {
                 const IndexDescriptor* desc = ii.next();
                 const IndexAccessMethod* iam = _indexCatalog.getIndex( desc );
@@ -656,59 +647,11 @@ namespace mongo {
                     return status;
             }
 
-            output->append( "indexes", BSON( "num" << _indexCatalog.numIndexesTotal() <<
+            output->append( "indexes", BSON( "num" << _indexCatalog.numIndexesTotal( txn ) <<
                                              "millis" << t.millis() ) );
         }
 
         return Status::OK();
-    }
-
-    bool Collection::isUserFlagSet( int flag ) const {
-        return _details->isUserFlagSet( flag );
-    }
-
-    bool Collection::setUserFlag( TransactionExperiment* txn, int flag ) {
-        if ( !_details->setUserFlag( flag ) )
-            return false;
-        _syncUserFlags(txn);
-        return true;
-    }
-
-    bool Collection::clearUserFlag( TransactionExperiment* txn, int flag ) {
-        if ( !_details->clearUserFlag( flag ) )
-            return false;
-        _syncUserFlags(txn);
-        return true;
-    }
-
-    void Collection::_syncUserFlags(TransactionExperiment* txn) {
-        if ( _ns.coll() == "system.namespaces" )
-            return;
-        string system_namespaces = _ns.getSisterNS( "system.namespaces" );
-        Collection* coll = _database->getCollection( txn, system_namespaces );
-
-        DiskLoc oldLocation = Helpers::findOne( coll, BSON( "name" << _ns.ns() ), false );
-        fassert( 17247, !oldLocation.isNull() );
-
-        BSONObj oldEntry = coll->docFor( oldLocation );
-
-        BSONObj newEntry = applyUpdateOperators( oldEntry,
-                                                 BSON( "$set" <<
-                                                       BSON( "options.flags" <<
-                                                             _details->userFlags() ) ) );
-
-        StatusWith<DiskLoc> loc = coll->updateDocument( txn, oldLocation, newEntry, false, NULL );
-        if ( !loc.isOK() ) {
-            // TODO: should this be an fassert?
-            error() << "syncUserFlags failed! "
-                    << " ns: " << _ns
-                    << " error: " << loc.toString();
-        }
-
-    }
-
-    void Collection::setMaxCappedDocs( long long max ) {
-        _details->setMaxCappedDocs( max );
     }
 
 }

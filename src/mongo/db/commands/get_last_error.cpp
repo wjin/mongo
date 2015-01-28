@@ -28,15 +28,23 @@
 *    it in the license file.
 */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/client.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/field_parser.h"
 #include "mongo/db/lasterror.h"
-#include "mongo/db/repl/rs.h"
+#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/write_concern.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
+
+    using std::string;
+    using std::stringstream;
 
     /* reset any errors so that getlasterror comes back clean.
 
@@ -57,20 +65,13 @@ namespace mongo {
             help << "reset error state (used with getpreverror)";
         }
         CmdResetError() : Command("resetError", false, "reseterror") {}
-        bool run(const string& db, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+        bool run(OperationContext* txn, const string& db, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
             LastError *le = lastError.get();
             verify( le );
             le->reset();
             return true;
         }
     } cmdResetError;
-
-    /* set by replica sets if specified in the configuration.
-       a pointer is used to avoid any possible locking issues with lockless reading.
-       (for now, it simply orphans any old copy as config changes should be extremely rare).
-       note: once non-null, never goes to null again.
-    */
-    BSONObj *getLastErrorDefault = 0;
 
     class CmdGetLastError : public Command {
     public:
@@ -91,7 +92,7 @@ namespace mongo {
                  << "  { wtimeout:m} - timeout for w in m milliseconds";
         }
 
-        bool run( const string& dbname,
+        bool run(OperationContext* txn, const string& dbname,
                   BSONObj& cmdObj,
                   int,
                   string& errmsg,
@@ -125,7 +126,7 @@ namespace mongo {
             LastError *le = lastError.disableForCommand();
 
             // Always append lastOp and connectionId
-            Client& c = cc();
+            Client& c = *txn->getClient();
             c.appendLastOp( result );
 
             // for sharding; also useful in general for debugging
@@ -143,7 +144,7 @@ namespace mongo {
             bool lastOpTimePresent = extracted != FieldParser::FIELD_NONE;
             if (!lastOpTimePresent) {
                 // Use the client opTime if no wOpTime is specified
-                lastOpTime = cc().getLastOp();
+                lastOpTime = c.getLastOp();
             }
             
             OID electionId;
@@ -177,16 +178,18 @@ namespace mongo {
                 (nFields == 2 && lastOpTimePresent) ||
                 (nFields == 3 && lastOpTimePresent && electionIdPresent);
 
-            if ( useDefaultGLEOptions && getLastErrorDefault ) {
-                writeConcernDoc = *getLastErrorDefault;
+            WriteConcernOptions writeConcern;
+
+            if (useDefaultGLEOptions) {
+                writeConcern = repl::getGlobalReplicationCoordinator()->getGetLastErrorDefault();
             }
+
+            Status status = writeConcern.parse( writeConcernDoc );
 
             //
             // Validate write concern no matter what, this matches 2.4 behavior
             //
 
-            WriteConcernOptions writeConcern;
-            Status status = writeConcern.parse( writeConcernDoc );
 
             if ( status.isOK() ) {
                 // Ensure options are valid for this host
@@ -210,7 +213,8 @@ namespace mongo {
 
             // If we got an electionId, make sure it matches
             if (electionIdPresent) {
-                if (!theReplSet) {
+                if (repl::getGlobalReplicationCoordinator()->getReplicationMode() !=
+                        repl::ReplicationCoordinator::modeReplSet) {
                     // Ignore electionIds of 0 from mongos.
                     if (electionId != OID()) {
                         errmsg = "wElectionId passed but no replication active";
@@ -219,9 +223,10 @@ namespace mongo {
                     }
                 } 
                 else {
-                    if (electionId != theReplSet->getElectionId()) {
+                    if (electionId != repl::getGlobalReplicationCoordinator()->getElectionId()) {
                         LOG(3) << "oid passed in is " << electionId
-                               << ", but our id is " << theReplSet->getElectionId();
+                               << ", but our id is "
+                               << repl::getGlobalReplicationCoordinator()->getElectionId();
                         errmsg = "election occurred after write";
                         result.append("code", ErrorCodes::WriteConcernFailed);
                         return false;
@@ -229,10 +234,10 @@ namespace mongo {
                 }
             }
 
-            cc().curop()->setMessage( "waiting for write concern" );
+            txn->setMessage( "waiting for write concern" );
 
             WriteConcernResult wcResult;
-            status = waitForWriteConcern( writeConcern, lastOpTime, &wcResult );
+            status = waitForWriteConcern( txn, writeConcern, lastOpTime, &wcResult );
             wcResult.appendTo( writeConcern, &result );
 
             // For backward compatibility with 2.4, wtimeout returns ok : 1.0
@@ -262,7 +267,7 @@ namespace mongo {
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) {} // No auth required
         CmdGetPrevError() : Command("getPrevError", false, "getpreverror") {}
-        bool run(const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+        bool run(OperationContext* txn, const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
             LastError *le = lastError.disableForCommand();
             le->appendSelf( result );
             if ( le->valid )

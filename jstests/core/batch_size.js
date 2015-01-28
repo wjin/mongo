@@ -63,13 +63,45 @@ assert.eq(15, t.find({a: {$gte: 85}}).sort({b: 1}).hint({b: 1}).batchSize(2).itc
 assert.eq(6, t.find({a: {$gte: 85}}).sort({b: 1}).hint({b: 1}).limit(6).itcount(), 'P');
 
 // With explain.
-assert.eq(15, t.find({a: {$gte: 85}}).sort({b: 1}).batchSize(2).explain().n, 'Q');
-assert.eq(6, t.find({a: {$gte: 85}}).sort({b: 1}).limit(6).explain().n, 'R');
+var explain = t.find({a: {$gte: 85}}).sort({b: 1}).batchSize(2).explain("executionStats");
+assert.eq(15, explain.executionStats.nReturned, 'Q');
+explain = t.find({a: {$gte: 85}}).sort({b: 1}).limit(6).explain("executionStats");
+assert.eq(6, explain.executionStats.nReturned, 'R');
 
 // Double check that we're not scanning more stuff than we have to.
 // In order to get the sort using index 'a', we should need to scan
 // about 50 keys and 50 documents.
-var explain = t.find({a: {$gte: 50}}).sort({b: 1}).hint({a: 1}).limit(6).explain();
-assert.lte(explain.nscanned, 60, 'S');
-assert.lte(explain.nscannedObjects, 60, 'T');
-assert.eq(explain.n, 6, 'U');
+var explain = t.find({a: {$gte: 50}}).sort({b: 1}).hint({a: 1}).limit(6).explain("executionStats");
+assert.lte(explain.executionStats.totalKeysExamined, 60, 'S');
+assert.lte(explain.executionStats.totalDocsExamined, 60, 'T');
+assert.eq(explain.executionStats.nReturned, 6, 'U');
+
+
+// -------
+
+
+// During plan ranking, we treat ntoreturn as a limit. This prevents us from buffering
+// too much data in a blocking sort stage during plan ranking.
+t.drop();
+
+// Generate big string to use in the object - 1MB+ String
+var bigStr = "ABCDEFGHIJKLMNBOPQRSTUVWXYZ012345687890";
+while (bigStr.length < 1000000) { bigStr = bigStr + "::" + bigStr; }
+
+// Insert enough documents to exceed the 32 MB in-memory sort limit.
+for (var i = 0; i < 40; i++) {
+    var doc = {x: 1, y: 1, z: i, big: bigStr};
+    t.insert(doc);
+}
+
+// Two indices needed in order to trigger plan ranking. Neither index provides
+// the sort order.
+t.ensureIndex({x: 1});
+t.ensureIndex({y: 1});
+
+// We should only buffer 3 docs in memory.
+var cursor = t.find({x: 1, y: 1}).sort({z: -1}).limit(3);
+assert.eq(39, cursor.next()["z"]);
+assert.eq(38, cursor.next()["z"]);
+assert.eq(37, cursor.next()["z"]);
+assert(!cursor.hasNext());

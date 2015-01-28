@@ -1,5 +1,3 @@
-// sharding.cpp : some unit tests for sharding internals
-
 /**
  *    Copyright (C) 2009 10gen Inc.
  *
@@ -28,16 +26,35 @@
  *    then also delete it in the license file.
  */
 
-#include "mongo/pch.h"
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+
+#include "mongo/platform/basic.h"
+
+#include <boost/shared_ptr.hpp>
 
 #include "mongo/client/dbclientmockcursor.h"
 #include "mongo/client/parallel.h"
+#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/operation_context_impl.h"
+#include "mongo/dbtests/config_server_fixture.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/s/chunk_diff.h"
 #include "mongo/s/chunk_version.h"
+#include "mongo/s/config.h"
 #include "mongo/s/type_chunk.h"
+#include "mongo/s/type_collection.h"
+#include "mongo/util/log.h"
 
 namespace ShardingTests {
+
+    using boost::shared_ptr;
+    using std::auto_ptr;
+    using std::make_pair;
+    using std::map;
+    using std::pair;
+    using std::set;
+    using std::string;
+    using std::vector;
 
     namespace serverandquerytests {
         class test1 {
@@ -78,17 +95,8 @@ namespace ShardingTests {
     class ChunkManagerTest : public ConnectionString::ConnectionHook {
     public:
 
-        class CustomDirectClient : public DBDirectClient {
-        public:
-            virtual ConnectionString::ConnectionType type() const {
-                return ConnectionString::CUSTOM;
-            }
-        };
-
-        CustomDirectClient _client;
-        Shard _shard;
-
-        ChunkManagerTest() {
+        ChunkManagerTest() : _client(&_txn) {
+            shardConnectionPool.clear();
 
             DBException::traceExceptions = true;
 
@@ -96,24 +104,30 @@ namespace ShardingTests {
             ConnectionString::setConnectionHook( this );
 
             // Create the default config database before querying, necessary for direct connections
-            client().dropDatabase( "config" );
-            client().insert( "config.test", BSON( "hello" << "world" ) );
-            client().dropCollection( "config.test" );
+            _client.dropDatabase( "config" );
+            _client.insert( "config.test", BSON( "hello" << "world" ) );
+            _client.dropCollection( "config.test" );
 
-            client().dropDatabase( nsGetDB( collName() ) );
-            client().insert( collName(), BSON( "hello" << "world" ) );
-            client().dropCollection( collName() );
+            _client.dropDatabase( nsGetDB( collName() ) );
+            _client.insert( collName(), BSON( "hello" << "world" ) );
+            _client.dropCollection( collName() );
 
             // Since we've redirected the conns, the host doesn't matter here so long as it's
             // prefixed with a "$"
-            _shard = Shard( "shard0000", "$hostFooBar:27017" );
+            _shard = Shard("shard0000",
+                           "$hostFooBar:27017",
+                           0 /* maxSize */,
+                           false /* draining */);
             // Need to run this to ensure the shard is in the global lookup table
-            _shard.setAddress( _shard.getAddress() );
+            Shard::installShard(_shard.getName(), _shard);
 
             // Create an index so that diffing works correctly, otherwise no cursors from S&O
-            client().ensureIndex( ChunkType::ConfigNS, // br
-                                  BSON( ChunkType::ns() << 1 << // br
-                                          ChunkType::DEPRECATED_lastmod() << 1 ) );
+            ASSERT_OK(dbtests::createIndex(
+                              &_txn,
+                              ChunkType::ConfigNS,
+                              BSON( ChunkType::ns() << 1 << // br
+                                    ChunkType::DEPRECATED_lastmod() << 1 ) ));
+            configServer.init("$dummy:1000");
         }
 
         virtual ~ChunkManagerTest() {
@@ -125,17 +139,19 @@ namespace ShardingTests {
 
         Shard& shard(){ return _shard; }
 
-        DBDirectClient& client(){
-            return _client;
-        }
-
         virtual DBClientBase* connect( const ConnectionString& connStr,
                                        string& errmsg,
                                        double socketTimeout )
         {
             // Note - must be new, since it gets owned elsewhere
-            return new CustomDirectClient();
+            return new CustomDirectClient(&_txn);
         }
+
+
+    protected:
+        OperationContextImpl _txn;
+        CustomDirectClient _client;
+        Shard _shard;
     };
 
     //
@@ -146,10 +162,11 @@ namespace ShardingTests {
 
         void run(){
 
-            ChunkManager manager( collName(), ShardKeyPattern( BSON( "_id" << 1 ) ), false );
+            ShardKeyPattern shardKeyPattern(BSON("_id" << 1));
+            ChunkManager manager(collName(), shardKeyPattern, false);
             manager.createFirstChunks( shard().getConnString(), shard(), NULL, NULL );
 
-            BSONObj firstChunk = client().findOne(ChunkType::ConfigNS, BSONObj()).getOwned();
+            BSONObj firstChunk = _client.findOne(ChunkType::ConfigNS, BSONObj()).getOwned();
 
             ASSERT(firstChunk[ChunkType::min()].Obj()[ "_id" ].type() == MinKey );
             ASSERT(firstChunk[ChunkType::max()].Obj()[ "_id" ].type() == MaxKey );
@@ -196,7 +213,8 @@ namespace ShardingTests {
             vector<BSONObj> splitKeys;
             genRandomSplitKeys( keyName, &splitKeys );
 
-            ChunkManager manager( collName(), ShardKeyPattern( BSON( keyName << 1 ) ), false );
+            ShardKeyPattern shardKeyPattern(BSON(keyName << 1));
+            ChunkManager manager(collName(), shardKeyPattern, false);
 
             manager.createFirstChunks( shard().getConnString(), shard(), &splitKeys, NULL );
         }
@@ -207,7 +225,7 @@ namespace ShardingTests {
             createChunks( keyName );
 
             auto_ptr<DBClientCursor> cursor =
-                client().query(ChunkType::ConfigNS, QUERY(ChunkType::ns(collName())));
+                _client.query(ChunkType::ConfigNS, QUERY(ChunkType::ns(collName())));
 
             set<int> minorVersions;
             OID epoch;
@@ -246,32 +264,44 @@ namespace ShardingTests {
 
             string keyName = "_id";
             createChunks( keyName );
-            int numChunks = static_cast<int>(client().count(ChunkType::ConfigNS,
+            int numChunks = static_cast<int>(_client.count(ChunkType::ConfigNS,
                                                             BSON(ChunkType::ns(collName()))));
 
-            BSONObj firstChunk = client().findOne(ChunkType::ConfigNS, BSONObj()).getOwned();
+            BSONObj firstChunk = _client.findOne(ChunkType::ConfigNS, BSONObj()).getOwned();
 
             ChunkVersion version = ChunkVersion::fromBSON(firstChunk,
                                                           ChunkType::DEPRECATED_lastmod());
 
             // Make manager load existing chunks
-            ChunkManagerPtr manager( new ChunkManager( collName(), ShardKeyPattern( BSON( "_id" << 1 ) ), false ) );
-            ((ChunkManager*) manager.get())->loadExistingRanges( shard().getConnString() );
+            BSONObjBuilder collDocBuilder;
+            collDocBuilder << CollectionType::ns(collName());
+            collDocBuilder << CollectionType::keyPattern(BSON( "_id" << 1 ));
+            collDocBuilder << CollectionType::unique(false);
+            collDocBuilder << CollectionType::dropped(false);
+            collDocBuilder << CollectionType::DEPRECATED_lastmod(jsTime());
+            collDocBuilder << CollectionType::DEPRECATED_lastmodEpoch(version.epoch());
 
-            ASSERT( manager->getVersion().epoch() == version.epoch() );
-            ASSERT( manager->getVersion().minorVersion() == ( numChunks - 1 ) );
-            ASSERT( static_cast<int>( manager->getChunkMap().size() ) == numChunks );
+            BSONObj collDoc(collDocBuilder.done());
+
+            ChunkManager manager(collDoc);
+            manager.loadExistingRanges(shard().getConnString(), NULL);
+
+            ASSERT(manager.getVersion().epoch() == version.epoch());
+            ASSERT(manager.getVersion().minorVersion() == (numChunks - 1));
+            ASSERT(static_cast<int>(manager.getChunkMap().size()) == numChunks);
 
             // Modify chunks collection
             BSONObjBuilder b;
             ChunkVersion laterVersion = ChunkVersion( 2, 1, version.epoch() );
             laterVersion.addToBSON(b, ChunkType::DEPRECATED_lastmod());
 
-            client().update(ChunkType::ConfigNS, BSONObj(), BSON( "$set" << b.obj()));
+            _client.update(ChunkType::ConfigNS, BSONObj(), BSON( "$set" << b.obj()));
 
             // Make new manager load chunk diff
-            ChunkManager newManager( manager );
-            newManager.loadExistingRanges( shard().getConnString() );
+            ChunkManager newManager(manager.getns(),
+                                    manager.getShardKeyPattern(),
+                                    manager.isUnique());
+            newManager.loadExistingRanges(shard().getConnString(), &manager);
 
             ASSERT( newManager.getVersion().toLong() == laterVersion.toLong() );
             ASSERT( newManager.getVersion().epoch() == laterVersion.epoch() );
@@ -305,7 +335,6 @@ namespace ShardingTests {
             }
 
             virtual string shardFor( const string& name ) const { return name; }
-            virtual string nameFrom( const string& shard ) const { return shard; }
         };
 
         // Inverts the storage order for chunks from min to max
@@ -379,7 +408,7 @@ namespace ShardingTests {
             // log() << "Validating that all shard versions are up to date..." << endl;
 
             // Validate that all the versions are the same
-            ASSERT( foundMaxVersion.isEquivalentTo( maxVersion ) );
+            ASSERT( foundMaxVersion.equals( maxVersion ) );
 
             for( VersionMap::iterator it = foundMaxShardVersions.begin(); it != foundMaxShardVersions.end(); it++ ){
 
@@ -387,7 +416,7 @@ namespace ShardingTests {
                 VersionMap::const_iterator maxIt = maxShardVersions.find( it->first );
 
                 ASSERT( maxIt != maxShardVersions.end() );
-                ASSERT( foundVersion.isEquivalentTo( maxIt->second ) );
+                ASSERT( foundVersion.equals( maxIt->second ) );
             }
             // Make sure all shards are accounted for
             ASSERT( foundMaxShardVersions.size() == maxShardVersions.size() );
@@ -655,6 +684,8 @@ namespace ShardingTests {
             add< ChunkDiffUnitTestNormal >();
             add< ChunkDiffUnitTestInverse >();
         }
-    } myall;
+    };
+
+    SuiteInstance<All> myall;
 
 }

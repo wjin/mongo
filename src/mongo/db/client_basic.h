@@ -28,6 +28,7 @@
 
 #pragma once
 
+#include <boost/noncopyable.hpp>
 #include <boost/scoped_ptr.hpp>
 
 #include "mongo/util/net/hostandport.h"
@@ -72,7 +73,6 @@ namespace mongo {
         AbstractMessagingPort * port() const { return _messagingPort; }
 
         static ClientBasic* getCurrent();
-        static bool hasCurrent();
 
     protected:
         ClientBasic(AbstractMessagingPort* messagingPort);

@@ -28,6 +28,8 @@
 
 #pragma once
 
+#include <boost/shared_ptr.hpp>
+
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/owned_pointer_vector.h"
 #include "mongo/db/field_ref_set.h"
@@ -42,7 +44,7 @@ namespace mongo {
 
     // For now, we handle lifecycle of CollectionManager via shared_ptrs
     class CollectionMetadata;
-    typedef shared_ptr<const CollectionMetadata> CollectionMetadataPtr;
+    typedef boost::shared_ptr<const CollectionMetadata> CollectionMetadataPtr;
 
     /**
      * The collection metadata has metadata information about a collection, in particular the
@@ -75,7 +77,7 @@ namespace mongo {
          * If a new metadata can't be created, returns NULL and fills in 'errMsg', if it was
          * provided.
          */
-        CollectionMetadata* cloneMinusPending( const ChunkType& pending, string* errMsg ) const;
+        CollectionMetadata* cloneMinusPending( const ChunkType& pending, std::string* errMsg ) const;
 
         /**
          * Returns a new metadata's instance based on 'this's state by adding a 'pending' chunk.
@@ -86,7 +88,7 @@ namespace mongo {
          * If a new metadata can't be created, returns NULL and fills in 'errMsg', if it was
          * provided.
          */
-        CollectionMetadata* clonePlusPending( const ChunkType& pending, string* errMsg ) const;
+        CollectionMetadata* clonePlusPending( const ChunkType& pending, std::string* errMsg ) const;
 
         /**
          * Returns a new metadata's instance based on 'this's state by removing 'chunk'.
@@ -98,7 +100,7 @@ namespace mongo {
          */
         CollectionMetadata* cloneMigrate( const ChunkType& chunk,
                                           const ChunkVersion& newShardVersion,
-                                          string* errMsg ) const;
+                                          std::string* errMsg ) const;
 
         /**
          * Returns a new metadata's instance by splitting an existing 'chunk' at the points
@@ -112,9 +114,9 @@ namespace mongo {
          * Note: 'splitKeys' must be sorted in ascending order.
          */
         CollectionMetadata* cloneSplit( const ChunkType& chunk,
-                                        const vector<BSONObj>& splitKeys,
+                                        const std::vector<BSONObj>& splitKeys,
                                         const ChunkVersion& newShardVersion,
-                                        string* errMsg ) const;
+                                        std::string* errMsg ) const;
 
         /**
          * Returns a new metadata instance by merging a key range which starts and ends at existing
@@ -127,7 +129,7 @@ namespace mongo {
         CollectionMetadata* cloneMerge( const BSONObj& minKey,
                                         const BSONObj& maxKey,
                                         const ChunkVersion& newShardVersion,
-                                        string* errMsg ) const;
+                                        std::string* errMsg ) const;
 
         //
         // verification logic
@@ -174,6 +176,7 @@ namespace mongo {
          * }
          *
          * @param lookupKey passing a key that does not belong to this metadata is undefined.
+         * @param orphanRange the output range. Note that the NS is not set.
          */
         bool getNextOrphanRange( const BSONObj& lookupKey, KeyRange* orphanRange ) const;
 
@@ -234,9 +237,9 @@ namespace mongo {
         void toBSONPending( BSONArrayBuilder& bb ) const;
 
         /**
-         * String output of the metadata information.
+         * std::string output of the metadata information.
          */
-        string toString() const;
+        std::string toString() const;
 
         /**
          * Use the MetadataLoader to fill the empty metadata from the config server, or use
@@ -258,7 +261,7 @@ namespace mongo {
          */
         CollectionMetadata* clonePlusChunk( const ChunkType& chunk,
                                             const ChunkVersion& newShardVersion,
-                                            string* errMsg ) const;
+                                            std::string* errMsg ) const;
 
     private:
         // Effectively, the MetadataLoader is this class's builder. So we open an exception

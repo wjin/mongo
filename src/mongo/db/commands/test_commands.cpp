@@ -1,7 +1,7 @@
 // test_commands.cpp
 
 /**
-*    Copyright (C) 2013 10gen Inc.
+*    Copyright (C) 2013-2014 MongoDB Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -28,18 +28,26 @@
 *    it in the license file.
 */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+
+#include "mongo/platform/basic.h"
+
 #include "mongo/base/init.h"
 #include "mongo/base/initializer_context.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/index_builder.h"
-#include "mongo/db/kill_current_op.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/repl/oplog.h"
-#include "mongo/db/storage/mmap_v1/dur_transaction.h"
+#include "mongo/db/operation_context_impl.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
+
+    using std::endl;
+    using std::string;
+    using std::stringstream;
 
     /* For testing only, not for general use. Enabled via command-line */
     class GodInsert : public Command {
@@ -55,26 +63,31 @@ namespace mongo {
         virtual void help( stringstream &help ) const {
             help << "internal. for testing only.";
         }
-        virtual bool run(const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+        virtual bool run(OperationContext* txn, const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
             string coll = cmdObj[ "godinsert" ].valuestrsafe();
             log() << "test only command godinsert invoked coll:" << coll << endl;
             uassert( 13049, "godinsert must specify a collection", !coll.empty() );
             string ns = dbname + "." + coll;
             BSONObj obj = cmdObj[ "obj" ].embeddedObjectUserCheck();
 
-            Lock::DBWrite lk(ns);
-            Client::Context ctx( ns );
-            DurTransaction txn;
+            ScopedTransaction transaction(txn, MODE_IX);
+            Lock::DBLock lk(txn->lockState(), dbname, MODE_X);
+            WriteUnitOfWork wunit(txn);
+            Client::Context ctx(txn,  ns );
             Database* db = ctx.db();
             Collection* collection = db->getCollection( ns );
             if ( !collection ) {
-                collection = db->createCollection( &txn, ns );
+                collection = db->createCollection( txn, ns );
                 if ( !collection ) {
                     errmsg = "could not create collection";
                     return false;
                 }
             }
-            StatusWith<DiskLoc> res = collection->insertDocument( &txn, obj, false );
+            StatusWith<RecordId> res = collection->insertDocument( txn, obj, false );
+            Status status = res.getStatus();
+            if (status.isOK()) {
+                wunit.commit();
+            }
             return appendCommandStatus( result, res.getStatus() );
         }
     };
@@ -94,7 +107,7 @@ namespace mongo {
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) {}
         CmdSleep() : Command("sleep") { }
-        bool run(const string& ns, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+        bool run(OperationContext* txn, const string& ns, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
             log() << "test only command sleep invoked" << endl;
             long long millis = 10 * 1000;
 
@@ -109,16 +122,18 @@ namespace mongo {
             }
 
             if(cmdObj.getBoolField("w")) {
-                Lock::GlobalWrite lk;
+                ScopedTransaction transaction(txn, MODE_X);
+                Lock::GlobalWrite lk(txn->lockState());
                 sleepmillis(millis);
             }
             else {
-                Lock::GlobalRead lk;
+                ScopedTransaction transaction(txn, MODE_S);
+                Lock::GlobalRead lk(txn->lockState());
                 sleepmillis(millis);
             }
 
             // Interrupt point for testing (e.g. maxTimeMS).
-            killCurrentOp.checkForInterrupt();
+            txn->checkForInterrupt();
 
             return true;
         }
@@ -134,28 +149,32 @@ namespace mongo {
         virtual void addRequiredPrivileges(const std::string& dbname,
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) {}
-        virtual bool run(const string& dbname , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+        virtual bool run(OperationContext* txn, const string& dbname , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
             string coll = cmdObj[ "captrunc" ].valuestrsafe();
             uassert( 13416, "captrunc must specify a collection", !coll.empty() );
             NamespaceString nss( dbname, coll );
             int n = cmdObj.getIntField( "n" );
             bool inc = cmdObj.getBoolField( "inc" ); // inclusive range?
 
-            Client::WriteContext ctx( nss.ns() );
-            DurTransaction txn;
-            Collection* collection = ctx.ctx().db()->getCollection( nss.ns() );
+            Client::WriteContext ctx(txn,  nss.ns() );
+            Collection* collection = ctx.getCollection();
             massert( 13417, "captrunc collection not found or empty", collection);
 
-            boost::scoped_ptr<Runner> runner(InternalPlanner::collectionScan(nss.ns(),
-                                                                             collection,
-                                                                             InternalPlanner::BACKWARD));
-            DiskLoc end;
-            // We remove 'n' elements so the start is one past that
-            for( int i = 0; i < n + 1; ++i ) {
-                Runner::RunnerState state = runner->getNext(NULL, &end);
-                massert( 13418, "captrunc invalid n", Runner::RUNNER_ADVANCED == state);
+            RecordId end;
+            {
+                boost::scoped_ptr<PlanExecutor> exec(InternalPlanner::collectionScan(txn,
+                                                                                     nss.ns(),
+                                                                                     collection,
+                                                                                     InternalPlanner::BACKWARD));
+                // We remove 'n' elements so the start is one past that
+                for( int i = 0; i < n + 1; ++i ) {
+                    PlanExecutor::ExecState state = exec->getNext(NULL, &end);
+                    massert( 13418, "captrunc invalid n", PlanExecutor::ADVANCED == state);
+                }
             }
-            collection->temp_cappedTruncateAfter( &txn, end, inc );
+            WriteUnitOfWork wuow(txn);
+            collection->temp_cappedTruncateAfter( txn, end, inc );
+            wuow.commit();
             return true;
         }
     };
@@ -172,37 +191,45 @@ namespace mongo {
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) {}
 
-        virtual std::vector<BSONObj> stopIndexBuilds(Database* db, 
+        virtual std::vector<BSONObj> stopIndexBuilds(OperationContext* opCtx,
+                                                     Database* db, 
                                                      const BSONObj& cmdObj) {
-            std::string coll = cmdObj[ "emptycapped" ].valuestrsafe();
-            std::string ns = db->name() + '.' + coll;
+            const std::string ns = parseNsCollectionRequired(db->name(), cmdObj);
 
             IndexCatalog::IndexKillCriteria criteria;
             criteria.ns = ns;
             return IndexBuilder::killMatchingIndexBuilds(db->getCollection(ns), criteria);
         }
 
-        virtual bool run(const string& dbname , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
-            string coll = cmdObj[ "emptycapped" ].valuestrsafe();
-            uassert( 13428, "emptycapped must specify a collection", !coll.empty() );
-            NamespaceString nss( dbname, coll );
+        virtual bool run(OperationContext* txn, const string& dbname , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+            const std::string ns = parseNsCollectionRequired(dbname, cmdObj);
 
-            Client::WriteContext ctx( nss.ns() );
-            DurTransaction txn;
-            Database* db = ctx.ctx().db();
-            Collection* collection = db->getCollection( nss.ns() );
-            massert( 13429, "emptycapped no such collection", collection );
+            ScopedTransaction scopedXact(txn, MODE_IX);
+            AutoGetDb autoDb(txn, dbname, MODE_X);
 
-            std::vector<BSONObj> indexes = stopIndexBuilds(db, cmdObj);
+            Database* db = autoDb.getDb();
+            massert(13429, "no such database", db);
 
-            Status status = collection->truncate(&txn);
-            if ( !status.isOK() )
-                return appendCommandStatus( result, status );
+            Collection* collection = db->getCollection(ns);
+            massert(28584, "no such collection", collection);
 
-            IndexBuilder::restoreIndexes(indexes);
+            std::vector<BSONObj> indexes = stopIndexBuilds(txn, db, cmdObj);
 
-            if (!fromRepl)
-                logOp(&txn, "c",(dbname + ".$cmd").c_str(), cmdObj);
+            WriteUnitOfWork wuow(txn);
+
+            Status status = collection->truncate(txn);
+            if (!status.isOK()) {
+                return appendCommandStatus(result, status);
+            }
+
+            IndexBuilder::restoreIndexes(txn, indexes);
+
+            if (!fromRepl) {
+                repl::logOp(txn, "c", (dbname + ".$cmd").c_str(), cmdObj);
+            }
+
+            wuow.commit();
+
             return true;
         }
     };

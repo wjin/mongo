@@ -28,7 +28,9 @@
 
 #pragma once
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
+
+#include <boost/intrusive_ptr.hpp>
 
 #include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/document.h"
@@ -162,7 +164,7 @@ namespace mongo {
 
           @returns the optimized Expression
          */
-        virtual intrusive_ptr<Expression> optimize() { return this; }
+        virtual boost::intrusive_ptr<Expression> optimize() { return this; }
 
         /**
          * Add this expression's field dependencies to the set
@@ -170,14 +172,14 @@ namespace mongo {
          * Expressions are trees, so this is often recursive.
          *
          * @param deps Fully qualified paths to depended-on fields are added to this set.
-         *             Empty string means need full document.
+         *             Empty std::string means need full document.
          * @param path path to self if all ancestors are ExpressionObjects.
          *             Top-level ExpressionObject gets pointer to empty vector.
          *             If any other Expression is an ancestor, or in other cases
          *             where {a:1} inclusion objects aren't allowed, they get
          *             NULL.
          */
-        virtual void addDependencies(DepsTracker* deps, vector<string>* path=NULL) const = 0;
+        virtual void addDependencies(DepsTracker* deps, std::vector<std::string>* path=NULL) const = 0;
 
         /** simple expressions are just inclusion exclusion as supported by ExpressionObject */
         virtual bool isSimple() { return false; }
@@ -237,7 +239,7 @@ namespace mongo {
          * Parses a BSON Object that could represent a functional expression or a Document
          * expression.
          */
-        static intrusive_ptr<Expression> parseObject(
+        static boost::intrusive_ptr<Expression> parseObject(
             BSONObj obj,
             ObjectCtx *pCtx,
             const VariablesParseState& vps);
@@ -248,7 +250,7 @@ namespace mongo {
          * exprElement should be the only element inside the expression object. That is the
          * field name should be the $op for the expression.
          */
-        static intrusive_ptr<Expression> parseExpression(
+        static boost::intrusive_ptr<Expression> parseExpression(
             BSONElement exprElement,
             const VariablesParseState& vps);
 
@@ -260,19 +262,19 @@ namespace mongo {
          * If it is a $op, exprElement should be the outer element whose value is an Object
          * containing the $op.
          */
-        static intrusive_ptr<Expression> parseOperand(
+        static boost::intrusive_ptr<Expression> parseOperand(
             BSONElement exprElement,
             const VariablesParseState& vps);
 
         /*
-          Produce a field path string with the field prefix removed.
+          Produce a field path std::string with the field prefix removed.
 
           Throws an error if the field prefix is not present.
 
           @param prefixedField the prefixed field
           @returns the field path with the prefix removed
          */
-        static string removeFieldPrefix(const string &prefixedField);
+        static std::string removeFieldPrefix(const std::string &prefixedField);
 
         /** Evaluate the subclass Expression using the given Variables as context and return result.
          *
@@ -282,7 +284,7 @@ namespace mongo {
         virtual Value evaluateInternal(Variables* vars) const = 0;
 
     protected:
-        typedef vector<intrusive_ptr<Expression> > ExpressionVector;
+        typedef std::vector<boost::intrusive_ptr<Expression> > ExpressionVector;
     };
 
 
@@ -291,16 +293,16 @@ namespace mongo {
         public Expression {
     public:
         // virtuals from Expression
-        virtual intrusive_ptr<Expression> optimize();
+        virtual boost::intrusive_ptr<Expression> optimize();
         virtual Value serialize(bool explain) const;
-        virtual void addDependencies(DepsTracker* deps, vector<string>* path=NULL) const;
+        virtual void addDependencies(DepsTracker* deps, std::vector<std::string>* path=NULL) const;
 
         /*
           Add an operand to the n-ary expression.
 
           @param pExpression the expression to add
         */
-        virtual void addOperand(const intrusive_ptr<Expression> &pExpression);
+        virtual void addOperand(const boost::intrusive_ptr<Expression> &pExpression);
 
         // TODO split this into two functions
         virtual bool isAssociativeAndCommutative() const { return false; }
@@ -308,7 +310,7 @@ namespace mongo {
         /*
           Get the name of the operator.
 
-          @returns the name of the operator; this string belongs to the class
+          @returns the name of the operator; this std::string belongs to the class
             implementation, and should not be deleted
             and should not
         */
@@ -331,9 +333,9 @@ namespace mongo {
     template <typename SubClass>
     class ExpressionNaryBase : public ExpressionNary {
     public:
-        static intrusive_ptr<Expression> parse(BSONElement bsonExpr,
+        static boost::intrusive_ptr<Expression> parse(BSONElement bsonExpr,
                                                const VariablesParseState& vps) {
-            intrusive_ptr<ExpressionNaryBase> expr = new SubClass();
+            boost::intrusive_ptr<ExpressionNaryBase> expr = new SubClass();
             ExpressionVector args = parseArguments(bsonExpr, vps);
             expr->validateArguments(args);
             expr->vpOperand = args;
@@ -380,7 +382,7 @@ namespace mongo {
     class ExpressionAnd : public ExpressionVariadic<ExpressionAnd> {
     public:
         // virtuals from Expression
-        virtual intrusive_ptr<Expression> optimize();
+        virtual boost::intrusive_ptr<Expression> optimize();
         virtual Value evaluateInternal(Variables* vars) const;
         virtual const char *getOpName() const;
         virtual bool isAssociativeAndCommutative() const { return true; }
@@ -398,19 +400,19 @@ namespace mongo {
     class ExpressionCoerceToBool : public Expression {
     public:
         // virtuals from ExpressionNary
-        virtual intrusive_ptr<Expression> optimize();
-        virtual void addDependencies(DepsTracker* deps, vector<string>* path=NULL) const;
+        virtual boost::intrusive_ptr<Expression> optimize();
+        virtual void addDependencies(DepsTracker* deps, std::vector<std::string>* path=NULL) const;
         virtual Value evaluateInternal(Variables* vars) const;
         virtual Value serialize(bool explain) const;
 
-        static intrusive_ptr<ExpressionCoerceToBool> create(
-            const intrusive_ptr<Expression> &pExpression);
+        static boost::intrusive_ptr<ExpressionCoerceToBool> create(
+            const boost::intrusive_ptr<Expression> &pExpression);
 
 
     private:
-        ExpressionCoerceToBool(const intrusive_ptr<Expression> &pExpression);
+        ExpressionCoerceToBool(const boost::intrusive_ptr<Expression> &pExpression);
 
-        intrusive_ptr<Expression> pExpression;
+        boost::intrusive_ptr<Expression> pExpression;
     };
 
 
@@ -434,7 +436,7 @@ namespace mongo {
         virtual Value evaluateInternal(Variables* vars) const;
         virtual const char *getOpName() const;
 
-        static intrusive_ptr<Expression> parse(
+        static boost::intrusive_ptr<Expression> parse(
             BSONElement bsonExpr,
             const VariablesParseState& vps,
             CmpOp cmpOp);
@@ -461,7 +463,7 @@ namespace mongo {
         virtual Value evaluateInternal(Variables* vars) const;
         virtual const char *getOpName() const;
 
-        static intrusive_ptr<Expression> parse(
+        static boost::intrusive_ptr<Expression> parse(
             BSONElement expr,
             const VariablesParseState& vps);
     };
@@ -470,14 +472,14 @@ namespace mongo {
     class ExpressionConstant : public Expression {
     public:
         // virtuals from Expression
-        virtual intrusive_ptr<Expression> optimize();
-        virtual void addDependencies(DepsTracker* deps, vector<string>* path=NULL) const;
+        virtual boost::intrusive_ptr<Expression> optimize();
+        virtual void addDependencies(DepsTracker* deps, std::vector<std::string>* path=NULL) const;
         virtual Value evaluateInternal(Variables* vars) const;
         virtual const char *getOpName() const;
         virtual Value serialize(bool explain) const;
 
-        static intrusive_ptr<ExpressionConstant> create(const Value& pValue);
-        static intrusive_ptr<Expression> parse(
+        static boost::intrusive_ptr<ExpressionConstant> create(const Value& pValue);
+        static boost::intrusive_ptr<Expression> parse(
             BSONElement bsonExpr,
             const VariablesParseState& vps);
 
@@ -494,12 +496,44 @@ namespace mongo {
         Value pValue;
     };
 
+    class ExpressionDateToString : public Expression {
+    public:
+        // virtuals from Expression
+        virtual boost::intrusive_ptr<Expression> optimize();
+        virtual Value serialize(bool explain) const;
+        virtual Value evaluateInternal(Variables* vars) const;
+        virtual void addDependencies(DepsTracker* deps, std::vector<std::string>* path=NULL) const;
+
+        static boost::intrusive_ptr<Expression> parse(
+            BSONElement expr,
+            const VariablesParseState& vps);
+
+    private:
+        ExpressionDateToString(const std::string& format, // the format string
+                               boost::intrusive_ptr<Expression> date); // the date to format
+
+        // Will uassert on invalid data
+        static void validateFormat(const std::string& format);
+
+        // Need raw date as tm doesn't have millisecond resolution.
+        // Format must be valid.
+        static std::string formatDate(const std::string& format,
+                                      const tm& tm,
+                                      const long long date);
+
+        static void insertPadded(StringBuilder& sb, int number, int spaces);
+
+        const std::string _format;
+        boost::intrusive_ptr<Expression> _date;
+    };
 
     class ExpressionDayOfMonth : public ExpressionFixedArity<ExpressionDayOfMonth, 1> {
     public:
         // virtuals from ExpressionNary
         virtual Value evaluateInternal(Variables* vars) const;
         virtual const char *getOpName() const;
+
+        static inline int extract(const tm& tm) { return tm.tm_mday; }
     };
 
 
@@ -508,6 +542,9 @@ namespace mongo {
         // virtuals from ExpressionNary
         virtual Value evaluateInternal(Variables* vars) const;
         virtual const char *getOpName() const;
+
+        // MySQL uses 1-7, tm uses 0-6
+        static inline int extract(const tm& tm) { return tm.tm_wday + 1; }
     };
 
 
@@ -516,6 +553,9 @@ namespace mongo {
         // virtuals from ExpressionNary
         virtual Value evaluateInternal(Variables* vars) const;
         virtual const char *getOpName() const;
+
+        // MySQL uses 1-366, tm uses 0-365
+        static inline int extract(const tm& tm) { return tm.tm_yday + 1; }
     };
 
 
@@ -530,8 +570,8 @@ namespace mongo {
     class ExpressionFieldPath : public Expression {
     public:
         // virtuals from Expression
-        virtual intrusive_ptr<Expression> optimize();
-        virtual void addDependencies(DepsTracker* deps, vector<string>* path=NULL) const;
+        virtual boost::intrusive_ptr<Expression> optimize();
+        virtual void addDependencies(DepsTracker* deps, std::vector<std::string>* path=NULL) const;
         virtual Value evaluateInternal(Variables* vars) const;
         virtual Value serialize(bool explain) const;
 
@@ -548,17 +588,17 @@ namespace mongo {
             indicator
           @returns the newly created field path expression
          */
-        static intrusive_ptr<ExpressionFieldPath> create(const string& fieldPath);
+        static boost::intrusive_ptr<ExpressionFieldPath> create(const std::string& fieldPath);
 
-        /// Like create(), but works with the raw string from the user with the "$" prefixes.
-        static intrusive_ptr<ExpressionFieldPath> parse(
-            const string& raw,
+        /// Like create(), but works with the raw std::string from the user with the "$" prefixes.
+        static boost::intrusive_ptr<ExpressionFieldPath> parse(
+            const std::string& raw,
             const VariablesParseState& vps);
 
         const FieldPath& getFieldPath() const { return _fieldPath; }
 
     private:
-        ExpressionFieldPath(const string& fieldPath, Variables::Id variable);
+        ExpressionFieldPath(const std::string& fieldPath, Variables::Id variable);
 
         /*
           Internal implementation of evaluateInternal(), used recursively.
@@ -588,6 +628,8 @@ namespace mongo {
         // virtuals from ExpressionNary
         virtual Value evaluateInternal(Variables* vars) const;
         virtual const char *getOpName() const;
+
+        static inline int extract(const tm& tm) { return tm.tm_hour; }
     };
 
 
@@ -602,58 +644,58 @@ namespace mongo {
     class ExpressionLet : public Expression {
     public:
         // virtuals from Expression
-        virtual intrusive_ptr<Expression> optimize();
+        virtual boost::intrusive_ptr<Expression> optimize();
         virtual Value serialize(bool explain) const;
         virtual Value evaluateInternal(Variables* vars) const;
-        virtual void addDependencies(DepsTracker* deps, vector<string>* path=NULL) const;
+        virtual void addDependencies(DepsTracker* deps, std::vector<std::string>* path=NULL) const;
 
-        static intrusive_ptr<Expression> parse(
+        static boost::intrusive_ptr<Expression> parse(
             BSONElement expr,
             const VariablesParseState& vps);
 
         struct NameAndExpression {
             NameAndExpression() {}
-            NameAndExpression(string name, intrusive_ptr<Expression> expression)
+            NameAndExpression(std::string name, boost::intrusive_ptr<Expression> expression)
                 : name(name)
                 , expression(expression)
             {}
 
-            string name;
-            intrusive_ptr<Expression> expression;
+            std::string name;
+            boost::intrusive_ptr<Expression> expression;
         };
 
-        typedef map<Variables::Id, NameAndExpression> VariableMap;
+        typedef std::map<Variables::Id, NameAndExpression> VariableMap;
 
     private:
         ExpressionLet(const VariableMap& vars,
-                      intrusive_ptr<Expression> subExpression);
+                      boost::intrusive_ptr<Expression> subExpression);
 
         VariableMap _variables;
-        intrusive_ptr<Expression> _subExpression;
+        boost::intrusive_ptr<Expression> _subExpression;
     };
 
     class ExpressionMap : public Expression {
     public:
         // virtuals from Expression
-        virtual intrusive_ptr<Expression> optimize();
+        virtual boost::intrusive_ptr<Expression> optimize();
         virtual Value serialize(bool explain) const;
         virtual Value evaluateInternal(Variables* vars) const;
-        virtual void addDependencies(DepsTracker* deps, vector<string>* path=NULL) const;
+        virtual void addDependencies(DepsTracker* deps, std::vector<std::string>* path=NULL) const;
 
-        static intrusive_ptr<Expression> parse(
+        static boost::intrusive_ptr<Expression> parse(
             BSONElement expr,
             const VariablesParseState& vps);
 
     private:
-        ExpressionMap(const string& varName, // name of variable to set
+        ExpressionMap(const std::string& varName, // name of variable to set
                       Variables::Id varId, // id of variable to set
-                      intrusive_ptr<Expression> input, // yields array to iterate
-                      intrusive_ptr<Expression> each); // yields results to be added to output array
+                      boost::intrusive_ptr<Expression> input, // yields array to iterate
+                      boost::intrusive_ptr<Expression> each); // yields results to be added to output array
 
-        string _varName;
+        std::string _varName;
         Variables::Id _varId;
-        intrusive_ptr<Expression> _input;
-        intrusive_ptr<Expression> _each;
+        boost::intrusive_ptr<Expression> _input;
+        boost::intrusive_ptr<Expression> _each;
     };
 
     class ExpressionMeta : public Expression {
@@ -661,9 +703,9 @@ namespace mongo {
         // virtuals from Expression
         virtual Value serialize(bool explain) const;
         virtual Value evaluateInternal(Variables* vars) const;
-        virtual void addDependencies(DepsTracker* deps, vector<string>* path=NULL) const;
+        virtual void addDependencies(DepsTracker* deps, std::vector<std::string>* path=NULL) const;
 
-        static intrusive_ptr<Expression> parse(
+        static boost::intrusive_ptr<Expression> parse(
             BSONElement expr,
             const VariablesParseState& vps);
     };
@@ -673,6 +715,8 @@ namespace mongo {
         // virtuals from ExpressionNary
         virtual Value evaluateInternal(Variables* vars) const;
         virtual const char* getOpName() const;
+
+        static int extract(const long long date);
     };
 
 
@@ -681,6 +725,8 @@ namespace mongo {
         // virtuals from ExpressionNary
         virtual Value evaluateInternal(Variables* vars) const;
         virtual const char *getOpName() const;
+
+        static int extract(const tm& tm) { return tm.tm_min; }
     };
 
 
@@ -706,6 +752,9 @@ namespace mongo {
         // virtuals from ExpressionNary
         virtual Value evaluateInternal(Variables* vars) const;
         virtual const char *getOpName() const;
+
+        // MySQL uses 1-12, tm uses 0-11
+        static inline int extract(const tm& tm) { return tm.tm_mon + 1; }
     };
 
 
@@ -720,9 +769,9 @@ namespace mongo {
     class ExpressionObject : public Expression {
     public:
         // virtuals from Expression
-        virtual intrusive_ptr<Expression> optimize();
+        virtual boost::intrusive_ptr<Expression> optimize();
         virtual bool isSimple();
-        virtual void addDependencies(DepsTracker* deps, vector<string>* path=NULL) const;
+        virtual void addDependencies(DepsTracker* deps, std::vector<std::string>* path=NULL) const;
         /** Only evaluates non inclusion expressions.  For inclusions, use addToDocument(). */
         virtual Value evaluateInternal(Variables* vars) const;
         virtual Value serialize(bool explain) const;
@@ -747,10 +796,10 @@ namespace mongo {
         /** Create an empty expression.
          *  Until fields are added, this will evaluate to an empty document.
          */
-        static intrusive_ptr<ExpressionObject> create();
+        static boost::intrusive_ptr<ExpressionObject> create();
 
         /// Like create but uses special handling of _id for root object of $project.
-        static intrusive_ptr<ExpressionObject> createRoot();
+        static boost::intrusive_ptr<ExpressionObject> createRoot();
 
         /*
           Add a field to the document expression.
@@ -761,7 +810,7 @@ namespace mongo {
                  Value in the result Document
         */
         void addField(const FieldPath &fieldPath,
-                      const intrusive_ptr<Expression> &pExpression);
+                      const boost::intrusive_ptr<Expression> &pExpression);
 
         /*
           Add a field path to the set of those to be included.
@@ -771,7 +820,7 @@ namespace mongo {
 
           @param fieldPath the name of the field to be included
         */
-        void includePath(const string &fieldPath);
+        void includePath(const std::string &fieldPath);
 
         /*
           Get a count of the added fields.
@@ -806,7 +855,7 @@ namespace mongo {
                @param include if true, the path is included; if false, the path
                  is excluded
              */
-            virtual void path(const string &path, bool include) = 0;
+            virtual void path(const std::string &path, bool include) = 0;
         };
 
         void excludeId(bool b) { _excludeId = b; }
@@ -816,11 +865,11 @@ namespace mongo {
 
         // Mapping from fieldname to the Expression that generates its value.
         // NULL expression means inclusion from source document.
-        typedef map<string, intrusive_ptr<Expression> > FieldMap;
+        typedef std::map<std::string, boost::intrusive_ptr<Expression> > FieldMap;
         FieldMap _expressions;
 
         // this is used to maintain order for generated fields not in the source document
-        vector<string> _order;
+        std::vector<std::string> _order;
 
         bool _excludeId;
         bool _atRoot;
@@ -830,7 +879,7 @@ namespace mongo {
     class ExpressionOr : public ExpressionVariadic<ExpressionOr> {
     public:
         // virtuals from Expression
-        virtual intrusive_ptr<Expression> optimize();
+        virtual boost::intrusive_ptr<Expression> optimize();
         virtual Value evaluateInternal(Variables* vars) const;
         virtual const char *getOpName() const;
         virtual bool isAssociativeAndCommutative() const { return true; }
@@ -842,6 +891,8 @@ namespace mongo {
         // virtuals from ExpressionNary
         virtual Value evaluateInternal(Variables* vars) const;
         virtual const char *getOpName() const;
+
+        static inline int extract(const tm& tm) { return tm.tm_sec; }
     };
 
 
@@ -874,7 +925,7 @@ namespace mongo {
     class ExpressionSetIsSubset : public ExpressionFixedArity<ExpressionSetIsSubset, 2> {
     public:
         // virtuals from ExpressionNary
-        virtual intrusive_ptr<Expression> optimize();
+        virtual boost::intrusive_ptr<Expression> optimize();
         virtual Value evaluateInternal(Variables* vars) const;
         virtual const char *getOpName() const;
     private:
@@ -945,6 +996,8 @@ namespace mongo {
         // virtuals from ExpressionNary
         virtual Value evaluateInternal(Variables* vars) const;
         virtual const char *getOpName() const;
+
+        static int extract(const tm& tm);
     };
 
 
@@ -953,6 +1006,9 @@ namespace mongo {
         // virtuals from ExpressionNary
         virtual Value evaluateInternal(Variables* vars) const;
         virtual const char *getOpName() const;
+
+        // tm_year is years since 1990
+        static int extract(const tm& tm) { return tm.tm_year + 1900; }
     };
 }
 

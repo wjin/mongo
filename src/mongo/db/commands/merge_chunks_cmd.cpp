@@ -33,10 +33,14 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/field_parser.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/s/d_logic.h"
+#include "mongo/s/d_state.h"
 #include "mongo/s/d_merge.h"
 
 namespace mongo {
+
+    using std::string;
+    using std::stringstream;
+    using std::vector;
 
     /**
      * Mongod-side command for merging chunks.
@@ -80,7 +84,7 @@ namespace mongo {
         static BSONField<string> shardNameField;
         static BSONField<string> configField;
 
-        bool run( const string& dbname,
+        bool run(OperationContext* txn, const string& dbname,
                   BSONObj& cmdObj,
                   int,
                   string& errmsg,
@@ -160,7 +164,7 @@ namespace mongo {
                 return false;
             }
 
-            return mergeChunks( NamespaceString( ns ), minKey, maxKey, epoch, true, &errmsg );
+            return mergeChunks( txn, NamespaceString( ns ), minKey, maxKey, epoch, &errmsg );
         }
     };
 

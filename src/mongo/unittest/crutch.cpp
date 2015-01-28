@@ -45,7 +45,9 @@ namespace mongo {
         return false;
     }
 
-    DBClientBase *createDirectClient() {
+    class OperationContext;
+
+    DBClientBase* createDirectClient(OperationContext* txn) {
         fassertFailed(17249);
         return NULL;
     }
@@ -55,7 +57,11 @@ namespace mongo {
     }
 
     void dbexit(ExitCode rc, const char *why) {
-        fassertFailed(17250);
+        invariant(!"unittests shouldn't call dbexit");
+    }
+
+    void exitCleanly(ExitCode code) {
+        invariant(!"unittests shouldn't call exitCleanly");
     }
 
 }  // namespace mongo

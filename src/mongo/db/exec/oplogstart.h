@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2013-2014 MongoDB Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -28,11 +28,13 @@
 
 #pragma once
 
+#include <boost/scoped_ptr.hpp>
+
 #include "mongo/base/owned_pointer_vector.h"
-#include "mongo/db/diskloc.h"
 #include "mongo/db/exec/collection_scan.h"
 #include "mongo/db/exec/plan_stage.h"
 #include "mongo/db/matcher/expression.h"
+#include "mongo/db/record_id.h"
 #include "mongo/util/timer.h"
 
 namespace mongo {
@@ -54,24 +56,38 @@ namespace mongo {
      * inserted before documents in a subsequent extent.  As such we can skip through entire extents
      * looking only at the first document.
      *
-     * Why is this a stage?  Because we want to yield, and we want to be notified of DiskLoc
+     * Why is this a stage?  Because we want to yield, and we want to be notified of RecordId
      * invalidations.  :(
      */
     class OplogStart : public PlanStage {
     public:
         // Does not take ownership.
-        OplogStart(const Collection* collection, MatchExpression* filter, WorkingSet* ws);
+        OplogStart(OperationContext* txn,
+                   const Collection* collection,
+                   MatchExpression* filter,
+                   WorkingSet* ws);
         virtual ~OplogStart();
 
         virtual StageState work(WorkingSetID* out);
         virtual bool isEOF();
 
-        virtual void invalidate(const DiskLoc& dl, InvalidationType type);
-        virtual void prepareToYield();
-        virtual void recoverFromYield();
+        virtual void invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type);
+        virtual void saveState();
+        virtual void restoreState(OperationContext* opCtx);
 
-        // PS. don't call this.
+        virtual std::vector<PlanStage*> getChildren() const;
+
+        //
+        // Exec stats -- do not call these for the oplog start stage.
+        //
+
         virtual PlanStageStats* getStats() { return NULL; }
+
+        virtual const CommonStats* getCommonStats() { return NULL; }
+
+        virtual const SpecificStats* getSpecificStats() { return NULL; }
+
+        virtual StageType stageType() const { return STAGE_OPLOG_START; }
 
         // For testing only.
         void setBackwardsScanTime(int newTime) { _backwardsScanTime = newTime; }
@@ -84,8 +100,11 @@ namespace mongo {
 
         StageState workExtentHopping(WorkingSetID* out);
 
+        // transactional context for read locks. Not owned by us
+        OperationContext* _txn;
+
         // If we're backwards scanning we just punt to a collscan.
-        scoped_ptr<CollectionScan> _cs;
+        boost::scoped_ptr<CollectionScan> _cs;
 
         // This is only used for the extent hopping scan.
         typedef OwnedPointerVector<RecordIterator> SubIterators;
@@ -111,7 +130,7 @@ namespace mongo {
         // WorkingSet is not owned by us.
         WorkingSet* _workingSet;
 
-        string _ns;
+        std::string _ns;
 
         MatchExpression* _filter;
 

@@ -2,20 +2,34 @@
 
 /*    Copyright 2009 10gen Inc.
  *
- *    Licensed under the Apache License, Version 2.0 (the "License");
- *    you may not use this file except in compliance with the License.
- *    You may obtain a copy of the License at
+ *    This program is free software: you can redistribute it and/or  modify
+ *    it under the terms of the GNU Affero General Public License, version 3,
+ *    as published by the Free Software Foundation.
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License for more details.
  *
- *    Unless required by applicable law or agreed to in writing, software
- *    distributed under the License is distributed on an "AS IS" BASIS,
- *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *    See the License for the specific language governing permissions and
- *    limitations under the License.
+ *    You should have received a copy of the GNU Affero General Public License
+ *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
  */
 
-#include "mongo/pch.h"
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+
+#include "mongo/platform/basic.h"
 
 #include "mongo/util/net/sock.h"
 
@@ -33,34 +47,53 @@
 # endif
 #endif
 
+#include "mongo/db/server_options.h"
 #include "mongo/util/background.h"
 #include "mongo/util/concurrency/value.h"
+#include "mongo/util/debug_util.h"
 #include "mongo/util/fail_point_service.h"
+#include "mongo/util/hex.h"
 #include "mongo/util/mongoutils/str.h"
+#include "mongo/util/log.h"
 #include "mongo/util/net/message.h"
 #include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/net/socket_poll.h"
+#include "mongo/util/quick_exit.h"
 
 namespace mongo {
+
+    using std::endl;
+    using std::pair;
+    using std::string;
+    using std::stringstream;
+    using std::vector;
+
     MONGO_FP_DECLARE(throwSockExcep);
 
     static bool ipv6 = false;
     void enableIPv6(bool state) { ipv6 = state; }
     bool IPv6Enabled() { return ipv6; }
-    
+
     void setSockTimeouts(int sock, double secs) {
+        bool report = shouldLog(logger::LogSeverity::Debug(4));
+        DEV report = true;
+#if defined(_WIN32)
+        DWORD timeout = secs * 1000; // Windows timeout is a DWORD, in milliseconds.
+        int status =
+            setsockopt( sock, SOL_SOCKET, SO_RCVTIMEO,
+                    reinterpret_cast<char*>(&timeout), sizeof(DWORD) );
+        if (report && (status == SOCKET_ERROR))
+            log() << "unable to set SO_RCVTIMEO: "
+               << errnoWithDescription(WSAGetLastError()) << endl;
+        status = setsockopt( sock, SOL_SOCKET, SO_SNDTIMEO,
+                    reinterpret_cast<char*>(&timeout), sizeof(DWORD) );
+        DEV if (report && (status == SOCKET_ERROR))
+            log() << "unable to set SO_SNDTIMEO: "
+               << errnoWithDescription(WSAGetLastError()) << endl;
+#else
         struct timeval tv;
         tv.tv_sec = (int)secs;
         tv.tv_usec = (int)((long long)(secs*1000*1000) % (1000*1000));
-        bool report = logger::globalLogDomain()->shouldLog(logger::LogSeverity::Debug(4));
-        DEV report = true;
-#if defined(_WIN32)
-        tv.tv_sec *= 1000; // Windows timeout is a DWORD, in milliseconds.
-        int status = setsockopt( sock, SOL_SOCKET, SO_RCVTIMEO, (char *) &tv.tv_sec, sizeof(DWORD) ) == 0;
-        if( report && (status == SOCKET_ERROR) ) log() << "unable to set SO_RCVTIMEO" << endl;
-        status = setsockopt( sock, SOL_SOCKET, SO_SNDTIMEO, (char *) &tv.tv_sec, sizeof(DWORD) ) == 0;
-        DEV if( report && (status == SOCKET_ERROR) ) log() << "unable to set SO_SNDTIMEO" << endl;
-#else
         bool ok = setsockopt( sock, SOL_SOCKET, SO_RCVTIMEO, (char *) &tv, sizeof(tv) ) == 0;
         if( report && !ok ) log() << "unable to set SO_RCVTIMEO" << endl;
         ok = setsockopt( sock, SOL_SOCKET, SO_SNDTIMEO, (char *) &tv, sizeof(tv) ) == 0;
@@ -133,6 +166,12 @@ namespace mongo {
     }
 
     // --- SockAddr
+    SockAddr::SockAddr() {
+        addressSize = sizeof(sa);
+        memset(&sa, 0, sizeof(sa));
+        sa.ss_family = AF_UNSPEC;
+        _isValid = true;
+    }
 
     SockAddr::SockAddr(int sourcePort) {
         memset(as<sockaddr_in>().sin_zero, 0, sizeof(as<sockaddr_in>().sin_zero));
@@ -140,6 +179,7 @@ namespace mongo {
         as<sockaddr_in>().sin_port = htons(sourcePort);
         as<sockaddr_in>().sin_addr.s_addr = htonl(INADDR_ANY);
         addressSize = sizeof(sockaddr_in);
+        _isValid = true;
     }
 
     SockAddr::SockAddr(const char * _iporhost , int port) {
@@ -157,50 +197,54 @@ namespace mongo {
             as<sockaddr_un>().sun_family = AF_UNIX;
             strcpy(as<sockaddr_un>().sun_path, target.c_str());
             addressSize = sizeof(sockaddr_un);
+            _isValid = true;
+            return;
         }
-        else {
-            addrinfo* addrs = NULL;
-            addrinfo hints;
-            memset(&hints, 0, sizeof(addrinfo));
-            hints.ai_socktype = SOCK_STREAM;
-            //hints.ai_flags = AI_ADDRCONFIG; // This is often recommended but don't do it. 
-                                              // SERVER-1579
-            hints.ai_flags |= AI_NUMERICHOST; // first pass tries w/o DNS lookup
-            hints.ai_family = (IPv6Enabled() ? AF_UNSPEC : AF_INET);
 
-            StringBuilder ss;
-            ss << port;
-            int ret = getaddrinfo(target.c_str(), ss.str().c_str(), &hints, &addrs);
+        addrinfo* addrs = NULL;
+        addrinfo hints;
+        memset(&hints, 0, sizeof(addrinfo));
+        hints.ai_socktype = SOCK_STREAM;
+        //hints.ai_flags = AI_ADDRCONFIG; // This is often recommended but don't do it. 
+                                          // SERVER-1579
+        hints.ai_flags |= AI_NUMERICHOST; // first pass tries w/o DNS lookup
+        hints.ai_family = (IPv6Enabled() ? AF_UNSPEC : AF_INET);
 
-            // old C compilers on IPv6-capable hosts return EAI_NODATA error
+        StringBuilder ss;
+        ss << port;
+        int ret = getaddrinfo(target.c_str(), ss.str().c_str(), &hints, &addrs);
+
+        // old C compilers on IPv6-capable hosts return EAI_NODATA error
 #ifdef EAI_NODATA
-            int nodata = (ret == EAI_NODATA);
+        int nodata = (ret == EAI_NODATA);
 #else
-            int nodata = false;
+        int nodata = false;
 #endif
-            if ( (ret == EAI_NONAME || nodata) ) {
-                // iporhost isn't an IP address, allow DNS lookup
-                hints.ai_flags &= ~AI_NUMERICHOST;
-                ret = getaddrinfo(target.c_str(), ss.str().c_str(), &hints, &addrs);
-            }
-
-            if (ret) {
-                // we were unsuccessful
-                if( target != "0.0.0.0" ) { // don't log if this as it is a 
-                                            // CRT construction and log() may not work yet.
-                    log() << "getaddrinfo(\"" << target << "\") failed: " << 
-                        getAddrInfoStrError(ret) << endl;
-                }
-                *this = SockAddr(port);
-            }
-            else {
-                //TODO: handle other addresses in linked list;
-                fassert(16501, addrs->ai_addrlen <= sizeof(sa));
-                memcpy(&sa, addrs->ai_addr, addrs->ai_addrlen);
-                addressSize = addrs->ai_addrlen;
-                freeaddrinfo(addrs);
-            }
+        if ( (ret == EAI_NONAME || nodata) ) {
+            // iporhost isn't an IP address, allow DNS lookup
+            hints.ai_flags &= ~AI_NUMERICHOST;
+            ret = getaddrinfo(target.c_str(), ss.str().c_str(), &hints, &addrs);
         }
+
+        if (ret) {
+            // we were unsuccessful
+            if( target != "0.0.0.0" ) { // don't log if this as it is a
+                                        // CRT construction and log() may not work yet.
+                log() << "getaddrinfo(\"" << target << "\") failed: " <<
+                    getAddrInfoStrError(ret) << endl;
+                _isValid = false;
+                return;
+            }
+            *this = SockAddr(port);
+            return;
+        }
+
+        //TODO: handle other addresses in linked list;
+        fassert(16501, addrs->ai_addrlen <= sizeof(sa));
+        memcpy(&sa, addrs->ai_addr, addrs->ai_addrlen);
+        addressSize = addrs->ai_addrlen;
+        freeaddrinfo(addrs);
+        _isValid = true;
     }
 
     bool SockAddr::isLocalHost() const {
@@ -248,7 +292,8 @@ namespace mongo {
         }
             
         case AF_UNIX:  
-            return (addressSize > 2 ? as<sockaddr_un>().sun_path : "anonymous unix socket");
+            return (as<sockaddr_un>().sun_path[0] != '\0' ? as<sockaddr_un>().sun_path :
+                "anonymous unix socket");
         case AF_UNSPEC: 
             return "(NONE)";
         default: 
@@ -323,11 +368,11 @@ namespace mongo {
     // If an ip address is passed in, just return that.  If a hostname is passed
     // in, look up its ip and return that.  Returns "" on failure.
     string hostbyname(const char *hostname) {
-        string addr =  SockAddr(hostname, 0).getAddr();
-        if (addr == "0.0.0.0")
+        SockAddr sockAddr(hostname, 0);
+        if (!sockAddr.isValid() || sockAddr.getAddr() == "0.0.0.0")
             return "";
         else
-            return addr;
+            return sockAddr.getAddr();
     }
    
     //  --- my --
@@ -437,15 +482,6 @@ namespace mongo {
 
     void Socket::close() {
         if ( _fd >= 0 ) {
-#ifdef MONGO_SSL
-            if (_sslConnection.get()) {
-                try {
-                    _sslManager->SSL_shutdown( _sslConnection.get() );
-                }
-                catch (const SocketException&) { // SSL_shutdown may throw if the connection fails
-                }  
-            }
-#endif
             // Stop any blocking reads/writes, and prevent new reads/writes
 #if defined(_WIN32)
             shutdown( _fd, SD_BOTH );
@@ -803,6 +839,12 @@ namespace mongo {
     // isStillConnected() polls the socket at max every Socket::errorPollIntervalSecs to determine
     // if any disconnection-type events have happened on the socket.
     bool Socket::isStillConnected() {
+        if (_fd == -1) {
+            // According to the man page, poll will respond with POLLVNAL for invalid or
+            // unopened descriptors, but it doesn't seem to be properly implemented in
+            // some platforms - it can return 0 events and 0 for revent. Hence this workaround.
+            return false;
+        }
 
         if ( errorPollIntervalSecs < 0 ) return true;
         if ( ! isPollSupported() ) return true; // nothing we can do
@@ -926,9 +968,8 @@ namespace mongo {
         WinsockInit() {
             WSADATA d;
             if ( WSAStartup(MAKEWORD(2,2), &d) != 0 ) {
-                out() << "ERROR: wsastartup failed " << errnoWithDescription() << endl;
-                problem() << "ERROR: wsastartup failed " << errnoWithDescription() << endl;
-                _exit(EXIT_NTSERVICE_ERROR);
+                log() << "ERROR: wsastartup failed " << errnoWithDescription() << endl;
+                quickExit(EXIT_NTSERVICE_ERROR);
             }
         }
     } winsock_init;

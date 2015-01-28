@@ -41,6 +41,7 @@
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
 
+#include <boost/scoped_ptr.hpp>
 #include <map>
 #include <memory>
 #include <string>
@@ -89,7 +90,6 @@ namespace {
             ReplicaSetMonitor::cleanup();
             _replSet.reset();
 
-            // TODO: remove this after we remove replSetGetStatus from ReplicaSetMonitor.
             mongo::ScopedDbConnection::clearPool();
         }
 
@@ -173,7 +173,7 @@ namespace {
             vector<HostAndPort> hostList(_replSet->getHosts());
             for (vector<HostAndPort>::const_iterator iter = hostList.begin();
                     iter != hostList.end(); ++iter) {
-                _replSet->kill(iter->toString(true));
+                _replSet->kill(iter->toString());
             }
         }
 
@@ -181,7 +181,6 @@ namespace {
             ReplicaSetMonitor::cleanup();
             _replSet.reset();
 
-            // TODO: remove this after we remove replSetGetStatus from ReplicaSetMonitor.
             mongo::ScopedDbConnection::clearPool();
         }
 
@@ -255,7 +254,6 @@ namespace {
             ReplicaSetMonitor::cleanup();
             _replSet.reset();
 
-            // TODO: remove this after we remove replSetGetStatus from ReplicaSetMonitor.
             mongo::ScopedDbConnection::clearPool();
         }
 
@@ -344,7 +342,6 @@ namespace {
             ReplicaSetMonitor::cleanup();
             _replSet.reset();
 
-            // TODO: remove this after we remove replSetGetStatus from ReplicaSetMonitor.
             mongo::ScopedDbConnection::clearPool();
         }
 
@@ -437,14 +434,21 @@ namespace {
                     mongo::MockConnRegistry::get()->getConnStrHook());
 
             {
-                mongo::MockReplicaSet::ReplConfigMap config = _replSet->getReplConfig();
+                mongo::repl::ReplicaSetConfig oldConfig = _replSet->getReplConfig();
 
+                mongo::BSONObjBuilder newConfigBuilder;
+                newConfigBuilder.append("_id", oldConfig.getReplSetName());
+                newConfigBuilder.append("version", oldConfig.getConfigVersion());
+
+                mongo::BSONArrayBuilder membersBuilder(newConfigBuilder.subarrayStart("members"));
                 {
                     const string host(_replSet->getPrimary());
-                    map<string, string>& tag = config[host].tags;
-                    tag.clear();
-                    tag["dc"] = "ny";
-                    tag["p"] = "1";
+                    const mongo::repl::MemberConfig* member =
+                            oldConfig.findMemberByHostAndPort(HostAndPort(host));
+                    membersBuilder.append(BSON("_id" << member->getId() <<
+                                               "host" << host <<
+                                               "tags" << BSON("dc" << "ny" <<
+                                                              "p" << "1")));
                     _replSet->getNode(host)->insert(IdentityNS, BSON(HostField(host)));
                 }
 
@@ -453,46 +457,58 @@ namespace {
 
                 {
                     const string host(*secIter);
-                    map<string, string>&  tag = config[host].tags;
-                    tag.clear();
-                    tag["dc"] = "sf";
-                    tag["s"] = "1";
-                    tag["group"] = "1";
+                    const mongo::repl::MemberConfig* member =
+                            oldConfig.findMemberByHostAndPort(HostAndPort(host));
+                    membersBuilder.append(BSON("_id" << member->getId() <<
+                                               "host" << host <<
+                                               "tags" << BSON("dc" << "sf" <<
+                                                              "s" << "1" <<
+                                                              "group" << "1")));
                     _replSet->getNode(host)->insert(IdentityNS, BSON(HostField(host)));
                 }
 
                 {
                     ++secIter;
                     const string host(*secIter);
-                    map<string, string>&  tag = config[host].tags;
-                    tag.clear();
-                    tag["dc"] = "ma";
-                    tag["s"] = "2";
-                    tag["group"] = "1";
+                    const mongo::repl::MemberConfig* member =
+                            oldConfig.findMemberByHostAndPort(HostAndPort(host));
+                    membersBuilder.append(BSON("_id" << member->getId() <<
+                                               "host" << host <<
+                                               "tags" << BSON("dc" << "ma" <<
+                                                              "s" << "2" <<
+                                                              "group" << "1")));
                     _replSet->getNode(host)->insert(IdentityNS, BSON(HostField(host)));
                 }
 
                 {
                     ++secIter;
                     const string host(*secIter);
-                    map<string, string>&  tag = config[host].tags;
-                    tag.clear();
-                    tag["dc"] = "eu";
-                    tag["s"] = "3";
+                    const mongo::repl::MemberConfig* member =
+                            oldConfig.findMemberByHostAndPort(HostAndPort(host));
+                    membersBuilder.append(BSON("_id" << member->getId() <<
+                                               "host" << host <<
+                                               "tags" << BSON("dc" << "eu" <<
+                                                              "s" << "3")));
                     _replSet->getNode(host)->insert(IdentityNS, BSON(HostField(host)));
                 }
 
                 {
                     ++secIter;
                     const string host(*secIter);
-                    map<string, string>&  tag = config[host].tags;
-                    tag.clear();
-                    tag["dc"] = "jp";
-                    tag["s"] = "4";
+                    const mongo::repl::MemberConfig* member =
+                            oldConfig.findMemberByHostAndPort(HostAndPort(host));
+                    membersBuilder.append(BSON("_id" << member->getId() <<
+                                               "host" << host <<
+                                               "tags" << BSON("dc" << "jp" <<
+                                                              "s" << "4")));
                     _replSet->getNode(host)->insert(IdentityNS, BSON(HostField(host)));
                 }
 
-                _replSet->setConfig(config);
+                membersBuilder.done();
+                mongo::repl::ReplicaSetConfig newConfig;
+                fassert(28569, newConfig.initialize(newConfigBuilder.done()));
+                fassert(28568, newConfig.validate());
+                _replSet->setConfig(newConfig);
             }
         }
 
@@ -503,7 +519,6 @@ namespace {
             ReplicaSetMonitor::cleanup();
             _replSet.reset();
 
-            // TODO: remove this after we remove replSetGetStatus from ReplicaSetMonitor.
             mongo::ScopedDbConnection::clearPool();
         }
 
@@ -565,7 +580,7 @@ namespace {
         // This is the only difference from ConnShouldPinIfSameSettings which tests that we *do* pin
         // in if the host is still marked as up. Note that this only notifies the RSM, and does not
         // directly effect the DBClientRS.
-        ReplicaSetMonitor::get(replSet->getSetName())->failedHost(dest);
+        ReplicaSetMonitor::get(replSet->getSetName())->failedHost(HostAndPort(dest));
 
         {
             Query query;

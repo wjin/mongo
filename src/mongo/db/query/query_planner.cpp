@@ -26,6 +26,10 @@
  *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/query/query_planner.h"
 
 #include <vector>
@@ -42,8 +46,12 @@
 #include "mongo/db/query/qlog.h"
 #include "mongo/db/query/query_planner_common.h"
 #include "mongo/db/query/query_solution.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
+
+    using std::auto_ptr;
+    using std::numeric_limits;
 
     // Copied verbatim from db/index.h
     static bool isIdIndex( const BSONObj &pattern ) {
@@ -135,6 +143,80 @@ namespace mongo {
         return bob.obj();
     }
 
+    /**
+     * "Finishes" the min object for the $min query option by filling in an empty object with
+     * MinKey/MaxKey and stripping field names.
+     *
+     * In the case that 'minObj' is empty, we "finish" it by filling in either MinKey or MaxKey
+     * instead. Choosing whether to use MinKey or MaxKey is done by comparing against 'maxObj'.
+     * For instance, suppose 'minObj' is empty, 'maxObj' is { a: 3 }, and the key pattern is
+     * { a: -1 }. According to the key pattern ordering, { a: 3 } < MinKey. This means that the
+     * proper resulting bounds are
+     *
+     *   start: { '': MaxKey }, end: { '': 3 }
+     *
+     * as opposed to
+     *
+     *   start: { '': MinKey }, end: { '': 3 }
+     *
+     * Suppose instead that the key pattern is { a: 1 }, with the same 'minObj' and 'maxObj'
+     * (that is, an empty object and { a: 3 } respectively). In this case, { a: 3 } > MinKey,
+     * which means that we use range [{'': MinKey}, {'': 3}]. The proper 'minObj' in this case is
+     * MinKey, whereas in the previous example it was MaxKey.
+     *
+     * If 'minObj' is non-empty, then all we do is strip its field names (because index keys always
+     * have empty field names).
+     */
+    static BSONObj finishMinObj(const BSONObj& kp, const BSONObj& minObj, const BSONObj& maxObj) {
+        BSONObjBuilder bob;
+        bob.appendMinKey("");
+        BSONObj minKey = bob.obj();
+
+        if (minObj.isEmpty()) {
+            if (0 > minKey.woCompare(maxObj, kp, false)) {
+                BSONObjBuilder minKeyBuilder;
+                minKeyBuilder.appendMinKey("");
+                return minKeyBuilder.obj();
+            }
+            else {
+                BSONObjBuilder maxKeyBuilder;
+                maxKeyBuilder.appendMaxKey("");
+                return maxKeyBuilder.obj();
+            }
+        }
+        else {
+            return stripFieldNames(minObj);
+        }
+    }
+
+    /**
+     * "Finishes" the max object for the $max query option by filling in an empty object with
+     * MinKey/MaxKey and stripping field names.
+     *
+     * See comment for finishMinObj() for why we need both 'minObj' and 'maxObj'.
+     */
+    static BSONObj finishMaxObj(const BSONObj& kp, const BSONObj& minObj, const BSONObj& maxObj) {
+        BSONObjBuilder bob;
+        bob.appendMaxKey("");
+        BSONObj maxKey = bob.obj();
+
+        if (maxObj.isEmpty()) {
+            if (0 < maxKey.woCompare(minObj, kp, false)) {
+                BSONObjBuilder maxKeyBuilder;
+                maxKeyBuilder.appendMaxKey("");
+                return maxKeyBuilder.obj();
+            }
+            else {
+                BSONObjBuilder minKeyBuilder;
+                minKeyBuilder.appendMinKey("");
+                return minKeyBuilder.obj();
+            }
+        }
+        else {
+            return stripFieldNames(maxObj);
+        }
+    }
+
     QuerySolution* buildCollscanSoln(const CanonicalQuery& query,
                                      bool tailable,
                                      const QueryPlannerParams& params) {
@@ -153,20 +235,11 @@ namespace mongo {
     }
 
     bool providesSort(const CanonicalQuery& query, const BSONObj& kp) {
-        BSONObjIterator sortIt(query.getParsed().getSort());
-        BSONObjIterator kpIt(kp);
-
-        while (sortIt.more() && kpIt.more()) {
-            // We want the field name to be the same as well (so we pass true).
-            // TODO: see if we can pull a reverse sort out...
-            if (0 != sortIt.next().woCompare(kpIt.next(), true)) {
-                return false;
-            }
-        }
-
-        // every elt in sort matched kp
-        return !sortIt.more();
+        return query.getParsed().getSort().isPrefixOf(kp);
     }
+
+    // static
+    const int QueryPlanner::kPlannerVersion = 1;
 
     Status QueryPlanner::cacheDataFromTaggedTree(const MatchExpression* const taggedTree,
                                                  const vector<IndexEntry>& relevantIndices,
@@ -329,7 +402,7 @@ namespace mongo {
 
         // Use the cached index assignments to build solnRoot.  Takes ownership of clone.
         QuerySolutionNode* solnRoot =
-            QueryPlannerAccess::buildIndexedDataAccess(query, clone, false, params.indices);
+            QueryPlannerAccess::buildIndexedDataAccess(query, clone, false, params.indices, params);
 
         if (NULL != solnRoot) {
             // Takes ownership of 'solnRoot'.
@@ -404,7 +477,7 @@ namespace mongo {
         // tailable set on the collscan.  TODO: This is a policy departure.  Previously I think you
         // could ask for a tailable cursor and it just tried to give you one.  Now, we fail if we
         // can't provide one.  Is this what we want?
-        if (query.getParsed().hasOption(QueryOption_CursorTailable)) {
+        if (query.getParsed().getOptions().tailable) {
             if (!QueryPlannerCommon::hasNode(query.root(), MatchExpression::GEO_NEAR)
                 && canTableScan) {
                 QuerySolution* soln = buildCollscanSoln(query, true, params);
@@ -415,10 +488,18 @@ namespace mongo {
             return Status::OK();
         }
 
-        // The hint can be $natural: 1.  If this happens, output a collscan.
-        if (!query.getParsed().getHint().isEmpty()) {
-            BSONElement natural = query.getParsed().getHint().getFieldDotted("$natural");
-            if (!natural.eoo()) {
+        // The hint or sort can be $natural: 1.  If this happens, output a collscan. If both
+        // a $natural hint and a $natural sort are specified, then the direction of the collscan
+        // is determined by the sign of the sort (not the sign of the hint).
+        if (!query.getParsed().getHint().isEmpty() || !query.getParsed().getSort().isEmpty()) {
+            BSONObj hintObj = query.getParsed().getHint();
+            BSONObj sortObj = query.getParsed().getSort();
+            BSONElement naturalHint = hintObj.getFieldDotted("$natural");
+            BSONElement naturalSort = sortObj.getFieldDotted("$natural");
+
+            // A hint overrides a $natural sort. This means that we don't force a table
+            // scan if there is a $natural sort with a non-$natural hint.
+            if (!naturalHint.eoo() || (!naturalSort.eoo() && hintObj.isEmpty())) {
                 QLOG() << "Forcing a table scan due to hinted $natural\n";
                 // min/max are incompatible with $natural.
                 if (canTableScan && query.getParsed().getMin().isEmpty()
@@ -510,6 +591,13 @@ namespace mongo {
             BSONObj minObj = query.getParsed().getMin();
             BSONObj maxObj = query.getParsed().getMax();
 
+            // The unfinished siblings of these objects may not be proper index keys because they
+            // may be empty objects or have field names. When an index is picked to use for the
+            // min/max query, these "finished" objects will always be valid index keys for the
+            // index's key pattern.
+            BSONObj finishedMinObj;
+            BSONObj finishedMaxObj;
+
             // This is the index into params.indices[...] that we use.
             size_t idxNo = numeric_limits<size_t>::max();
 
@@ -527,6 +615,17 @@ namespace mongo {
                                   "hint provided does not work with max query");
                 }
 
+                const BSONObj& kp = params.indices[hintIndexNumber].keyPattern;
+                finishedMinObj = finishMinObj(kp, minObj, maxObj);
+                finishedMaxObj = finishMaxObj(kp, minObj, maxObj);
+
+                // The min must be less than the max for the hinted index ordering.
+                if (0 <= finishedMinObj.woCompare(finishedMaxObj, kp, false)) {
+                    QLOG() << "Minobj/Maxobj don't work with hint";
+                    return Status(ErrorCodes::BadValue,
+                                  "hint provided does not work with min/max query");
+                }
+
                 idxNo = hintIndexNumber;
             }
             else {
@@ -537,8 +636,22 @@ namespace mongo {
 
                     BSONObj toUse = minObj.isEmpty() ? maxObj : minObj;
                     if (indexCompatibleMaxMin(toUse, kp)) {
-                        idxNo = i;
-                        break;
+                        // In order to be fully compatible, the min has to be less than the max
+                        // according to the index key pattern ordering. The first step in verifying
+                        // this is "finish" the min and max by replacing empty objects and stripping
+                        // field names.
+                        finishedMinObj = finishMinObj(kp, minObj, maxObj);
+                        finishedMaxObj = finishMaxObj(kp, minObj, maxObj);
+
+                        // Now we have the final min and max. This index is only relevant for
+                        // the min/max query if min < max.
+                        if (0 >= finishedMinObj.woCompare(finishedMaxObj, kp, false)) {
+                            // Found a relevant index.
+                            idxNo = i;
+                            break;
+                        }
+
+                        // This index is not relevant; move on to the next.
                     }
                 }
             }
@@ -550,31 +663,14 @@ namespace mongo {
                               "unable to find relevant index for max/min query");
             }
 
-            // maxObj can be empty; the index scan just goes until the end.  minObj can't be empty
-            // though, so if it is, we make a minKey object.
-            if (minObj.isEmpty()) {
-                BSONObjBuilder bob;
-                bob.appendMinKey("");
-                minObj = bob.obj();
-            }
-            else {
-                // Must strip off the field names to make an index key.
-                minObj = stripFieldNames(minObj);
-            }
-
-            if (!maxObj.isEmpty()) {
-                // Must strip off the field names to make an index key.
-                maxObj = stripFieldNames(maxObj);
-            }
-
             QLOG() << "Max/min query using index " << params.indices[idxNo].toString() << endl;
 
             // Make our scan and output.
             QuerySolutionNode* solnRoot = QueryPlannerAccess::makeIndexScan(params.indices[idxNo],
                                                                             query,
                                                                             params,
-                                                                            minObj,
-                                                                            maxObj);
+                                                                            finishedMinObj,
+                                                                            finishedMaxObj);
 
             QuerySolution* soln = QueryPlannerAnalysis::analyzeDataAccess(query, params, solnRoot);
             if (NULL != soln) {
@@ -593,6 +689,20 @@ namespace mongo {
         QueryPlannerIXSelect::rateIndices(query.root(), "", relevantIndices);
         QueryPlannerIXSelect::stripInvalidAssignments(query.root(), relevantIndices);
 
+        // Unless we have GEO_NEAR, TEXT, or a projection, we may be able to apply an optimization
+        // in which we strip unnecessary index assignments.
+        //
+        // Disallowed with projection because assignment to a non-unique index can allow the plan
+        // to be covered.
+        //
+        // TEXT and GEO_NEAR are special because they require the use of a text/geo index in order
+        // to be evaluated correctly. Stripping these "mandatory assignments" is therefore invalid.
+        if (query.getParsed().getProj().isEmpty()
+            && !QueryPlannerCommon::hasNode(query.root(), MatchExpression::GEO_NEAR)
+            && !QueryPlannerCommon::hasNode(query.root(), MatchExpression::TEXT)) {
+            QueryPlannerIXSelect::stripUnneededAssignments(query.root(), relevantIndices);
+        }
+
         // query.root() is now annotated with RelevantTag(s).
         QLOG() << "Rated tree:" << endl << query.root()->toString();
 
@@ -606,76 +716,6 @@ namespace mongo {
                 // Don't leave tags on query tree.
                 query.root()->resetTag();
                 return Status(ErrorCodes::BadValue, "unable to find index for $geoNear query");
-            }
-
-            GeoNearMatchExpression* gnme = static_cast<GeoNearMatchExpression*>(gnNode);
-
-            vector<size_t> newFirst;
-
-            // 2d + GEO_NEAR is annoying.  Because 2d's GEO_NEAR isn't streaming we have to embed
-            // the full query tree inside it as a matcher.
-            for (size_t i = 0; i < tag->first.size(); ++i) {
-                // GEO_NEAR has a non-2d index it can use.  We can deal w/that in normal planning.
-                if (!is2DIndex(relevantIndices[tag->first[i]].keyPattern)) {
-                    newFirst.push_back(tag->first[i]);
-                    continue;
-                }
-
-                // If we're here, GEO_NEAR has a 2d index.  We create a 2dgeonear plan with the
-                // entire tree as a filter, if possible.
-
-                GeoNear2DNode* solnRoot = new GeoNear2DNode();
-                solnRoot->nq = gnme->getData();
-                if (NULL != query.getProj()) {
-                    solnRoot->addPointMeta = query.getProj()->wantGeoNearPoint();
-                    solnRoot->addDistMeta = query.getProj()->wantGeoNearDistance();
-                }
-
-                if (MatchExpression::GEO_NEAR != query.root()->matchType()) {
-                    // root is an AND, clone and delete the GEO_NEAR child.
-                    MatchExpression* filterTree = query.root()->shallowClone();
-                    verify(MatchExpression::AND == filterTree->matchType());
-
-                    bool foundChild = false;
-                    for (size_t i = 0; i < filterTree->numChildren(); ++i) {
-                        if (MatchExpression::GEO_NEAR == filterTree->getChild(i)->matchType()) {
-                            foundChild = true;
-                            scoped_ptr<MatchExpression> holder(filterTree->getChild(i));
-                            filterTree->getChildVector()->erase(filterTree->getChildVector()->begin() + i);
-                            break;
-                        }
-                    }
-                    verify(foundChild);
-                    solnRoot->filter.reset(filterTree);
-                }
-
-                solnRoot->numWanted = query.getParsed().getNumToReturn();
-                if (0 == solnRoot->numWanted) {
-                    solnRoot->numWanted = 100;
-                }
-                solnRoot->indexKeyPattern = relevantIndices[tag->first[i]].keyPattern;
-
-                // Remove the 2d index.  2d can only be the first field, and we know there is
-                // only one GEO_NEAR, so we don't care if anyone else was assigned it; it'll
-                // only be first for gnNode.
-                tag->first.erase(tag->first.begin() + i);
-
-                QuerySolution* soln = QueryPlannerAnalysis::analyzeDataAccess(query,
-                                                                              params,
-                                                                              solnRoot);
-
-                if (NULL != soln) {
-                    out->push_back(soln);
-                }
-            }
-
-            // Continue planning w/non-2d indices tagged for this pred.
-            tag->first.swap(newFirst);
-
-            if (0 == tag->first.size() && 0 == tag->notFirst.size()) {
-                // Don't leave tags on query tree.
-                query.root()->resetTag();
-                return Status::OK();
             }
 
             QLOG() << "Rated tree after geonear processing:" << query.root()->toString();
@@ -748,7 +788,8 @@ namespace mongo {
 
                 // This can fail if enumeration makes a mistake.
                 QuerySolutionNode* solnRoot =
-                    QueryPlannerAccess::buildIndexedDataAccess(query, rawTree, false, relevantIndices);
+                    QueryPlannerAccess::buildIndexedDataAccess(query, rawTree, false,
+                                                               relevantIndices, params);
 
                 if (NULL == solnRoot) { continue; }
 
@@ -821,10 +862,28 @@ namespace mongo {
             if (!usingIndexToSort) {
                 for (size_t i = 0; i < params.indices.size(); ++i) {
                     const IndexEntry& index = params.indices[i];
+                    // Only regular (non-plugin) indexes can be used to provide a sort.
+                    if (index.type != INDEX_BTREE) {
+                        continue;
+                    }
+                    // Only non-sparse indexes can be used to provide a sort.
                     if (index.sparse) {
                         continue;
                     }
-                    const BSONObj kp = LiteParsedQuery::normalizeSortOrder(index.keyPattern);
+
+                    // TODO: Sparse indexes can't normally provide a sort, because non-indexed
+                    // documents could potentially be missing from the result set.  However, if the
+                    // query predicate can be used to guarantee that all documents to be returned
+                    // are indexed, then the index should be able to provide the sort.
+                    //
+                    // For example:
+                    // - Sparse index {a: 1, b: 1} should be able to provide a sort for
+                    //   find({b: 1}).sort({a: 1}).  SERVER-13908.
+                    // - Index {a: 1, b: "2dsphere"} (which is "geo-sparse", if
+                    //   2dsphereIndexVersion=2) should be able to provide a sort for
+                    //   find({b: GEO}).sort({a:1}).  SERVER-10801.
+
+                    const BSONObj kp = QueryPlannerAnalysis::getSortPattern(index.keyPattern);
                     if (providesSort(query, kp)) {
                         QLOG() << "Planner: outputting soln that uses index to provide sort."
                                << endl;

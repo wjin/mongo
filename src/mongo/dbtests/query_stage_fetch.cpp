@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2013-2014 MongoDB Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -34,32 +34,36 @@
 
 #include "mongo/client/dbclientcursor.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/dbdirectclient.h"
 #include "mongo/db/exec/fetch.h"
 #include "mongo/db/exec/plan_stage.h"
-#include "mongo/db/exec/mock_stage.h"
-#include "mongo/db/instance.h"
+#include "mongo/db/exec/queued_data_stage.h"
 #include "mongo/db/json.h"
 #include "mongo/db/matcher/expression_parser.h"
-#include "mongo/db/pdfile.h"
-#include "mongo/db/storage/mmap_v1/dur_transaction.h"
+#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/dbtests/dbtests.h"
 
 namespace QueryStageFetch {
 
+    using boost::shared_ptr;
+    using std::auto_ptr;
+    using std::set;
+
     class QueryStageFetchBase {
     public:
-        QueryStageFetchBase() { }
+        QueryStageFetchBase() : _client(&_txn) {
+        
+        }
 
         virtual ~QueryStageFetchBase() {
             _client.dropCollection(ns());
         }
 
-        void getLocs(set<DiskLoc>* out, Collection* coll) {
-            RecordIterator* it = coll->getIterator(DiskLoc(), false,
-                                                       CollectionScanParams::FORWARD);
+        void getLocs(set<RecordId>* out, Collection* coll) {
+            RecordIterator* it = coll->getIterator(&_txn);
             while (!it->isEOF()) {
-                DiskLoc nextLoc = it->getNext();
+                RecordId nextLoc = it->getNext();
                 out->insert(nextLoc);
             }
             delete it;
@@ -75,11 +79,11 @@ namespace QueryStageFetch {
 
         static const char* ns() { return "unittests.QueryStageFetch"; }
 
-    private:
-        static DBDirectClient _client;
+    protected:
+        OperationContextImpl _txn;
+        DBDirectClient _client;
     };
 
-    DBDirectClient QueryStageFetchBase::_client;
 
     //
     // Test that a WSM with an obj is passed through verbatim.
@@ -87,42 +91,44 @@ namespace QueryStageFetch {
     class FetchStageAlreadyFetched : public QueryStageFetchBase {
     public:
         void run() {
-            Client::WriteContext ctx(ns());
-            DurTransaction txn;
+            Client::WriteContext ctx(&_txn, ns());
             Database* db = ctx.ctx().db();
             Collection* coll = db->getCollection(ns());
             if (!coll) {
-                coll = db->createCollection(&txn, ns());
+                WriteUnitOfWork wuow(&_txn);
+                coll = db->createCollection(&_txn, ns());
+                wuow.commit();
             }
+
             WorkingSet ws;
 
             // Add an object to the DB.
             insert(BSON("foo" << 5));
-            set<DiskLoc> locs;
+            set<RecordId> locs;
             getLocs(&locs, coll);
             ASSERT_EQUALS(size_t(1), locs.size());
 
             // Create a mock stage that returns the WSM.
-            auto_ptr<MockStage> mockStage(new MockStage(&ws));
+            auto_ptr<QueuedDataStage> mockStage(new QueuedDataStage(&ws));
 
             // Mock data.
             {
                 WorkingSetMember mockMember;
                 mockMember.state = WorkingSetMember::LOC_AND_UNOWNED_OBJ;
                 mockMember.loc = *locs.begin();
-                mockMember.obj = coll->docFor(mockMember.loc);
+                mockMember.obj = coll->docFor(&_txn, mockMember.loc);
                 // Points into our DB.
-                ASSERT_FALSE(mockMember.obj.isOwned());
                 mockStage->pushBack(mockMember);
 
                 mockMember.state = WorkingSetMember::OWNED_OBJ;
-                mockMember.loc = DiskLoc();
+                mockMember.loc = RecordId();
                 mockMember.obj = BSON("foo" << 6);
                 ASSERT_TRUE(mockMember.obj.isOwned());
                 mockStage->pushBack(mockMember);
             }
 
-            auto_ptr<FetchStage> fetchStage(new FetchStage(&ws, mockStage.release(), NULL, coll));
+            auto_ptr<FetchStage> fetchStage(new FetchStage(&_txn, &ws, mockStage.release(),
+                                                           NULL, coll));
 
             WorkingSetID id = WorkingSet::INVALID_ID;
             PlanStage::StageState state;
@@ -145,23 +151,27 @@ namespace QueryStageFetch {
     class FetchStageFilter : public QueryStageFetchBase {
     public:
         void run() {
-            Client::WriteContext ctx(ns());
-            DurTransaction txn;
-            Database* db = ctx.ctx().db();
+            ScopedTransaction transaction(&_txn, MODE_IX);
+            Lock::DBLock lk(_txn.lockState(), nsToDatabaseSubstring(ns()), MODE_X);
+            Client::Context ctx(&_txn, ns());
+            Database* db = ctx.db();
             Collection* coll = db->getCollection(ns());
             if (!coll) {
-                coll = db->createCollection(&txn, ns());
+                WriteUnitOfWork wuow(&_txn);
+                coll = db->createCollection(&_txn, ns());
+                wuow.commit();
             }
+
             WorkingSet ws;
 
             // Add an object to the DB.
             insert(BSON("foo" << 5));
-            set<DiskLoc> locs;
+            set<RecordId> locs;
             getLocs(&locs, coll);
             ASSERT_EQUALS(size_t(1), locs.size());
 
             // Create a mock stage that returns the WSM.
-            auto_ptr<MockStage> mockStage(new MockStage(&ws));
+            auto_ptr<QueuedDataStage> mockStage(new QueuedDataStage(&ws));
 
             // Mock data.
             {
@@ -183,7 +193,7 @@ namespace QueryStageFetch {
 
             // Matcher requires that foo==6 but we only have data with foo==5.
             auto_ptr<FetchStage> fetchStage(
-                new FetchStage(&ws, mockStage.release(), filterExpr.get(), coll));
+                     new FetchStage(&_txn, &ws, mockStage.release(), filterExpr.get(), coll));
 
             // First call should return a fetch request as it's not in memory.
             WorkingSetID id = WorkingSet::INVALID_ID;
@@ -207,6 +217,8 @@ namespace QueryStageFetch {
             add<FetchStageAlreadyFetched>();
             add<FetchStageFilter>();
         }
-    }  queryStageFetchAll;
+    };
+
+    SuiteInstance<All> queryStageFetchAll;
 
 }  // namespace QueryStageFetch

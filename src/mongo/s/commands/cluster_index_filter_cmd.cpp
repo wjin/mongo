@@ -40,6 +40,7 @@
 namespace mongo {
 
     using std::string;
+    using std::stringstream;
     using std::vector;
 
     /**
@@ -56,6 +57,10 @@ namespace mongo {
 
         bool slaveOk() const {
             return false;
+        }
+
+        bool slaveOverrideOk() const {
+            return true;
         }
 
         virtual bool isWriteCommandForConfigServer() const { return false; }
@@ -79,7 +84,7 @@ namespace mongo {
         }
 
         // Cluster plan cache command entry point.
-        bool run( const std::string& dbname,
+        bool run(OperationContext* txn, const std::string& dbname,
                   BSONObj& cmdObj,
                   int options,
                   std::string& errmsg,
@@ -105,7 +110,7 @@ namespace mongo {
     // Cluster index filter command implementation(s) below
     //
 
-    bool ClusterIndexFilterCmd::run( const std::string& dbName,
+    bool ClusterIndexFilterCmd::run(OperationContext* txn, const std::string& dbName,
                                BSONObj& cmdObj,
                                int options,
                                std::string& errMsg,

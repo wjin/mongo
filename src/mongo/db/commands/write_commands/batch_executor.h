@@ -28,10 +28,12 @@
 
 #pragma once
 
+#include <boost/scoped_ptr.hpp>
 #include <string>
 
 #include "mongo/base/disallow_copying.h"
-#include "mongo/db/client.h"
+#include "mongo/db/ops/update_request.h"
+#include "mongo/db/write_concern_options.h"
 #include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/batched_command_response.h"
 #include "mongo/s/write_ops/batched_delete_document.h"
@@ -43,6 +45,7 @@ namespace mongo {
     class BSONObjBuilder;
     class CurOp;
     class OpCounters;
+    class OperationContext;
     struct LastError;
 
     struct WriteOpStats;
@@ -58,8 +61,8 @@ namespace mongo {
         // State object used by private execInserts.  TODO: Do not expose this type.
         class ExecInsertsState;
 
-        WriteBatchExecutor( const BSONObj& defaultWriteConcern,
-                            Client* client,
+        WriteBatchExecutor( OperationContext* txn,
+                            const WriteConcernOptions& defaultWriteConcern,
                             OpCounters* opCounters,
                             LastError* le );
 
@@ -70,6 +73,12 @@ namespace mongo {
         void executeBatch( const BatchedCommandRequest& request, BatchedCommandResponse* response );
 
         const WriteBatchStats& getStats() const;
+
+        /**
+         * Does basic validation of the batch request. Returns a non-OK status if
+         * any problems with the batch are found.
+         */
+        static Status validateBatch( const BatchedCommandRequest& request );
 
     private:
         /**
@@ -132,12 +141,10 @@ namespace mongo {
                             const WriteErrorDetail* error,
                             CurOp* currentOp );
 
-        // Default write concern, if one isn't provide in the batches.
-        const BSONObj _defaultWriteConcern;
+        OperationContext* _txn;
 
-        // Client object to issue writes on behalf of.
-        // Not owned here.
-        Client* _client;
+        // Default write concern, if one isn't provide in the batches.
+        const WriteConcernOptions _defaultWriteConcern;
 
         // OpCounters object to update - needed for stats reporting
         // Not owned here.
@@ -148,7 +155,7 @@ namespace mongo {
         LastError* _le;
 
         // Stats
-        scoped_ptr<WriteBatchStats> _stats;
+        boost::scoped_ptr<WriteBatchStats> _stats;
     };
 
     /**

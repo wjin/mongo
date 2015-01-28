@@ -26,18 +26,22 @@
 *    it in the license file.
 */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include <cctype>
 
 #include "mongo/db/jsobj.h"
-#include "mongo/db/matcher.h"
+#include "mongo/db/matcher/matcher.h"
 #include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/util/stringutils.h"
 
 namespace mongo {
+
+    using boost::intrusive_ptr;
+    using std::string;
+    using std::vector;
 
     const char DocumentSourceMatch::matchName[] = "$match";
 
@@ -88,8 +92,9 @@ namespace mongo {
         }
 
         // Replace our matcher with the $and of ours and theirs.
-        matcher.reset(new Matcher(BSON("$and" << BSON_ARRAY(getQuery()
-                                                         << otherMatch->getQuery()))));
+        matcher.reset(new Matcher(BSON("$and" << BSON_ARRAY(getQuery() 
+                                              << otherMatch->getQuery())),
+                                  MatchExpressionParser::WhereCallback()));
 
         return true;
     }
@@ -342,8 +347,8 @@ namespace {
 
     DocumentSourceMatch::DocumentSourceMatch(const BSONObj &query,
                                              const intrusive_ptr<ExpressionContext> &pExpCtx)
-        : DocumentSource(pExpCtx)
-        , matcher(new Matcher(query.getOwned()))
-        , _isTextQuery(isTextQuery(query))
+        : DocumentSource(pExpCtx),
+          matcher(new Matcher(query.getOwned(), MatchExpressionParser::WhereCallback())),
+          _isTextQuery(isTextQuery(query))
     {}
 }

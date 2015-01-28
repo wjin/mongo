@@ -1,3 +1,4 @@
+if (0) { // TODO SERVER-16799 reenable
 // Check debug information recorded for a query.
 
 // special db so that it can be run in parallel tests
@@ -55,10 +56,11 @@ try {
     o = lastOp();
     assert.eq('insert', o.op);
 
+    printjson( o );
     assert.eq( 0, o.lockStats.timeLockedMicros.r );
     assert.lt( 0, o.lockStats.timeLockedMicros.w );
     assert.eq( 0, o.lockStats.timeAcquiringMicros.r );
-    //assert.lt( 0, o.lockStats.timeAcquiringMicros.w );    // Removed due to SERVER-8331
+    assert.lte( 0, o.lockStats.timeAcquiringMicros.w );
 
     // check read lock stats are set
     t.find();
@@ -66,15 +68,15 @@ try {
     assert.eq('query', o.op);
     assert.lt( 0, o.lockStats.timeLockedMicros.r );
     assert.eq( 0, o.lockStats.timeLockedMicros.w );
-    //assert.lt( 0, o.lockStats.timeAcquiringMicros.r );    // Removed due to SERVER-8331
-    //assert.lt( 0, o.lockStats.timeAcquiringMicros.w );    // Removed due to SERVER-8331
+    assert.lte( 0, o.lockStats.timeAcquiringMicros.r );
+    assert.lte( 0, o.lockStats.timeAcquiringMicros.w );
 
     t.save( {} );
     t.save( {} );
     t.find().skip( 1 ).limit( 4 ).itcount();
     checkLastOp( [ [ "ntoreturn", 4 ],
                   [ "ntoskip", 1 ],
-                  [ "nscanned", 3 ],
+                  [ "nscannedObjects", 3 ],
                   [ "nreturned", 2 ] ] );
 
     t.find().batchSize( 2 ).next();
@@ -93,8 +95,8 @@ try {
     t.ensureIndex( {a:1} );
     t.find( {a:1} ).itcount();
     o = lastOp();
-    assert.eq( "FETCH", o.execStats.type, tojson( o.execStats ) );
-    assert.eq( "IXSCAN", o.execStats.children[0].type, tojson( o.execStats ) );
+    assert.eq( "FETCH", o.execStats.stage, tojson( o.execStats ) );
+    assert.eq( "IXSCAN", o.execStats.inputStage.stage, tojson( o.execStats ) );
 
     // For queries with a lot of stats data, the execution stats in the profile
     // is replaced by the plan summary.
@@ -116,4 +118,5 @@ try {
 finally {
     db.setProfilingLevel(0);
     db = stddb;
+}
 }

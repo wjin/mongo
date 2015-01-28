@@ -26,7 +26,7 @@
  *    it in the license file.
  */
 
-#include "mongo/db/geo/s2common.h"
+#include "mongo/db/index/s2_common.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/index/2d_common.h"
 #include "mongo/db/jsobj.h"
@@ -50,21 +50,15 @@ namespace mongo {
                     if (e.isNumber()) {
                         order = static_cast<int>(e.Number());
                     }
-                    out->other.push_back(make_pair(e.fieldName(), order));
+                    out->other.push_back(std::make_pair(e.fieldName(), order));
                 }
             }
 
             uassert(16802, "no geo field specified", out->geo.size());
 
-            double bits =  configValueWithDefaultDouble(infoObj, "bits", 26);  // for lat/long, ~ 1ft
-            uassert(16803, "bits in geo index must be between 1 and 32", bits > 0 && bits <= 32);
-
             GeoHashConverter::Parameters hashParams;
-            hashParams.bits = static_cast<unsigned>(bits);
-            hashParams.max = configValueWithDefaultDouble(infoObj, "max", 180.0);
-            hashParams.min = configValueWithDefaultDouble(infoObj, "min", -180.0);
-            double numBuckets = (1024 * 1024 * 1024 * 4.0);
-            hashParams.scaling = numBuckets / (hashParams.max - hashParams.min);
+            Status paramStatus = GeoHashConverter::parseParameters(infoObj, &hashParams);
+            uassertStatusOK(paramStatus);
 
             out->geoHashConverter.reset(new GeoHashConverter(hashParams));
         }
@@ -72,7 +66,7 @@ namespace mongo {
         static void parseHashParams(const BSONObj& infoObj,
                                     HashSeed* seedOut,
                                     int* versionOut,
-                                    string* fieldOut) {
+                                    std::string* fieldOut) {
 
             // Default _seed to DEFAULT_HASH_SEED if "seed" is not included in the index spec
             // or if the value of "seed" is not a number
@@ -101,8 +95,8 @@ namespace mongo {
         }
 
         static void parseHaystackParams(const BSONObj& infoObj,
-                                        string* geoFieldOut,
-                                        vector<string>* otherFieldsOut,
+                                        std::string* geoFieldOut,
+                                        std::vector<std::string>* otherFieldsOut,
                                         double* bucketSizeOut) {
 
             BSONElement e = infoObj["bucketSize"];
@@ -148,7 +142,7 @@ namespace mongo {
                                                                   "coarsestIndexedLevel",
                 S2::kAvgEdge.GetClosestLevel(100 * 1000.0 / out->radius));
 
-            static const string kIndexVersionFieldName("2dsphereIndexVersion");
+            static const std::string kIndexVersionFieldName("2dsphereIndexVersion");
 
             // Determine which version of this index we're using.  If none was set in the descriptor,
             // assume S2_INDEX_VERSION_1 (alas, the first version predates the existence of the version
@@ -171,14 +165,14 @@ namespace mongo {
 
     private:
         static double configValueWithDefaultDouble(const BSONObj& infoObj,
-                                                   const string& name,
+                                                   const std::string& name,
                                                    double def) {
             BSONElement e = infoObj[name];
             if (e.isNumber()) { return e.numberDouble(); }
             return def;
         }
 
-        static int configValueWithDefaultInt(const BSONObj& infoObj, const string& name, int def) {
+        static int configValueWithDefaultInt(const BSONObj& infoObj, const std::string& name, int def) {
             BSONElement e = infoObj[name];
             if (e.isNumber()) { return e.numberInt(); }
             return def;

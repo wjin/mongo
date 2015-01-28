@@ -26,6 +26,8 @@
 *    it in the license file.
 */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kAccessControl
+
 #include "mongo/db/auth/auth_index_d.h"
 
 #include "mongo/base/init.h"
@@ -38,11 +40,14 @@
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/storage/mmap_v1/dur_transaction.h"
+#include "mongo/db/operation_context_impl.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
+
+    using std::endl;
+
 namespace authindex {
 
 namespace {
@@ -57,7 +62,7 @@ namespace {
         v3SystemUsersKeyPattern = BSON(AuthorizationManager::USER_NAME_FIELD_NAME << 1 <<
                                        AuthorizationManager::USER_DB_FIELD_NAME << 1);
         v3SystemRolesKeyPattern = BSON(AuthorizationManager::ROLE_NAME_FIELD_NAME << 1 <<
-                                       AuthorizationManager::ROLE_SOURCE_FIELD_NAME << 1);
+                                       AuthorizationManager::ROLE_DB_FIELD_NAME << 1);
         v3SystemUsersIndexName = std::string(
                 str::stream() <<
                         AuthorizationManager::USER_NAME_FIELD_NAME << "_1_" <<
@@ -65,39 +70,43 @@ namespace {
         v3SystemRolesIndexName = std::string(
                 str::stream() <<
                         AuthorizationManager::ROLE_NAME_FIELD_NAME << "_1_" <<
-                        AuthorizationManager::ROLE_SOURCE_FIELD_NAME << "_1");
+                        AuthorizationManager::ROLE_DB_FIELD_NAME << "_1");
 
         return Status::OK();
     }
 
 }  // namespace
 
-    void configureSystemIndexes(const StringData& dbname) {
-        int authzVersion;
-        Status status = getGlobalAuthorizationManager()->getAuthorizationVersion(&authzVersion);
-        if (!status.isOK()) {
-            return;
+    Status verifySystemIndexes(OperationContext* txn) {
+        const NamespaceString systemUsers = AuthorizationManager::usersCollectionNamespace;
+
+        // Make sure the old unique index from v2.4 on system.users doesn't exist.
+        ScopedTransaction scopedXact(txn, MODE_IX);
+        AutoGetDb autoDb(txn, systemUsers.db(), MODE_X);
+        if (!autoDb.getDb()) {
+            return Status::OK();
         }
 
-        if (dbname == "admin" && authzVersion == AuthorizationManager::schemaVersion26Final) {
-            NamespaceString systemUsers(dbname, "system.users");
-
-            // Make sure the old unique index from v2.4 on system.users doesn't exist.
-            Client::WriteContext wctx(systemUsers);
-            DurTransaction txn;
-            Collection* collection = wctx.ctx().db()->getCollection(NamespaceString(systemUsers));
-            if (!collection) {
-                return;
-            }
-            IndexCatalog* indexCatalog = collection->getIndexCatalog();
-            IndexDescriptor* oldIndex = NULL;
-            while ((oldIndex = indexCatalog->findIndexByKeyPattern(v1SystemUsersKeyPattern))) {
-                indexCatalog->dropIndex(&txn, oldIndex);
-            }
+        Collection* collection = autoDb.getDb()->getCollection(NamespaceString(systemUsers));
+        if (!collection) {
+            return Status::OK();
         }
+
+        IndexCatalog* indexCatalog = collection->getIndexCatalog();
+        IndexDescriptor* oldIndex = NULL;
+
+        if (indexCatalog &&
+            (oldIndex = indexCatalog->findIndexByKeyPattern(txn, v1SystemUsersKeyPattern))) {
+            return Status(ErrorCodes::AuthSchemaIncompatible,
+                          "Old 2.4 style user index identified. "
+                          "The authentication schema needs to be updated by "
+                          "running authSchemaUpgrade on a 2.6 server.");
+        }
+
+        return Status::OK();
     }
 
-    void createSystemIndexes(TransactionExperiment* txn, Collection* collection) {
+    void createSystemIndexes(OperationContext* txn, Collection* collection) {
         invariant( collection );
         const NamespaceString& ns = collection->ns();
         if (ns == AuthorizationManager::usersCollectionNamespace) {

@@ -33,8 +33,10 @@
 #include "mongo/db/query/plan_cache.h"
 
 #include <algorithm>
+#include <boost/scoped_ptr.hpp>
 #include <ostream>
 #include <memory>
+
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
 #include "mongo/db/query/qlog.h"
@@ -50,7 +52,10 @@ using namespace mongo;
 
 namespace {
 
+    using boost::scoped_ptr;
     using std::auto_ptr;
+    using std::string;
+    using std::vector;
 
     static const char* ns = "somebogusns";
 
@@ -182,7 +187,8 @@ namespace {
     PlanRankingDecision* createDecision(size_t numPlans) {
         auto_ptr<PlanRankingDecision> why(new PlanRankingDecision());
         for (size_t i = 0; i < numPlans; ++i) {
-            auto_ptr<PlanStageStats> stats(new PlanStageStats(CommonStats(), STAGE_COLLSCAN));
+            CommonStats common("COLLSCAN");
+            auto_ptr<PlanStageStats> stats(new PlanStageStats(common, STAGE_COLLSCAN));
             stats->specific.reset(new CollectionScanStats());
             why->stats.mutableVector().push_back(stats.release());
             why->scores.push_back(0U);
@@ -357,7 +363,8 @@ namespace {
         PlanCache planCache;
         auto_ptr<CanonicalQuery> cq(canonicalize("{a: 1}"));
         std::vector<QuerySolution*> solns;
-        ASSERT_NOT_OK(planCache.add(*cq, solns, createDecision(1U)));
+        boost::scoped_ptr<PlanRankingDecision> decision(createDecision(1U));
+        ASSERT_NOT_OK(planCache.add(*cq, solns, decision.get()));
     }
 
     TEST(PlanCacheTest, AddValidSolution) {
@@ -443,6 +450,7 @@ namespace {
     class CachePlanSelectionTest : public mongo::unittest::Test {
     protected:
         void setUp() {
+            cq = NULL;
             params.options = QueryPlannerParams::INCLUDE_COLLSCAN;
             addIndex(BSON("_id" << 1));
         }
@@ -462,6 +470,7 @@ namespace {
             params.indices.push_back(IndexEntry(keyPattern,
                                                 multikey,
                                                 false,
+                                                false,
                                                 "hari_king_of_the_stove",
                                                 BSONObj()));
         }
@@ -470,6 +479,7 @@ namespace {
             params.indices.push_back(IndexEntry(keyPattern,
                                                 multikey,
                                                 sparse,
+                                                false,
                                                 "note_to_self_dont_break_build",
                                                 BSONObj()));
         }
@@ -529,7 +539,18 @@ namespace {
                           const BSONObj& minObj,
                           const BSONObj& maxObj,
                           bool snapshot) {
+
+            // Clean up any previous state from a call to runQueryFull
+            delete cq;
+            cq = NULL;
+
+            for (vector<QuerySolution*>::iterator it = solns.begin(); it != solns.end(); ++it) {
+                delete *it;
+            }
+
             solns.clear();
+
+
             Status s = CanonicalQuery::canonicalize(ns, query, sort, proj, skip, limit, hint,
                                                     minObj, maxObj, snapshot,
                                                     false, // explain
@@ -629,6 +650,7 @@ namespace {
             s = QueryPlanner::planFromCache(*scopedCq.get(), params, cachedSoln,
                                             &out, &backupOut);
             ASSERT_OK(s);
+            std::auto_ptr<QuerySolution> cleanBackup(backupOut);
 
             return out;
         }
@@ -700,6 +722,7 @@ namespace {
             QuerySolution* bestSoln = firstMatchingSolution(solnJson);
             QuerySolution* planSoln = planQueryFromCache(query, sort, proj, *bestSoln);
             assertSolutionMatches(planSoln, solnJson);
+            delete planSoln;
         }
 
         /**
@@ -888,7 +911,8 @@ namespace {
                 "{ixscan: {filter: null, pattern: {b: 1, c: 1}}}]}}}}");
     }
 
-    // SERVER-10801
+    // Disabled: SERVER-10801.
+    /*
     TEST_F(CachePlanSelectionTest, SortOnGeoQuery) {
         addIndex(BSON("timestamp" << -1 << "position" << "2dsphere"));
         BSONObj query = fromjson("{position: {$geoWithin: {$geometry: {type: \"Polygon\", "
@@ -900,6 +924,7 @@ namespace {
         assertPlanCacheRecoversSolution(query, sort, BSONObj(),
             "{fetch: {node: {ixscan: {pattern: {timestamp: -1, position: '2dsphere'}}}}}");
     }
+    */
 
     // SERVER-9257
     TEST_F(CachePlanSelectionTest, CompoundGeoNoGeoPredicate) {
@@ -1001,22 +1026,22 @@ namespace {
         // Polygon
         query = fromjson("{a : { $within: { $polygon : [[0,0], [2,0], [4,0]] } }}");
         runQuery(query);
-        assertNotCached("{fetch: {node: {geo2d: {a: '2d'}}}}");
+        assertNotCached("{fetch: {node: {ixscan: {pattern: {a: '2d'}}}}}");
 
         // Center
         query = fromjson("{a : { $within : { $center : [[ 5, 5 ], 7 ] } }}");
         runQuery(query);
-        assertNotCached("{fetch: {node: {geo2d: {a: '2d'}}}}");
+        assertNotCached("{fetch: {node: {ixscan: {pattern: {a: '2d'}}}}}");
 
         // Centersphere
         query = fromjson("{a : { $within : { $centerSphere : [[ 10, 20 ], 0.01 ] } }}");
         runQuery(query);
-        assertNotCached("{fetch: {node: {geo2d: {a: '2d'}}}}");
+        assertNotCached("{fetch: {node: {ixscan: {pattern: {a: '2d'}}}}}");
 
         // Within box.
         query = fromjson("{a : {$within: {$box : [[0,0],[9,9]]}}}");
         runQuery(query);
-        assertNotCached("{fetch: {node: {geo2d: {a: '2d'}}}}");
+        assertNotCached("{fetch: {node: {ixscan: {pattern: {a: '2d'}}}}}");
     }
 
     TEST_F(CachePlanSelectionTest, Or2DNonNearNotCached) {
@@ -1026,7 +1051,8 @@ namespace {
                                         " {b : { $within : { $center : [[ 5, 5 ], 7 ] } }} ]}");
 
         runQuery(query);
-        assertNotCached("{fetch: {node: {or: {nodes: [{geo2d: {a: '2d'}}, {geo2d: {b: '2d'}}]}}}}");
+        assertNotCached("{or: {nodes: [{fetch: {node: {ixscan: {pattern: {a: '2d'}}}}},"
+                                      "{fetch: {node: {ixscan: {pattern: {b: '2d'}}}}}]}}");
     }
 
 }  // namespace

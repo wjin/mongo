@@ -35,6 +35,7 @@
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/matcher/matchable.h"
 #include "mongo/db/matcher/match_details.h"
 
@@ -50,7 +51,7 @@ namespace mongo {
             AND, OR, NOR, NOT,
 
             // array types
-            ALL, ELEM_MATCH_OBJECT, ELEM_MATCH_VALUE, SIZE,
+            ELEM_MATCH_OBJECT, ELEM_MATCH_VALUE, SIZE,
 
             // leaf types
             LTE, LT, EQ, GT, GTE, REGEX, MOD, EXISTS, MATCH_IN, NIN,
@@ -65,7 +66,7 @@ namespace mongo {
             GEO_NEAR, TEXT,
 
             // Expressions that are only created internally
-            INTERNAL_GEO_S2_KEYCHECK
+            INTERNAL_2DSPHERE_KEY_IN_REGION, INTERNAL_2D_KEY_IN_REGION, INTERNAL_2D_POINT_IN_ANNULUS
         };
 
         MatchExpression( MatchType type );
@@ -124,11 +125,11 @@ namespace mongo {
          * Is this node an array operator?  Array operators have multiple clauses but operate on one
          * field.
          *
-         * ALL (AllElemMatchOp)
          * ELEM_MATCH_VALUE, ELEM_MATCH_OBJECT, SIZE (ArrayMatchingMatchExpression)
          */
         bool isArray() const {
-            return SIZE == _matchType || ALL == _matchType || ELEM_MATCH_VALUE == _matchType
+            return SIZE == _matchType
+                   || ELEM_MATCH_VALUE == _matchType
                    || ELEM_MATCH_OBJECT == _matchType;
         }
 
@@ -190,8 +191,9 @@ namespace mongo {
         //
         // Debug information
         //
-        virtual string toString() const;
+        virtual std::string toString() const;
         virtual void debugString( StringBuilder& debug, int level = 0 ) const = 0;
+        virtual void toBSON(BSONObjBuilder* out) const = 0;
 
     protected:
         void _debugAddSpace( StringBuilder& debug, int level ) const;
@@ -223,6 +225,8 @@ namespace mongo {
 
         virtual void debugString( StringBuilder& debug, int level = 0 ) const;
 
+        virtual void toBSON(BSONObjBuilder* out) const;
+
         virtual bool equivalent( const MatchExpression* other ) const {
             return other->matchType() == ATOMIC;
         }
@@ -245,6 +249,8 @@ namespace mongo {
         }
 
         virtual void debugString( StringBuilder& debug, int level = 0 ) const;
+
+        virtual void toBSON(BSONObjBuilder* out) const;
 
         virtual bool equivalent( const MatchExpression* other ) const {
             return other->matchType() == ALWAYS_FALSE;

@@ -28,11 +28,14 @@
 *    then also delete it in the license file.
 */
 
-#include "mongo/pch.h"
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+
+#include "mongo/platform/basic.h"
 
 #include "mongo/s/server.h"
 
 #include <boost/thread/thread.hpp>
+#include <iostream>
 
 #include "mongo/base/init.h"
 #include "mongo/base/initializer.h"
@@ -46,10 +49,14 @@
 #include "mongo/db/auth/user_cache_invalidator_job.h"
 #include "mongo/db/client_basic.h"
 #include "mongo/db/dbwebserver.h"
+#include "mongo/db/global_environment_experiment.h"
+#include "mongo/db/global_environment_noop.h"
 #include "mongo/db/initialize_server_global_state.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/db/log_process_details.h"
+#include "mongo/db/operation_context_noop.h"
+#include "mongo/db/startup_warnings_common.h"
 #include "mongo/platform/process_id.h"
 #include "mongo/s/balance.h"
 #include "mongo/s/chunk.h"
@@ -77,6 +84,7 @@
 #include "mongo/util/ntservice.h"
 #include "mongo/util/options_parser/startup_options.h"
 #include "mongo/util/processinfo.h"
+#include "mongo/util/quick_exit.h"
 #include "mongo/util/ramlog.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/signal_handlers.h"
@@ -87,13 +95,20 @@
 
 namespace mongo {
 
+    using std::cout;
+    using std::endl;
+    using std::string;
+    using std::vector;
+
+    using logger::LogComponent;
+
 #if defined(_WIN32)
     ntservice::NtServiceDefaultStrings defaultServiceStrings = {
         L"MongoS",
         L"MongoDB Router",
         L"MongoDB Sharding Router"
     };
-    static void initService();
+    static ExitCode initService();
 #endif
 
     Database *database = 0;
@@ -145,7 +160,7 @@ namespace mongo {
                     << " for " << r.getns() << causedBy( ex ) << endl;
 
                 if ( r.expectResponse() ) {
-                    m.header()->id = r.id();
+                    m.header().setId(r.id());
                     replyToQuery( ResultFlag_ErrSet, p , m , buildErrReply( ex ) );
                 }
 
@@ -159,7 +174,7 @@ namespace mongo {
                       << " for " << r.getns() << causedBy( ex ) << endl;
 
                 if ( r.expectResponse() ) {
-                    m.header()->id = r.id();
+                    m.header().setId(r.id());
                     replyToQuery( ResultFlag_ErrSet, p , m , buildErrReply( ex ) );
                 }
 
@@ -176,11 +191,6 @@ namespace mongo {
         }
     };
 
-
-    void init() {
-        serverID.init();
-    }
-
     void start( const MessageServer::Options& opts ) {
         balancer.go();
         cursorCache.startTimeoutThread();
@@ -196,7 +206,7 @@ namespace mongo {
         server->run();
     }
 
-    DBClientBase *createDirectClient() {
+    DBClientBase* createDirectClient(OperationContext* txn) {
         uassert( 10197 ,  "createDirectClient not implemented for sharding yet" , 0 );
         return 0;
     }
@@ -205,7 +215,7 @@ namespace mongo {
 
 using namespace mongo;
 
-static bool runMongosServer( bool doUpgrade ) {
+static ExitCode runMongosServer( bool doUpgrade ) {
     setThreadName( "mongosMain" );
     printShardingVersionInfo( false );
 
@@ -219,16 +229,24 @@ static bool runMongosServer( bool doUpgrade ) {
     DBClientConnection::setLazyKillCursor( false );
 
     ReplicaSetMonitor::setConfigChangeHook(
-        boost::bind(&ConfigServer::replicaSetChange, &configServer, _1 , _2));
+        stdx::bind(&ConfigServer::replicaSetChange, &configServer, stdx::placeholders::_1 , stdx::placeholders::_2));
+
+    // Mongos connection pools already takes care of authenticating new connections so the
+    // replica set connection shouldn't need to.
+    DBClientReplicaSet::setAuthPooledSecondaryConn(false);
+
+    if (getHostName().empty()) {
+        dbexit(EXIT_BADOPTIONS);
+    }
 
     if (!configServer.init(mongosGlobalParams.configdbs)) {
-        log() << "couldn't resolve config db address" << endl;
-        return false;
+        mongo::log(LogComponent::kDefault) << "couldn't resolve config db address" << endl;
+        return EXIT_SHARDING_ERROR;
     }
 
     if ( ! configServer.ok( true ) ) {
-        log() << "configServer connection startup check failed" << endl;
-        return false;
+        mongo::log(LogComponent::kDefault) << "configServer connection startup check failed" << endl;
+        return EXIT_SHARDING_ERROR;
     }
 
     startConfigServerChecker();
@@ -239,8 +257,8 @@ static bool runMongosServer( bool doUpgrade ) {
     string configServerURL = configServer.getPrimary().getConnString();
     ConnectionString configServerConnString = ConnectionString::parse(configServerURL, errMsg);
     if (!configServerConnString.isValid()) {
-        error() << "Invalid connection string for config servers: " << configServerURL << endl;
-        return false;
+        error(LogComponent::kDefault) << "Invalid connection string for config servers: " << configServerURL << endl;
+        return EXIT_SHARDING_ERROR;
     }
     bool upgraded = checkAndUpgradeConfigVersion(configServerConnString,
                                                  doUpgrade,
@@ -249,31 +267,34 @@ static bool runMongosServer( bool doUpgrade ) {
                                                  &errMsg);
 
     if (!upgraded) {
-        error() << "error upgrading config database to v" << CURRENT_CONFIG_VERSION
+        error(LogComponent::kDefault) << "error upgrading config database to v"
+                << CURRENT_CONFIG_VERSION
                 << causedBy(errMsg) << endl;
-        return false;
+        return EXIT_SHARDING_ERROR;
     }
 
     if ( doUpgrade ) {
-        log() << "Config database is at version v" << CURRENT_CONFIG_VERSION;
-        return true;
+        mongo::log(LogComponent::kDefault) << "Config database is at version v"
+                << CURRENT_CONFIG_VERSION;
+        return EXIT_CLEAN;
     }
 
     configServer.reloadSettings();
-
-    init();
 
 #if !defined(_WIN32)
     mongo::signalForkSuccess();
 #endif
 
     if (serverGlobalParams.isHttpInterfaceEnabled)
-        boost::thread web( boost::bind(&webServerThread, new NoAdminAccess() /* takes ownership */) );
+        boost::thread web( stdx::bind(&webServerThread,
+                                       new NoAdminAccess())); // takes ownership
 
-    Status status = getGlobalAuthorizationManager()->initialize();
+    OperationContextNoop txn;
+
+    Status status = getGlobalAuthorizationManager()->initialize(&txn);
     if (!status.isOK()) {
-        log() << "Initializing authorization data failed: " << status;
-        return false;
+        mongo::log(LogComponent::kDefault) << "Initializing authorization data failed: " << status;
+        return EXIT_SHARDING_ERROR;
     }
 
     MessageServer::Options opts;
@@ -282,8 +303,7 @@ static bool runMongosServer( bool doUpgrade ) {
     start(opts);
 
     // listen() will return when exit code closes its socket.
-    dbexit( EXIT_NET_ERROR );
-    return true;
+    return EXIT_NET_ERROR;
 }
 
 MONGO_INITIALIZER_GENERAL(ForkServer,
@@ -310,7 +330,6 @@ static void startupConfigActions(const std::vector<std::string>& argv) {
 }
 
 static int _main() {
-
     if (!initializeServerGlobalState())
         return EXIT_FAILURE;
 
@@ -328,13 +347,14 @@ static int _main() {
             }
 
             if ( configAddr.isLocalHost() != grid.allowLocalHost() ) {
-                out() << "cannot mix localhost and ip addresses in configdbs" << endl;
+                mongo::log(LogComponent::kDefault)
+                    << "cannot mix localhost and ip addresses in configdbs" << endl;
                 return 10;
             }
 
         }
         catch ( DBException& e) {
-            out() << "configdb: " << e.what() << endl;
+            mongo::log(LogComponent::kDefault) << "configdb: " << e.what() << endl;
             return 9;
         }
     }
@@ -347,26 +367,43 @@ static int _main() {
     }
 #endif
 
-    return !runMongosServer(mongosGlobalParams.upgrade);
+    ExitCode exitCode = runMongosServer(mongosGlobalParams.upgrade);
+
+    // To maintain backwards compatibility, we exit with EXIT_NET_ERROR if the listener loop returns.
+    if (exitCode == EXIT_NET_ERROR) {
+        dbexit( EXIT_NET_ERROR );
+    }
+
+    return (exitCode == EXIT_CLEAN) ? 0 : 1;
 }
 
 #if defined(_WIN32)
 namespace mongo {
-    static void initService() {
+    static ExitCode initService() {
         ntservice::reportStatus( SERVICE_RUNNING );
         log() << "Service running" << endl;
-        runMongosServer( false );
+
+        ExitCode exitCode = runMongosServer(mongosGlobalParams.upgrade);
+
+        // ignore EXIT_NET_ERROR on clean shutdown since we return this when the listening socket
+        // is closed
+        return (exitCode == EXIT_NET_ERROR && inShutdown()) ? EXIT_CLEAN : exitCode;
     }
 }  // namespace mongo
 #endif
 
 MONGO_INITIALIZER_GENERAL(CreateAuthorizationManager,
-                          ("SetupInternalSecurityUser"),
+                          ("SetupInternalSecurityUser", "OIDGeneration"),
                           MONGO_NO_DEPENDENTS)
         (InitializerContext* context) {
     AuthorizationManager* authzManager =
                 new AuthorizationManager(new AuthzManagerExternalStateMongos());
     setGlobalAuthorizationManager(authzManager);
+    return Status::OK();
+}
+
+MONGO_INITIALIZER(SetGlobalEnvironment)(InitializerContext* context) {
+    setGlobalEnvironment(new GlobalEnvironmentNoop());
     return Status::OK();
 }
 
@@ -384,18 +421,21 @@ int mongoSMain(int argc, char* argv[], char** envp) {
     if (argc < 1)
         return EXIT_FAILURE;
 
-    setupSignalHandlers();
+    setupSignalHandlers(false);
 
     mongosCommand = argv[0];
 
     Status status = mongo::runGlobalInitializers(argc, argv, envp);
     if (!status.isOK()) {
-        severe() << "Failed global initialization: " << status;
-        ::_exit(EXIT_FAILURE);
+        severe(LogComponent::kDefault) << "Failed global initialization: " << status;
+        quickExit(EXIT_FAILURE);
     }
 
     startupConfigActions(std::vector<std::string>(argv, argv + argc));
     cmdline_utils::censorArgvArray(argc, argv);
+
+    mongo::logCommonStartupWarnings();
+
     try {
         int exitCode = _main();
         return exitCode;
@@ -427,18 +467,18 @@ int mongoSMain(int argc, char* argv[], char** envp) {
 int wmain(int argc, wchar_t* argvW[], wchar_t* envpW[]) {
     WindowsCommandLine wcl(argc, argvW, envpW);
     int exitCode = mongoSMain(argc, wcl.argv(), wcl.envp());
-    ::_exit(exitCode);
+    quickExit(exitCode);
 }
 #else
 int main(int argc, char* argv[], char** envp) {
     int exitCode = mongoSMain(argc, argv, envp);
-    ::_exit(exitCode);
+    quickExit(exitCode);
 }
 #endif
 
 #undef exit
 
-void mongo::exitCleanly( ExitCode code ) {
+void mongo::exitCleanly(ExitCode code) {
     // TODO: do we need to add anything?
     mongo::dbexit( code );
 }
@@ -454,8 +494,7 @@ void mongo::dbexit( ExitCode rc, const char *why ) {
 #endif
     log() << "dbexit: " << why
           << " rc:" << rc
-          << " " << ( why ? why : "" )
           << endl;
     flushForGcov();
-    ::_exit(rc);
+    quickExit(rc);
 }

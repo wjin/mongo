@@ -27,13 +27,20 @@
 */
 
 #include "mongo/db/exec/skip.h"
+#include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
 
+    using std::auto_ptr;
+    using std::vector;
+
+    // static
+    const char* SkipStage::kStageType = "SKIP";
+
     SkipStage::SkipStage(int toSkip, WorkingSet* ws, PlanStage* child)
-        : _ws(ws), _child(child), _toSkip(toSkip) { }
+        : _ws(ws), _child(child), _toSkip(toSkip), _commonStats(kStageType) { }
 
     SkipStage::~SkipStage() { }
 
@@ -41,6 +48,9 @@ namespace mongo {
 
     PlanStage::StageState SkipStage::work(WorkingSetID* out) {
         ++_commonStats.works;
+
+        // Adds the amount of time taken by work() to executionTimeMillis.
+        ScopedTimer timer(&_commonStats.executionTimeMillis);
 
         WorkingSetID id = WorkingSet::INVALID_ID;
         StageState status = _child->work(&id);
@@ -72,39 +82,54 @@ namespace mongo {
             }
             return status;
         }
-        else {
-            if (PlanStage::NEED_FETCH == status) {
-                *out = id;
-                ++_commonStats.needFetch;
-            }
-            else if (PlanStage::NEED_TIME == status) {
-                ++_commonStats.needTime;
-            }
-            // NEED_TIME/YIELD, ERROR, IS_EOF
-            return status;
+        else if (PlanStage::NEED_TIME == status) {
+            ++_commonStats.needTime;
         }
+        else if (PlanStage::NEED_FETCH == status) {
+            ++_commonStats.needFetch;
+            *out = id;
+        }
+
+        // NEED_TIME, NEED_FETCH, ERROR, IS_EOF
+        return status;
     }
 
-    void SkipStage::prepareToYield() {
+    void SkipStage::saveState() {
         ++_commonStats.yields;
-        _child->prepareToYield();
+        _child->saveState();
     }
 
-    void SkipStage::recoverFromYield() {
+    void SkipStage::restoreState(OperationContext* opCtx) {
         ++_commonStats.unyields;
-        _child->recoverFromYield();
+        _child->restoreState(opCtx);
     }
 
-    void SkipStage::invalidate(const DiskLoc& dl, InvalidationType type) {
+    void SkipStage::invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type) {
         ++_commonStats.invalidates;
-        _child->invalidate(dl, type);
+        _child->invalidate(txn, dl, type);
+    }
+
+    vector<PlanStage*> SkipStage::getChildren() const {
+        vector<PlanStage*> children;
+        children.push_back(_child.get());
+        return children;
     }
 
     PlanStageStats* SkipStage::getStats() {
         _commonStats.isEOF = isEOF();
+        _specificStats.skip = _toSkip;
         auto_ptr<PlanStageStats> ret(new PlanStageStats(_commonStats, STAGE_SKIP));
+        ret->specific.reset(new SkipStats(_specificStats));
         ret->children.push_back(_child->getStats());
         return ret.release();
+    }
+
+    const CommonStats* SkipStage::getCommonStats() {
+        return &_commonStats;
+    }
+
+    const SpecificStats* SkipStage::getSpecificStats() {
+        return &_specificStats;
     }
 
 }  // namespace mongo

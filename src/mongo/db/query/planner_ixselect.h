@@ -46,15 +46,15 @@ namespace mongo {
          * The 'prefix' argument is a path prefix to be prepended to any fields mentioned in
          * predicates encountered.  Some array operators specify a path prefix.
          */
-        static void getFields(MatchExpression* node, string prefix, unordered_set<string>* out);
+        static void getFields(MatchExpression* node, std::string prefix, unordered_set<std::string>* out);
 
         /**
          * Find all indices prefixed by fields we have predicates over.  Only these indices are
          * useful in answering the query.
          */
-        static void findRelevantIndices(const unordered_set<string>& fields,
-                                        const vector<IndexEntry>& indices,
-                                        vector<IndexEntry>* out);
+        static void findRelevantIndices(const unordered_set<std::string>& fields,
+                                        const std::vector<IndexEntry>& indices,
+                                        std::vector<IndexEntry>* out);
 
         /**
          * Return true if the index key pattern field 'elt' (which belongs to 'index') can be used
@@ -84,8 +84,8 @@ namespace mongo {
          * original predicate by having an AND as a parent.
          */
         static void rateIndices(MatchExpression* node,
-                                string prefix,
-                                const vector<IndexEntry>& indices);
+                                std::string prefix,
+                                const std::vector<IndexEntry>& indices);
 
         /**
          * Amend the RelevantTag lists for all predicates in the subtree rooted at 'node' to remove
@@ -94,7 +94,34 @@ namespace mongo {
          * See the body of this function and the specific stripInvalidAssignments functions for details.
          */
         static void stripInvalidAssignments(MatchExpression* node,
-                                            const vector<IndexEntry>& indices);
+                                            const std::vector<IndexEntry>& indices);
+
+        /**
+         * In some special cases, we can strip most of the index assignments from the tree early
+         * on. Specifically, if we find an AND which has a child tagged for equality over a
+         * single-field unique index, then all other predicate-to-index assignments can be
+         * stripped off the subtree rooted at 'node'.
+         *
+         * This is used to ensure that we always favor key-value lookup plans over any
+         * more complex plan.
+         *
+         * Example:
+         *   Suppose you have match expression OR (AND (a==1, b==2), AND (c==3, d==4)).
+         *   There are indices on fields, 'a', 'b', 'c', and 'd'. The index on 'd' is
+         *   the only unique index.
+         *
+         *   This code will find that the subtree AND (c==3, d==4) can be answered by
+         *   looking up the value of 'd' in the unique index. Since no better plan than
+         *   a single key lookup is ever available, all assignments in this subtree
+         *   are stripped, except for the assignment of d==4 to the unique 'd' index.
+         *
+         *   Stripping the assignment for 'c' causes the planner to generate just two
+         *   possible plans:
+         *     1) an OR of an index scan over 'a' and an index scan over 'd'
+         *     2) an OR of an index scan over 'b' and an index scan over 'd'
+         */
+        static void stripUnneededAssignments(MatchExpression* node,
+                                             const std::vector<IndexEntry>& indices);
 
     private:
         /**
@@ -129,7 +156,7 @@ namespace mongo {
          * those annotations get removed here.
          */
         static void stripInvalidAssignmentsToTextIndexes(MatchExpression* node,
-                                                         const vector<IndexEntry>& indices);
+                                                         const std::vector<IndexEntry>& indices);
 
         /**
          * For V1 2dsphere indices we ignore the sparse option.  As such we can use an index
@@ -149,7 +176,7 @@ namespace mongo {
          * predicate on every geo field in the index.
          */
         static void stripInvalidAssignmentsTo2dsphereIndices(MatchExpression* node,
-                                                             const vector<IndexEntry>& indices);
+                                                             const std::vector<IndexEntry>& indices);
     };
 
 }  // namespace mongo

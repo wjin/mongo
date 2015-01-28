@@ -1,7 +1,7 @@
 // documentsourcetests.cpp : Unit tests for DocumentSource classes.
 
 /**
- *    Copyright (C) 2012 10gen Inc.
+ *    Copyright (C) 2012-2014 MongoDB Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -28,25 +28,33 @@
  *    then also delete it in the license file.
  */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
+#include <boost/shared_ptr.hpp>
 #include <boost/thread/thread.hpp>
 
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
-#include "mongo/db/interrupt_status_mongod.h"
+#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/expression_context.h"
-#include "mongo/db/query/get_runner.h"
+#include "mongo/db/query/get_executor.h"
 #include "mongo/db/storage_options.h"
 #include "mongo/dbtests/dbtests.h"
 
 namespace DocumentSourceTests {
 
+    using boost::intrusive_ptr;
+    using boost::shared_ptr;
+    using std::map;
+    using std::set;
+    using std::string;
+    using std::vector;
+
     static const char* const ns = "unittests.documentsourcetests";
     static const BSONObj metaTextScore = BSON("$meta" << "textScore");
-    static DBDirectClient client;
 
     BSONObj toBson( const intrusive_ptr<DocumentSource>& source ) {
         vector<Value> arr;
@@ -57,9 +65,17 @@ namespace DocumentSourceTests {
 
     class CollectionBase {
     public:
+        CollectionBase() : client(&_opCtx) {
+
+        }
+
         ~CollectionBase() {
             client.dropCollection( ns );
         }
+
+    protected:
+        OperationContextImpl _opCtx;
+        DBDirectClient client;
     };
 
     namespace DocumentSourceClass {
@@ -155,35 +171,38 @@ namespace DocumentSourceTests {
 
         class Base : public CollectionBase {
         public:
-            Base()
-                : _ctx(new ExpressionContext(InterruptStatusMongod::status, NamespaceString(ns)))
-            { _ctx->tempDir = storageGlobalParams.dbpath + "/_tmp"; }
+            Base() : _ctx(new ExpressionContext(&_opCtx, NamespaceString(ns))) { 
+                _ctx->tempDir = storageGlobalParams.dbpath + "/_tmp"; 
+            }
+
         protected:
             void createSource() {
                 // clean up first if this was called before
                 _source.reset();
-                _registration.reset();
-                _runner.reset();
+                _exec.reset();
 
-                Client::WriteContext ctx (ns);
+                Client::WriteContext ctx(&_opCtx, ns);
                 CanonicalQuery* cq;
                 uassertStatusOK(CanonicalQuery::canonicalize(ns, /*query=*/BSONObj(), &cq));
-                Runner* runnerBare;
-                uassertStatusOK(getRunner(ctx.ctx().db()->getCollection(ns), cq, &runnerBare));
+                PlanExecutor* execBare;
+                uassertStatusOK(getExecutor(&_opCtx,
+                                            ctx.getCollection(),
+                                            cq,
+                                            PlanExecutor::YIELD_MANUAL,
+                                            &execBare));
 
-                _runner.reset(runnerBare);
-                _runner->setYieldPolicy(Runner::YIELD_AUTO);
-                _runner->saveState();
-                _registration.reset(new ScopedRunnerRegistration(_runner.get()));
+                _exec.reset(execBare);
+                _exec->saveState();
+                _exec->registerExec();
 
-                _source = DocumentSourceCursor::create(ns, _runner, _ctx);
+                _source = DocumentSourceCursor::create(ns, _exec, _ctx);
             }
             intrusive_ptr<ExpressionContext> ctx() { return _ctx; }
             DocumentSourceCursor* source() { return _source.get(); }
+
         private:
             // It is important that these are ordered to ensure correct destruction order.
-            boost::shared_ptr<Runner> _runner;
-            boost::scoped_ptr<ScopedRunnerRegistration> _registration;
+            boost::shared_ptr<PlanExecutor> _exec;
             intrusive_ptr<ExpressionContext> _ctx;
             intrusive_ptr<DocumentSourceCursor> _source;
         };
@@ -194,11 +213,11 @@ namespace DocumentSourceTests {
             void run() {
                 createSource();
                 // The DocumentSourceCursor doesn't hold a read lock.
-                ASSERT( !Lock::isReadLocked() );
+                ASSERT( !_opCtx.lockState()->isReadLocked() );
                 // The collection is empty, so the source produces no results.
                 ASSERT( !source()->getNext() );
                 // Exhausting the source releases the read lock.
-                ASSERT( !Lock::isReadLocked() );
+                ASSERT( !_opCtx.lockState()->isReadLocked() );
             }
         };
 
@@ -209,7 +228,7 @@ namespace DocumentSourceTests {
                 client.insert( ns, BSON( "a" << 1 ) );
                 createSource();
                 // The DocumentSourceCursor doesn't hold a read lock.
-                ASSERT( !Lock::isReadLocked() );
+                ASSERT( !_opCtx.lockState()->isReadLocked() );
                 // The cursor will produce the expected result.
                 boost::optional<Document> next = source()->getNext();
                 ASSERT(bool(next));
@@ -217,7 +236,7 @@ namespace DocumentSourceTests {
                 // There are no more results.
                 ASSERT( !source()->getNext() );
                 // Exhausting the source releases the read lock.
-                ASSERT( !Lock::isReadLocked() );                
+                ASSERT( !_opCtx.lockState()->isReadLocked() );
             }
         };
 
@@ -227,10 +246,10 @@ namespace DocumentSourceTests {
             void run() {
                 createSource();
                 // The DocumentSourceCursor doesn't hold a read lock.
-                ASSERT( !Lock::isReadLocked() );
+                ASSERT( !_opCtx.lockState()->isReadLocked() );
                 source()->dispose();
                 // Releasing the cursor releases the read lock.
-                ASSERT( !Lock::isReadLocked() );
+                ASSERT( !_opCtx.lockState()->isReadLocked() );
                 // The source is marked as exhausted.
                 ASSERT( !source()->getNext() );
             }
@@ -253,10 +272,10 @@ namespace DocumentSourceTests {
                 ASSERT(bool(next));
                 ASSERT_EQUALS(Value(2), next->getField("a"));
                 // The DocumentSourceCursor doesn't hold a read lock.
-                ASSERT( !Lock::isReadLocked() );
+                ASSERT( !_opCtx.lockState()->isReadLocked() );
                 source()->dispose();
                 // Disposing of the source releases the lock.
-                ASSERT( !Lock::isReadLocked() );
+                ASSERT( !_opCtx.lockState()->isReadLocked() );
                 // The source cannot be advanced further.
                 ASSERT( !source()->getNext() );
             }
@@ -286,57 +305,6 @@ namespace DocumentSourceTests {
             mutable boost::condition _condition;
         };
 
-        /** A writer client will be registered for the lifetime of an object of this class. */
-        class WriterClientScope {
-        public:
-            WriterClientScope() :
-            _state( Initial ),
-            _dummyWriter( boost::bind( &WriterClientScope::runDummyWriter, this ) ) {
-                _state.await( Ready );
-            }
-            ~WriterClientScope() {
-                // Terminate the writer thread even on exception.
-                _state.set( Finished );
-                DESTRUCTOR_GUARD( _dummyWriter.join() );
-            }
-        private:
-            enum State {
-                Initial,
-                Ready,
-                Finished
-            };
-            void runDummyWriter() {
-                Client::initThread( "dummy writer" );
-                scoped_ptr<Acquiring> a( new Acquiring( 0 , cc().lockState() ) );
-                _state.set( Ready );
-                _state.await( Finished );
-                a.reset(0);
-                cc().shutdown();
-            }
-            PendingValue _state;
-            boost::thread _dummyWriter;
-        };
-
-        /** DocumentSourceCursor yields deterministically when enough documents are scanned. */
-        class Yield : public Base {
-        public:
-            void run() {
-                // Insert enough documents that counting them will exceed the iteration threshold
-                // to trigger a yield.
-                for( int i = 0; i < 1000; ++i ) {
-                    client.insert( ns, BSON( "a" << 1 ) );
-                }
-                createSource();
-                ASSERT_EQUALS( 0, cc().curop()->numYields() );
-                // Iterate through all results.
-                while( source()->getNext() );
-                // The lock was yielded during iteration.
-                ASSERT_GREATER_THAN(cc().curop()->numYields(), 0);
-            }
-        private:
-            // An active writer is required to trigger yielding.
-            WriterClientScope _writerScope;
-        };
 
         /** Test coalescing a limit into a cursor */
         class LimitCoalesce : public Base {
@@ -396,7 +364,7 @@ namespace DocumentSourceTests {
                 client.insert( ns, BSON( "a" << 2 ) );
                 createSource();
                 // The DocumentSourceCursor doesn't hold a read lock.
-                ASSERT( !Lock::isReadLocked() );
+                ASSERT( !_opCtx.lockState()->isReadLocked() );
                 createLimit( 1 );
                 limit()->setSource( source() );
                 // The limit's result is as expected.
@@ -406,7 +374,7 @@ namespace DocumentSourceTests {
                 // The limit is exhausted.
                 ASSERT( !limit()->getNext() );
                 // The limit disposes the source, releasing the read lock.
-                ASSERT( !Lock::isReadLocked() );
+                ASSERT( !_opCtx.lockState()->isReadLocked() );
             }
         };
 
@@ -435,7 +403,7 @@ namespace DocumentSourceTests {
                 ASSERT( !limit()->getNext() );
                 // The limit disposes the match, which disposes the source and releases the read
                 // lock.
-                ASSERT( !Lock::isReadLocked() );
+                ASSERT( !_opCtx.lockState()->isReadLocked() );
             }
         };
 
@@ -465,7 +433,7 @@ namespace DocumentSourceTests {
                 BSONElement specElement = namedSpec.firstElement();
 
                 intrusive_ptr<ExpressionContext> expressionContext =
-                        new ExpressionContext(InterruptStatusMongod::status, NamespaceString(ns));
+                        new ExpressionContext(&_opCtx, NamespaceString(ns));
                 expressionContext->inShard = inShard;
                 expressionContext->tempDir = storageGlobalParams.dbpath + "/_tmp";
 
@@ -1931,7 +1899,6 @@ namespace DocumentSourceTests {
             add<DocumentSourceCursor::Iterate>();
             add<DocumentSourceCursor::Dispose>();
             add<DocumentSourceCursor::IterateDispose>();
-            add<DocumentSourceCursor::Yield>();
             add<DocumentSourceCursor::LimitCoalesce>();
 
             add<DocumentSourceLimit::DisposeSource>();
@@ -2027,6 +1994,8 @@ namespace DocumentSourceTests {
             add<DocumentSourceMatch::RedactSafePortion>();
             add<DocumentSourceMatch::Coalesce>();
         }
-    } myall;
+    };
+
+    SuiteInstance<All> myall;
 
 } // namespace DocumentSourceTests

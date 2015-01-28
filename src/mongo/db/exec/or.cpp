@@ -27,14 +27,22 @@
  */
 
 #include "mongo/db/exec/or.h"
+
 #include "mongo/db/exec/filter.h"
+#include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
 
+    using std::auto_ptr;
+    using std::vector;
+
+    // static
+    const char* OrStage::kStageType = "OR";
+
     OrStage::OrStage(WorkingSet* ws, bool dedup, const MatchExpression* filter)
-        : _ws(ws), _filter(filter), _currentChild(0), _dedup(dedup) { }
+        : _ws(ws), _filter(filter), _currentChild(0), _dedup(dedup), _commonStats(kStageType) { }
 
     OrStage::~OrStage() {
         for (size_t i = 0; i < _children.size(); ++i) {
@@ -48,6 +56,9 @@ namespace mongo {
 
     PlanStage::StageState OrStage::work(WorkingSetID* out) {
         ++_commonStats.works;
+
+        // Adds the amount of time taken by work() to executionTimeMillis.
+        ScopedTimer timer(&_commonStats.executionTimeMillis);
 
         if (isEOF()) { return PlanStage::IS_EOF; }
 
@@ -65,7 +76,7 @@ namespace mongo {
             if (_dedup && member->hasLoc()) {
                 ++_specificStats.dupsTested;
 
-                // ...and we've seen the DiskLoc before
+                // ...and we've seen the RecordId before
                 if (_seen.end() != _seen.find(member->loc)) {
                     // ...drop it.
                     ++_specificStats.dupsDropped;
@@ -121,47 +132,45 @@ namespace mongo {
             }
             return childStatus;
         }
-        else {
-            if (PlanStage::NEED_FETCH == childStatus) {
-                *out = id;
-                ++_commonStats.needFetch;
-            }
-            else if (PlanStage::NEED_TIME == childStatus) {
-                ++_commonStats.needTime;
-            }
-
-            // NEED_TIME, ERROR, NEED_YIELD, pass them up.
-            return childStatus;
+        else if (PlanStage::NEED_TIME == childStatus) {
+            ++_commonStats.needTime;
         }
+        else if (PlanStage::NEED_FETCH == childStatus) {
+            ++_commonStats.needFetch;
+            *out = id;
+        }
+
+        // NEED_TIME, ERROR, NEED_FETCH, pass them up.
+        return childStatus;
     }
 
-    void OrStage::prepareToYield() {
+    void OrStage::saveState() {
         ++_commonStats.yields;
         for (size_t i = 0; i < _children.size(); ++i) {
-            _children[i]->prepareToYield();
+            _children[i]->saveState();
         }
     }
 
-    void OrStage::recoverFromYield() {
+    void OrStage::restoreState(OperationContext* opCtx) {
         ++_commonStats.unyields;
         for (size_t i = 0; i < _children.size(); ++i) {
-            _children[i]->recoverFromYield();
+            _children[i]->restoreState(opCtx);
         }
     }
 
-    void OrStage::invalidate(const DiskLoc& dl, InvalidationType type) {
+    void OrStage::invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type) {
         ++_commonStats.invalidates;
 
         if (isEOF()) { return; }
 
         for (size_t i = 0; i < _children.size(); ++i) {
-            _children[i]->invalidate(dl, type);
+            _children[i]->invalidate(txn, dl, type);
         }
 
         // If we see DL again it is not the same record as it once was so we still want to
         // return it.
         if (_dedup && INVALIDATION_DELETION == type) {
-            unordered_set<DiskLoc, DiskLoc::Hasher>::iterator it = _seen.find(dl);
+            unordered_set<RecordId, RecordId::Hasher>::iterator it = _seen.find(dl);
             if (_seen.end() != it) {
                 ++_specificStats.locsForgotten;
                 _seen.erase(dl);
@@ -169,8 +178,19 @@ namespace mongo {
         }
     }
 
+    vector<PlanStage*> OrStage::getChildren() const {
+        return _children;
+    }
+
     PlanStageStats* OrStage::getStats() {
         _commonStats.isEOF = isEOF();
+
+        // Add a BSON representation of the filter to the stats tree, if there is one.
+        if (NULL != _filter) {
+            BSONObjBuilder bob;
+            _filter->toBSON(&bob);
+            _commonStats.filter = bob.obj();
+        }
 
         auto_ptr<PlanStageStats> ret(new PlanStageStats(_commonStats, STAGE_OR));
         ret->specific.reset(new OrStats(_specificStats));
@@ -179,6 +199,14 @@ namespace mongo {
         }
 
         return ret.release();
+    }
+
+    const CommonStats* OrStage::getCommonStats() {
+        return &_commonStats;
+    }
+
+    const SpecificStats* OrStage::getSpecificStats() {
+        return &_specificStats;
     }
 
 }  // namespace mongo

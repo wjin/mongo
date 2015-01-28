@@ -32,13 +32,13 @@
 #include <vector>
 #include <set>
 
-#include "mongo/db/diskloc.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/db/matcher.h"
 #include "mongo/db/exec/plan_stage.h"
 #include "mongo/db/exec/working_set.h"
+#include "mongo/db/jsobj.h"
 #include "mongo/db/query/index_bounds.h"
+#include "mongo/db/record_id.h"
 #include "mongo/platform/unordered_map.h"
+
 
 namespace mongo {
 
@@ -49,7 +49,7 @@ namespace mongo {
     public:
         SortStageParams() : collection(NULL), limit(0) { }
 
-        // Used for resolving DiskLocs to BSON
+        // Used for resolving RecordIds to BSON
         const Collection* collection;
 
         // How we're sorting.
@@ -142,21 +142,32 @@ namespace mongo {
      */
     class SortStage : public PlanStage {
     public:
-        SortStage(const SortStageParams& params, WorkingSet* ws, PlanStage* child);
+        SortStage(const SortStageParams& params,
+                  WorkingSet* ws,
+                  PlanStage* child);
 
         virtual ~SortStage();
 
         virtual bool isEOF();
         virtual StageState work(WorkingSetID* out);
 
-        virtual void prepareToYield();
-        virtual void recoverFromYield();
-        virtual void invalidate(const DiskLoc& dl, InvalidationType type);
+        virtual void saveState();
+        virtual void restoreState(OperationContext* opCtx);
+        virtual void invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type);
+
+        virtual std::vector<PlanStage*> getChildren() const;
+
+        virtual StageType stageType() const { return STAGE_SORT; }
 
         PlanStageStats* getStats();
 
+        virtual const CommonStats* getCommonStats();
+
+        virtual const SpecificStats* getSpecificStats();
+
+        static const char* kStageType;
+
     private:
-        void getBoundsForSort(const BSONObj& queryObj, const BSONObj& sortObj);
 
         //
         // Query Stage
@@ -198,15 +209,15 @@ namespace mongo {
             WorkingSetID wsid;
             BSONObj sortKey;
             // Since we must replicate the behavior of a covered sort as much as possible we use the
-            // DiskLoc to break sortKey ties.
+            // RecordId to break sortKey ties.
             // See sorta.js.
-            DiskLoc loc;
+            RecordId loc;
         };
 
         // Comparison object for data buffers (vector and set).
         // Items are compared on (sortKey, loc). This is also how the items are
         // ordered in the indices.
-        // Keys are compared using BSONObj::woCompare() with DiskLoc as a tie-breaker.
+        // Keys are compared using BSONObj::woCompare() with RecordId as a tie-breaker.
         struct WorkingSetComparator {
             explicit WorkingSetComparator(BSONObj p);
 
@@ -231,7 +242,7 @@ namespace mongo {
 
         // Comparator for data buffer
         // Initialization follows sort key generator
-        scoped_ptr<WorkingSetComparator> _sortKeyComparator;
+        boost::scoped_ptr<WorkingSetComparator> _sortKeyComparator;
 
         // The data we buffer and sort.
         // _data will contain sorted data when all data is gathered
@@ -240,15 +251,15 @@ namespace mongo {
         // _dataSet is used instead to maintain an ordered set of the incomplete data set.
         // When the data set is complete, we copy the items from _dataSet to _data which will
         // be used to provide the results of this stage through _resultIterator.
-        vector<SortableDataItem> _data;
+        std::vector<SortableDataItem> _data;
         typedef std::set<SortableDataItem, WorkingSetComparator> SortableDataItemSet;
-        scoped_ptr<SortableDataItemSet> _dataSet;
+        boost::scoped_ptr<SortableDataItemSet> _dataSet;
 
         // Iterates through _data post-sort returning it.
-        vector<SortableDataItem>::iterator _resultIterator;
+        std::vector<SortableDataItem>::iterator _resultIterator;
 
-        // We buffer a lot of data and we want to look it up by DiskLoc quickly upon invalidation.
-        typedef unordered_map<DiskLoc, WorkingSetID, DiskLoc::Hasher> DataMap;
+        // We buffer a lot of data and we want to look it up by RecordId quickly upon invalidation.
+        typedef unordered_map<RecordId, WorkingSetID, RecordId::Hasher> DataMap;
         DataMap _wsidByDiskLoc;
 
         //

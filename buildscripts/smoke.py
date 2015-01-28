@@ -8,9 +8,9 @@
 #   so the smoke.py process and all its children must be run with the
 #   mongo repo as current working directory.  That's kinda icky.
 
-# 1 The tests that are implemented as standalone executables ("test",
-#   "perftest"), don't take arguments for the dbpath, but
-#   unconditionally use "/tmp/unittest".
+# 1 The tests that are implemented as standalone executables ("test"),
+#   don't take arguments for the dbpath, but unconditionally use
+#   "/tmp/unittest".
 
 # 2 mongod output gets intermingled with mongo output, and it's often
 #   hard to find error messages in the slop.  Maybe have smoke.py do
@@ -41,16 +41,20 @@ import os
 import pprint
 import re
 import shlex
+import signal
 import socket
 import stat
 from subprocess import (PIPE, Popen, STDOUT)
 import sys
 import time
+import threading
+import traceback
 
 from pymongo import Connection
 from pymongo.errors import OperationFailure
 
 import cleanbb
+import smoke
 import utils
 
 try:
@@ -104,13 +108,36 @@ small_oplog_rs = False
 test_report = { "results": [] }
 report_file = None
 
-# This class just implements the with statement API, for a sneaky
-# purpose below.
-class Nothing(object):
+# This class just implements the with statement API
+class NullMongod(object):
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
     def __enter__(self):
+        self.start()
         return self
+
     def __exit__(self, type, value, traceback):
+        self.stop()
         return not isinstance(value, Exception)
+
+
+def dump_stacks(signal, frame):
+    print "======================================"
+    print "DUMPING STACKS due to SIGUSR1 signal"
+    print "======================================"
+    threads = threading.enumerate();
+
+    print "Total Threads: " + str(len(threads))
+
+    for id, stack in sys._current_frames().items():
+        print "Thread %d" % (id)
+        print "".join(traceback.format_stack(stack))
+    print "======================================"
+
 
 def buildlogger(cmd, is_global=False):
     # if the environment variable MONGO_USE_BUILDLOGGER
@@ -134,23 +161,11 @@ def clean_dbroot(dbroot="", nokill=False):
         cleanbb.cleanup(dbroot, nokill)
 
 
-class mongod(object):
+class mongod(NullMongod):
     def __init__(self, **kwargs):
         self.kwargs = kwargs
         self.proc = None
         self.auth = False
-
-    def __enter__(self):
-        self.start()
-        return self
-
-    def __exit__(self, type, value, traceback):
-        try:
-            self.stop()
-        except Exception, e:
-            print >> sys.stderr, "error shutting down mongod"
-            print >> sys.stderr, e
-        return not isinstance(value, Exception)
 
     def ensure_test_dirs(self):
         utils.ensureDir(smoke_db_prefix + "/tmp/unittest/")
@@ -204,11 +219,19 @@ class mongod(object):
         utils.ensureDir(dir_name)
 
         argv = [mongod_executable, "--port", str(self.port), "--dbpath", dir_name]
-        # These parameters are alwas set for tests
+        # These parameters are always set for tests
         # SERVER-9137 Added httpinterface parameter to keep previous behavior
         argv += ['--setParameter', 'enableTestCommands=1', '--httpinterface']
         if self.kwargs.get('small_oplog'):
             argv += ["--master", "--oplogSize", "511"]
+        if self.kwargs.get('storage_engine'):
+            argv += ["--storageEngine", self.kwargs.get('storage_engine')]
+        if self.kwargs.get('wiredtiger_engine_config_string'):
+            argv += ["--wiredTigerEngineConfigString", self.kwargs.get('wiredtiger_engine_config_string')]
+        if self.kwargs.get('wiredtiger_collection_config_string'):
+            argv += ["--wiredTigerCollectionConfigString", self.kwargs.get('wiredtiger_collection_config_string')]
+        if self.kwargs.get('wiredtiger_index_config_string'):
+            argv += ["--wiredTigerIndexConfigString", self.kwargs.get('wiredtiger_index_config_string')]
         params = self.kwargs.get('set_parameters', None)
         if params:
             for p in params.split(','): argv += ['--setParameter', p]
@@ -222,8 +245,8 @@ class mongod(object):
             argv += ['--nopreallocj']
         if self.kwargs.get('auth'):
             argv += ['--auth', '--setParameter', 'enableLocalhostAuthBypass=false']
-            authMechanism = self.kwargs.get('authMechanism', 'MONGODB-CR')
-            if authMechanism != 'MONGODB-CR':
+            authMechanism = self.kwargs.get('authMechanism', 'SCRAM-SHA-1')
+            if authMechanism != 'SCRAM-SHA-1':
                 argv += ['--setParameter', 'authenticationMechanisms=' + authMechanism]
             self.auth = True
         if self.kwargs.get('keyFile'):
@@ -296,18 +319,27 @@ class mongod(object):
             if os.sys.platform == "win32":
                 import win32job
                 win32job.TerminateJobObject(self.job_object, -1)
-                import time
                 # Windows doesn't seem to kill the process immediately, so give it some time to die
                 time.sleep(5)
-            else:
-                # This function not available in Python 2.5
+            elif hasattr(self.proc, "terminate"):
+                # This method added in Python 2.6
                 self.proc.terminate()
-        except AttributeError:
-            from os import kill
-            kill(self.proc.pid, 15)
+            else:
+                os.kill(self.proc.pid, 15)
+        except Exception, e:
+            print >> sys.stderr, "error shutting down mongod"
+            print >> sys.stderr, e
         self.proc.wait()
         sys.stderr.flush()
         sys.stdout.flush()
+
+        # Fail hard if mongod terminates with an error. That might indicate that an
+        # instrumented build (e.g. LSAN) has detected an error. For now we aren't doing this on
+        # windows because the exit code seems to be unpredictable. We don't have LSAN there
+        # anyway.
+        retcode = self.proc.returncode
+        if os.sys.platform != "win32" and retcode != 0:
+            raise(Exception('mongod process exited with non-zero code %d' % retcode))
 
     def wait_for_repl(self):
         Connection(port=self.port).testing.smokeWait.insert({}, w=2, wtimeout=5*60*1000)
@@ -406,7 +438,7 @@ def skipTest(path):
     parentDir = os.path.basename(parentPath)
     if small_oplog: # For tests running in parallel
         if basename in ["cursor8.js", "indexh.js", "dropdb.js", "dropdb_race.js", 
-                        "connections_opened.js", "opcounters.js", "dbadmin.js"]:
+                        "connections_opened.js", "opcounters_write_cmd.js", "dbadmin.js"]:
             return True
     if use_ssl:
         # Skip tests using mongobridge since it does not support SSL
@@ -436,6 +468,7 @@ def skipTest(path):
                            ("sharding", "sync3.js"), # SERVER-6388 for this and those below
                            ("sharding", "sync6.js"),
                            ("sharding", "parallel.js"),
+                           ("sharding", "copydb_from_mongos.js"), # SERVER-13080
                            ("jstests", "bench_test1.js"),
                            ("jstests", "bench_test2.js"),
                            ("jstests", "bench_test3.js"),
@@ -449,14 +482,11 @@ def skipTest(path):
 
     return False
 
-forceCommandsForDirs = ["aggregation", "auth", "core", "parallel", "replsets", "sharding"]
-# look for jstests and one of the above suites separated by either posix or windows slashes
-forceCommandsRE = re.compile(r"jstests[/\\](%s)" % ('|'.join(forceCommandsForDirs)))
+legacyWriteRE = re.compile(r"jstests[/\\]multiVersion")
 def setShellWriteModeForTest(path, argv):
     swm = shell_write_mode
-    if swm == "legacy": # change when the default changes to "commands"
-        if use_write_commands or forceCommandsRE.search(path):
-            swm = "commands"
+    if legacyWriteRE.search(path):
+        swm = "legacy"
     argv += ["--writeMode", swm]
 
 def runTest(test, result):
@@ -484,7 +514,7 @@ def runTest(test, result):
         if os.path.basename(path) in ('python', 'python.exe'):
             path = argv[1]
     elif ext == ".js":
-        argv = [shell_executable, "--port", mongod_port, '--authenticationMechanism', authMechanism]
+        argv = [shell_executable, "--port", mongod_port]
         
         setShellWriteModeForTest(path, argv)
         
@@ -500,12 +530,22 @@ def runTest(test, result):
         argv += [path]
     elif ext in ["", ".exe"]:
         # Blech.
-        if os.path.basename(path) in ["dbtest", "dbtest.exe", "perftest", "perftest.exe"]:
+        if os.path.basename(path) in ["dbtest", "dbtest.exe"]:
             argv = [path]
-            # default data directory for test and perftest is /tmp/unittest
+            # default data directory for dbtest is /tmp/unittest
             if smoke_db_prefix:
                 dir_name = smoke_db_prefix + '/unittests'
                 argv.extend(["--dbpath", dir_name] )
+
+            if storage_engine:
+                argv.extend(["--storageEngine", storage_engine])
+            if wiredtiger_engine_config_string:
+                argv.extend(["--wiredTigerEngineConfigString", wiredtiger_engine_config_string])
+            if wiredtiger_collection_config_string:
+                argv.extend(["--wiredTigerCollectionConfigString", wiredtiger_collection_config_string])
+            if wiredtiger_index_config_string:
+                argv.extend(["--wiredTigerIndexConfigString", wiredtiger_index_config_string])
+
         # more blech
         elif os.path.basename(path) in ['mongos', 'mongos.exe']:
             argv = [path, "--test"]
@@ -527,6 +567,10 @@ def runTest(test, result):
     # hangs... that's bad.
     if ( argv[0].endswith( 'mongo' ) or argv[0].endswith( 'mongo.exe' ) ) and not '--eval' in argv :
         evalString = 'TestData = new Object();' + \
+                     'TestData.storageEngine = "' + ternary( storage_engine, storage_engine, "" ) + '";' + \
+                     'TestData.wiredTigerEngineConfigString = "' + ternary( wiredtiger_engine_config_string, wiredtiger_engine_config_string, "" ) + '";' + \
+                     'TestData.wiredTigerCollectionConfigString = "' + ternary( wiredtiger_collection_config_string, wiredtiger_collection_config_string, "" ) + '";' + \
+                     'TestData.wiredTigerIndexConfigString = "' + ternary( wiredtiger_index_config_string, wiredtiger_index_config_string, "" ) + '";' + \
                      'TestData.testPath = "' + path + '";' + \
                      'TestData.testFile = "' + os.path.basename( path ) + '";' + \
                      'TestData.testName = "' + re.sub( ".js$", "", os.path.basename( path ) ) + '";' + \
@@ -544,6 +588,8 @@ def runTest(test, result):
         # this updates the default data directory for mongod processes started through shell (src/mongo/shell/servers.js)
         evalString += 'MongoRunner.dataDir = "' + os.path.abspath(smoke_db_prefix + '/data/db') + '";'
         evalString += 'MongoRunner.dataPath = MongoRunner.dataDir + "/";'
+        if temp_path:
+            evalString += 'TestData.tmpPath = "' + temp_path + '";'
         if os.sys.platform == "win32":
             # double quotes in the evalString on windows; this
             # prevents the backslashes from being removed when
@@ -554,6 +600,7 @@ def runTest(test, result):
             evalString += 'jsTest.authenticate(db.getMongo());'
 
         argv = argv + [ '--eval', evalString]
+
 
     if argv[0].endswith( 'dbtest' ) or argv[0].endswith( 'dbtest.exe' ):
         if no_preallocj :
@@ -632,35 +679,52 @@ def run_tests(tests):
     # The reason we want to use "with" is so that we get __exit__ semantics
     # but "with" is only supported on Python 2.5+
 
-    if start_mongod:
-        master = mongod(small_oplog_rs=small_oplog_rs,
-                        small_oplog=small_oplog,
-                        no_journal=no_journal,
-                        set_parameters=set_parameters,
-                        no_preallocj=no_preallocj,
-                        auth=auth,
-                        authMechanism=authMechanism,
-                        keyFile=keyFile,
-                        use_ssl=use_ssl,
-                        use_x509=use_x509).__enter__()
-    else:
-        master = Nothing()
+    master = NullMongod()
+    slave = NullMongod()
+
     try:
+        if start_mongod:
+            master = mongod(small_oplog_rs=small_oplog_rs,
+                            small_oplog=small_oplog,
+                            no_journal=no_journal,
+                            storage_engine=storage_engine,
+                            wiredtiger_engine_config_string=wiredtiger_engine_config_string,
+                            wiredtiger_collection_config_string=wiredtiger_collection_config_string,
+                            wiredtiger_index_config_string=wiredtiger_index_config_string,
+                            set_parameters=set_parameters,
+                            no_preallocj=no_preallocj,
+                            auth=auth,
+                            authMechanism=authMechanism,
+                            keyFile=keyFile,
+                            use_ssl=use_ssl,
+                            use_x509=use_x509)
+            master.start()
+
         if small_oplog:
             slave = mongod(slave=True,
-                           set_parameters=set_parameters).__enter__()
+                           storage_engine=storage_engine,
+                           wiredtiger_engine_config_string=wiredtiger_engine_config_string,
+                           wiredtiger_collection_config_string=wiredtiger_collection_config_string,
+                           wiredtiger_index_config_string=wiredtiger_index_config_string,
+                           set_parameters=set_parameters)
+            slave.start()
         elif small_oplog_rs:
             slave = mongod(slave=True,
                            small_oplog_rs=small_oplog_rs,
                            small_oplog=small_oplog,
                            no_journal=no_journal,
+                           storage_engine=storage_engine,
+                           wiredtiger_engine_config_string=wiredtiger_engine_config_string,
+                           wiredtiger_collection_config_string=wiredtiger_collection_config_string,
+                           wiredtiger_index_config_string=wiredtiger_index_config_string,
                            set_parameters=set_parameters,
                            no_preallocj=no_preallocj,
                            auth=auth,
                            authMechanism=authMechanism,
                            keyFile=keyFile,
                            use_ssl=use_ssl,
-                           use_x509=use_x509).__enter__()
+                           use_x509=use_x509)
+            slave.start()
             primary = Connection(port=master.port, slave_okay=True);
 
             primary.admin.command({'replSetInitiate' : {'_id' : 'foo', 'members' : [
@@ -672,86 +736,88 @@ def run_tests(tests):
                 result = primary.admin.command("ismaster");
                 ismaster = result["ismaster"]
                 time.sleep(1)
-        else:
-            slave = Nothing()
 
-        try:
-            if small_oplog or small_oplog_rs:
-                master.wait_for_repl()
+        if small_oplog or small_oplog_rs:
+            master.wait_for_repl()
 
-            for tests_run, test in enumerate(tests):
-                tests_run += 1    # enumerate from 1, python 2.5 compatible
-                test_result = { "start": time.time() }
+        for tests_run, test in enumerate(tests):
+            tests_run += 1    # enumerate from 1, python 2.5 compatible
+            test_result = { "start": time.time() }
 
-                (test_path, use_db) = test
+            (test_path, use_db) = test
 
-                if test_path.startswith(mongo_repo + os.path.sep):
-                    test_result["test_file"] = test_path[len(mongo_repo)+1:]
+            if test_path.startswith(mongo_repo + os.path.sep):
+                test_result["test_file"] = test_path[len(mongo_repo)+1:]
+            else:
+                # user could specify a file not in repo. leave it alone.
+                test_result["test_file"] = test_path
+
+            try:
+                if skipTest(test_path):
+                    test_result["status"] = "skip"
+
+                    print "skipping " + test_path
                 else:
-                    # user could specify a file not in repo. leave it alone.
-                    test_result["test_file"] = test_path
+                    fails.append(test)
+                    runTest(test, test_result)
+                    fails.pop()
+                    winners.append(test)
 
+                    test_result["status"] = "pass"
+
+                test_result["end"] = time.time()
+                test_result["elapsed"] = test_result["end"] - test_result["start"]
+                test_report["results"].append( test_result )
+                if small_oplog or small_oplog_rs:
+                    master.wait_for_repl()
+                    # check the db_hashes
+                    if isinstance(slave, mongod):
+                        check_db_hashes(master, slave)
+                        check_and_report_replication_dbhashes()
+
+                elif use_db: # reach inside test and see if "usedb" is true
+                    if clean_every_n_tests and (tests_run % clean_every_n_tests) == 0:
+                        # Restart mongod periodically to clean accumulated test data
+                        # clean_dbroot() is invoked by mongod.start()
+                        master.stop()
+                        master = mongod(small_oplog_rs=small_oplog_rs,
+                                        small_oplog=small_oplog,
+                                        no_journal=no_journal,
+                                        storage_engine=storage_engine,
+                                        wiredtiger_engine_config_string=wiredtiger_engine_config_string,
+                                        wiredtiger_collection_config_string=wiredtiger_collection_config_string,
+                                        wiredtiger_index_config_string=wiredtiger_index_config_string,
+                                        set_parameters=set_parameters,
+                                        no_preallocj=no_preallocj,
+                                        auth=auth,
+                                        authMechanism=authMechanism,
+                                        keyFile=keyFile,
+                                        use_ssl=use_ssl,
+                                        use_x509=use_x509)
+                        master.start()
+
+            except TestFailure, f:
+                test_result["end"] = time.time()
+                test_result["elapsed"] = test_result["end"] - test_result["start"]
+                test_result["error"] = str(f)
+                test_result["status"] = "fail"
+                test_report["results"].append( test_result )
                 try:
-                    if skipTest(test_path):
-                        test_result["status"] = "skip"
-
-                        print "skipping " + test_path
-                    else:
-                        fails.append(test)
-                        runTest(test, test_result)
-                        fails.pop()
-                        winners.append(test)
-
-                        test_result["status"] = "pass"
-
-                    test_result["end"] = time.time()
-                    test_result["elapsed"] = test_result["end"] - test_result["start"]
-                    test_report["results"].append( test_result )
-                    if small_oplog or small_oplog_rs:
-                        master.wait_for_repl()
-                        # check the db_hashes
-                        if isinstance(slave, mongod):
-                            check_db_hashes(master, slave)
-                            check_and_report_replication_dbhashes()
-
-                    elif use_db: # reach inside test and see if "usedb" is true
-                        if clean_every_n_tests and (tests_run % clean_every_n_tests) == 0:
-                            # Restart mongod periodically to clean accumulated test data
-                            # clean_dbroot() is invoked by mongod.start()
-                            master.__exit__(None, None, None)
-                            master = mongod(small_oplog_rs=small_oplog_rs,
-                                            small_oplog=small_oplog,
-                                            no_journal=no_journal,
-                                            set_parameters=set_parameters,
-                                            no_preallocj=no_preallocj,
-                                            auth=auth,
-                                            authMechanism=authMechanism,
-                                            keyFile=keyFile,
-                                            use_ssl=use_ssl,
-                                            use_x509=use_x509).__enter__()
-
+                    print f
+                    # Record the failing test and re-raise.
+                    losers[f.path] = f.status
+                    raise f
+                except TestServerFailure, f:
+                    return 2
                 except TestFailure, f:
-                    test_result["end"] = time.time()
-                    test_result["elapsed"] = test_result["end"] - test_result["start"]
-                    test_result["error"] = str(f)
-                    test_result["status"] = "fail"
-                    test_report["results"].append( test_result )
-                    try:
-                        print f
-                        # Record the failing test and re-raise.
-                        losers[f.path] = f.status
-                        raise f
-                    except TestServerFailure, f:
-                        return 2
-                    except TestFailure, f:
-                        if not continue_on_failure:
-                            return 1
-            if isinstance(slave, mongod):
-                check_db_hashes(master, slave)
-        finally:
-            slave.__exit__(None, None, None)
+                    if not continue_on_failure:
+                        return 1
+        if isinstance(slave, mongod):
+            check_db_hashes(master, slave)
+
     finally:
-        master.__exit__(None, None, None)
+        slave.stop()
+        master.stop()
     return 0
 
 
@@ -831,6 +897,7 @@ suiteGlobalConfig = {"js": ("core/*.js", True),
                      "noPassthroughWithMongod": ("noPassthroughWithMongod/*.js", True),
                      "noPassthrough": ("noPassthrough/*.js", False),
                      "parallel": ("parallel/*.js", True),
+                     "concurrency": ("concurrency/*.js", True),
                      "clone": ("clone/*.js", False),
                      "repl": ("repl/*.js", False),
                      "replSets": ("replsets/*.js", False),
@@ -844,7 +911,9 @@ suiteGlobalConfig = {"js": ("core/*.js", True),
                      "ssl": ("ssl/*.js", True),
                      "sslSpecial": ("sslSpecial/*.js", True),
                      "jsCore": ("core/*.js", True),
+                     "mmap_v1": ("mmap_v1/*.js", True),
                      "gle": ("gle/*.js", True),
+                     "rocksDB": ("rocksDB/*.js", True),
                      "slow1": ("slow1/*.js", True),
                      "slow2": ("slow2/*.js", True),
                      }
@@ -909,13 +978,14 @@ def expand_suites(suites,expandUseDB=True):
     for suite in suites:
         if suite == 'all':
             return expand_suites(['dbtest',
-                                  'perf', 
                                   'jsCore', 
                                   'jsPerf', 
+                                  'mmap_v1',
                                   'noPassthroughWithMongod', 
                                   'noPassthrough', 
                                   'clone', 
                                   'parallel', 
+                                  'concurrency',
                                   'repl', 
                                   'auth', 
                                   'sharding', 
@@ -928,12 +998,6 @@ def expand_suites(suites,expandUseDB=True):
                 program = 'dbtest.exe'
             else:
                 program = 'dbtest'
-            (globstr, usedb) = (program, False)
-        elif suite == 'perf':
-            if os.sys.platform == "win32":
-                program = 'perftest.exe'
-            else:
-                program = 'perftest'
             (globstr, usedb) = (program, False)
         elif suite == 'mongosTest':
             if os.sys.platform == "win32":
@@ -977,15 +1041,40 @@ def expand_suites(suites,expandUseDB=True):
 
     return tests
 
+
+def filter_tests_by_tag(tests, tag_query):
+    """Selects tests from a list based on a query over the tags in the tests."""
+
+    test_map = {}
+    roots = []
+    for test in tests:
+        root = os.path.abspath(test[0])
+        roots.append(root)
+        test_map[root] = test
+
+    new_style_tests = smoke.tests.build_tests(roots, extract_metadata=True)
+    new_style_tests = smoke.suites.build_suite(new_style_tests, tag_query)
+
+    print "\nTag query matches %s tests out of %s.\n" % (len(new_style_tests),
+                                                         len(tests))
+
+    tests = []
+    for new_style_test in new_style_tests:
+        tests.append(test_map[os.path.abspath(new_style_test.filename)])
+
+    return tests
+
+
 def add_exe(e):
     if os.sys.platform.startswith( "win" ) and not e.endswith( ".exe" ):
         e += ".exe"
     return e
 
+
 def set_globals(options, tests):
     global mongod_executable, mongod_port, shell_executable, continue_on_failure
     global small_oplog, small_oplog_rs
-    global no_journal, set_parameters, set_parameters_mongos, no_preallocj
+    global no_journal, set_parameters, set_parameters_mongos, no_preallocj, storage_engine, wiredtiger_engine_config_string, wiredtiger_collection_config_string, wiredtiger_index_config_string
     global auth, authMechanism, keyFile, keyFileData, smoke_db_prefix, test_path, start_mongod
     global use_ssl, use_x509
     global file_of_commands_mode
@@ -1019,6 +1108,10 @@ def set_globals(options, tests):
     if hasattr(options, "small_oplog_rs"):
         small_oplog_rs = options.small_oplog_rs
     no_journal = options.no_journal
+    storage_engine = options.storage_engine
+    wiredtiger_engine_config_string = options.wiredtiger_engine_config_string
+    wiredtiger_collection_config_string = options.wiredtiger_collection_config_string
+    wiredtiger_index_config_string = options.wiredtiger_index_config_string
     set_parameters = options.set_parameters
     set_parameters_mongos = options.set_parameters_mongos
     no_preallocj = options.no_preallocj
@@ -1133,8 +1226,13 @@ def add_to_failfile(tests, options):
 
 def main():
     global mongod_executable, mongod_port, shell_executable, continue_on_failure, small_oplog
-    global no_journal, set_parameters, set_parameters_mongos, no_preallocj, auth
+    global no_journal, set_parameters, set_parameters_mongos, no_preallocj, auth, storage_engine, wiredtiger_engine_config_string, wiredtiger_collection_config_string, wiredtiger_index_config_string
     global keyFile, smoke_db_prefix, test_path, use_write_commands
+
+    try:
+        signal.signal(signal.SIGUSR1, dump_stacks)
+    except AttributeError:
+        print "Cannot catch signals on Windows"
 
     parser = OptionParser(usage="usage: smoke.py [OPTIONS] ARGS*")
     parser.add_option('--mode', dest='mode', default='suite',
@@ -1164,6 +1262,14 @@ def main():
     parser.add_option('--small-oplog-rs', dest='small_oplog_rs', default=False,
                       action="store_true",
                       help='Run tests with replica set replication & use a small oplog')
+    parser.add_option('--storageEngine', dest='storage_engine', default=None,
+                      help='What storage engine to start mongod with')
+    parser.add_option('--wiredTigerEngineConfig', dest='wiredtiger_engine_config_string', default=None,
+                      help='Wired Tiger configuration to pass through to mongod')
+    parser.add_option('--wiredTigerCollectionConfig', dest='wiredtiger_collection_config_string', default=None,
+                      help='Wired Tiger collection configuration to pass through to mongod')
+    parser.add_option('--wiredTigerIndexConfig', dest='wiredtiger_index_config_string', default=None,
+                      help='Wired Tiger index configuration to pass through to mongod')
     parser.add_option('--nojournal', dest='no_journal', default=False,
                       action="store_true",
                       help='Do not turn on journaling in tests')
@@ -1176,7 +1282,7 @@ def main():
     parser.add_option('--use-x509', dest='use_x509', default=False,
                       action="store_true",
                       help='Use x509 auth for internal cluster authentication')
-    parser.add_option('--authMechanism', dest='authMechanism', default='MONGODB-CR',
+    parser.add_option('--authMechanism', dest='authMechanism', default='SCRAM-SHA-1',
                       help='Use the given authentication mechanism, when --auth is used.')
     parser.add_option('--keyFile', dest='keyFile', default=None,
                       help='Path to keyFile to use to run replSet and sharding tests with authentication enabled')
@@ -1192,7 +1298,7 @@ def main():
                       default=False,
                       help='Clear database files before first test')
     parser.add_option('--clean-every', dest='clean_every_n_tests', type='int',
-                      default=20,
+                      default=(1 if 'detect_leaks=1' in os.getenv("ASAN_OPTIONS", "") else 20),
                       help='Clear database files every N tests [default %default]')
     parser.add_option('--dont-start-mongod', dest='start_mongod', default=True,
                       action='store_false',
@@ -1205,7 +1311,7 @@ def main():
     parser.add_option('--set-parameters-mongos', dest='set_parameters_mongos', default="",
                       help='Adds --setParameter to mongos for each passed in item in the csv list - ex. "param1=1,param2=foo" ')
     parser.add_option('--temp-path', dest='temp_path', default=None,
-                      help='If present, passed as --tempPath to unittests and dbtests')
+                      help='If present, passed as --tempPath to unittests and dbtests or TestData.tmpPath to mongo')
     # Buildlogger invocation from command line
     parser.add_option('--buildlogger-builder', dest='buildlogger_builder', default=None,
                       action="store", help='Set the "builder name" for buildlogger')
@@ -1223,8 +1329,16 @@ def main():
     parser.add_option('--use-write-commands', dest='use_write_commands', default=False,
                       action='store_true',
                       help='Deprecated(use --shell-write-mode): Sets the shell to use write commands by default')
-    parser.add_option('--shell-write-mode', dest='shell_write_mode', default="legacy",
+    parser.add_option('--shell-write-mode', dest='shell_write_mode', default="commands",
                       help='Sets the shell to use a specific write mode: commands/compatibility/legacy (default:legacy)')
+
+    parser.add_option('--include-tags', dest='include_tags', default="", action='store',
+                      help='Filters jstests run by tag regex(es) - a tag in the test must match the regexes.  ' +
+                           'Specify single regex string or JSON array.')
+
+    parser.add_option('--exclude-tags', dest='exclude_tags', default="", action='store',
+                      help='Filters jstests run by tag regex(es) - no tags in the test must match the regexes.  ' +
+                           'Specify single regex string or JSON array.')
 
     global tests
     (options, tests) = parser.parse_args()
@@ -1279,6 +1393,22 @@ def main():
                 return True
 
         tests = filter( ignore_test, tests )
+
+    if options.include_tags or options.exclude_tags:
+
+        def to_regex_array(tags_option):
+            if not tags_option:
+                return []
+
+            tags_list = smoke.json_options.json_coerce(tags_option)
+            if isinstance(tags_list, basestring):
+                tags_list = [tags_list]
+
+            return map(re.compile, tags_list)
+
+        tests = filter_tests_by_tag(tests,
+            smoke.suites.RegexQuery(include_res=to_regex_array(options.include_tags),
+                                    exclude_res=to_regex_array(options.exclude_tags)))
 
     if not tests:
         print "warning: no tests specified"

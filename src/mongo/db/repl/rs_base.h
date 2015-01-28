@@ -28,9 +28,13 @@
 
 #pragma once
 
+#include <boost/noncopyable.hpp>
+
 #include "mongo/db/repl/health.h"
+#include "mongo/util/concurrency/mutex.h"
 
 namespace mongo {
+namespace repl {
 
     /**
      * most operations on a ReplSet object should be done while locked. that
@@ -45,16 +49,12 @@ namespace mongo {
         ThreadLocalValue<bool> _lockedByMe;
     protected:
         RSBase() : m("RSBase"), _locked(0) { }
-        ~RSBase() {
-            // this can happen if we throw in the constructor; otherwise never happens.  thus we
-            // logit as it is quite unusual.
-            log() << "replSet ~RSBase called" << rsLog;
-        }
+        ~RSBase() { }
 
     public:
         class lock {
             RSBase& rsbase;
-            auto_ptr<scoped_lock> sl;
+            std::auto_ptr<scoped_lock> sl;
         public:
             lock(RSBase* b) : rsbase(*b) {
                 if( rsbase._lockedByMe.get() )
@@ -86,4 +86,5 @@ namespace mongo {
         bool lockedByMe() { return _lockedByMe.get(); }
     };
 
+} // namespace repl
 } // namespace mongo

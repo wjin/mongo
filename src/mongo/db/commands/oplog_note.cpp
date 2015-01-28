@@ -35,9 +35,13 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/repl/oplog.h"
-#include "mongo/db/repl/repl_settings.h"
+#include "mongo/db/repl/replication_coordinator_global.h"
 
 namespace mongo {
+
+    using std::string;
+    using std::stringstream;
+
     class AppendOplogNoteCmd : public Command {
     public:
         AppendOplogNoteCmd() : Command( "appendOplogNote" ) {}
@@ -56,13 +60,13 @@ namespace mongo {
             }
             return Status::OK();
         }
-        virtual bool run(const string& dbname,
+        virtual bool run(OperationContext* txn, const string& dbname,
                          BSONObj& cmdObj,
                          int,
                          string& errmsg,
                          BSONObjBuilder& result,
                          bool fromRepl) {
-            if (!replSettings.master) {
+            if (!repl::getGlobalReplicationCoordinator()->isReplEnabled()) {
                 return appendCommandStatus(result, Status(
                         ErrorCodes::NoReplicationEnabled,
                         "Must have replication set up to run \"appendOplogNote\""));
@@ -73,7 +77,7 @@ namespace mongo {
                 return appendCommandStatus(result, status);
             }
 
-            logOpComment(dataElement.Obj());
+            repl::logOpComment(txn, dataElement.Obj());
             return true;
         }
 

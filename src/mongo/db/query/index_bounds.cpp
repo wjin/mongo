@@ -33,6 +33,7 @@
 
 namespace mongo {
 
+    using std::string;
     using std::vector;
 
     namespace {
@@ -185,47 +186,31 @@ namespace mongo {
     }
 
     BSONObj IndexBounds::toBSON() const {
-        BSONObjBuilder builder;
-        if (isSimpleRange) {
-            // TODO
-        }
-        else {
-            for (vector<OrderedIntervalList>::const_iterator itField = fields.begin();
-                 itField != fields.end();
-                 ++itField) {
-                BSONArrayBuilder fieldBuilder(builder.subarrayStart(itField->name));
-                for (vector<Interval>::const_iterator itInterval = itField->intervals.begin();
-                     itInterval != itField->intervals.end();
-                     ++itInterval) {
-                    BSONArrayBuilder intervalBuilder;
+        BSONObjBuilder bob;
+        vector<OrderedIntervalList>::const_iterator itField;
+        for (itField = fields.begin(); itField != fields.end(); ++itField) {
+            BSONArrayBuilder fieldBuilder(bob.subarrayStart(itField->name));
 
-                    // Careful to output $minElement/$maxElement if we don't have bounds.
-                    if (itInterval->start.eoo()) {
-                        BSONObjBuilder minBuilder;
-                        minBuilder.appendMinKey("");
-                        BSONObj minKeyObj = minBuilder.obj();
-                        intervalBuilder.append(minKeyObj.firstElement());
-                    }
-                    else {
-                        intervalBuilder.append(itInterval->start);
-                    }
+            vector<Interval>::const_iterator itInterval;
+            for (itInterval = itField->intervals.begin()
+                    ; itInterval != itField->intervals.end()
+                    ; ++itInterval) {
+                std::string intervalStr = itInterval->toString();
 
-                    if (itInterval->end.eoo()) {
-                        BSONObjBuilder maxBuilder;
-                        maxBuilder.appendMaxKey("");
-                        BSONObj maxKeyObj = maxBuilder.obj();
-                        intervalBuilder.append(maxKeyObj.firstElement());
-                    }
-                    else {
-                        intervalBuilder.append(itInterval->end);
-                    }
-
-                    fieldBuilder.append(
-                        static_cast<BSONArray>(intervalBuilder.arr().clientReadable()));
+                // Insulate against hitting BSON size limit.
+                if ((bob.len() + (int)intervalStr.size()) > BSONObjMaxUserSize) {
+                    fieldBuilder.append("warning: bounds truncated due to BSON size limit");
+                    fieldBuilder.doneFast();
+                    return bob.obj();
                 }
+
+                fieldBuilder.append(intervalStr);
             }
+
+            fieldBuilder.doneFast();
         }
-        return builder.obj();
+
+        return bob.obj();
     }
 
     //

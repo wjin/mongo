@@ -38,12 +38,18 @@ namespace mongo {
 
     class QueryPlannerAnalysis {
     public:
-
         /**
-         * See explodeForSort.  Max number of index scans we're willing to create to pull
-         * a sort order out of an index scan with point intervals.
+         * Takes an index key pattern and returns an object describing the "maximal sort" that this
+         * index can provide.  Returned object is in normalized sort form (all elements have value 1
+         * or -1).
+         *
+         * Examples:
+         * - {a: 1, b: -1} => {a: 1, b: -1}
+         * - {a: true} => {a: 1}
+         * - {a: "hashed"} => {}
+         * - {a: 1, b: "text", c: 1} => {a: 1}
          */
-        static const size_t kMaxScansToExplode;
+        static BSONObj getSortPattern(const BSONObj& indexKeyPattern);
 
         /**
          * In brief: performs sort and covering analysis.

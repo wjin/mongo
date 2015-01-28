@@ -2,20 +2,34 @@
 
 /*    Copyright 2009 10gen Inc.
  *
- *    Licensed under the Apache License, Version 2.0 (the "License");
- *    you may not use this file except in compliance with the License.
- *    You may obtain a copy of the License at
+ *    This program is free software: you can redistribute it and/or  modify
+ *    it under the terms of the GNU Affero General Public License, version 3,
+ *    as published by the Free Software Foundation.
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License for more details.
  *
- *    Unless required by applicable law or agreed to in writing, software
- *    distributed under the License is distributed on an "AS IS" BASIS,
- *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *    See the License for the specific language governing permissions and
- *    limitations under the License.
+ *    You should have received a copy of the GNU Affero General Public License
+ *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
  */
 
-#include "mongo/pch.h"
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
+
+#include "mongo/platform/basic.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -24,12 +38,17 @@
 #include <sys/types.h>
 
 #include "mongo/platform/atomic_word.h"
-#include "mongo/db/d_concurrency.h"
+#include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/util/file_allocator.h"
+#include "mongo/util/log.h"
 #include "mongo/util/mmap.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/startup_test.h"
+
+using std::endl;
+using std::numeric_limits;
+using std::vector;
 
 using namespace mongoutils;
 
@@ -220,7 +239,6 @@ namespace mongo {
 
     void* MemoryMappedFile::remapPrivateView(void *oldPrivateAddr) {
 #if defined(__sunos__) // SERVER-8795
-        verify( Lock::isW() );
         LockMongoFilesExclusive lockMongoFiles;
 #endif
 
@@ -240,10 +258,15 @@ namespace mongo {
     void MemoryMappedFile::flush(bool sync) {
         if ( views.empty() || fd == 0 )
             return;
-        if ( msync(viewForFlushing(), len, sync ? MS_SYNC : MS_ASYNC) ) {
+
+        bool useFsync = sync && !ProcessInfo::preferMsyncOverFSync();
+
+        if ( useFsync ?
+            fsync(fd) != 0 :
+            msync(viewForFlushing(), len, sync ? MS_SYNC : MS_ASYNC) ) {
             // msync failed, this is very bad
-            problem() << "msync failed: " << errnoWithDescription()
-                      << " file: " << filename() << endl;
+            log() << (useFsync ? "fsync failed: " : "msync failed: ") << errnoWithDescription()
+                  << " file: " << filename() << endl;
             dataSyncFailedHandler();
         }
     }
@@ -258,8 +281,11 @@ namespace mongo {
             if ( _view == NULL || _fd == 0 )
                 return;
 
-            if ( msync(_view, _len, MS_SYNC ) == 0 )
+            if ( ProcessInfo::preferMsyncOverFSync() ?
+                msync(_view, _len, MS_SYNC ) == 0 :
+                fsync(_fd) == 0 ) {
                 return;
+            }
 
             if ( errno == EBADF ) {
                 // ok, we were unlocked, so this file was closed
@@ -278,7 +304,7 @@ namespace mongo {
             }
 
             // we got an error, and we still exist, so this is bad, we fail
-            problem() << "msync " << errnoWithDescription() << endl;
+            log() << "msync " << errnoWithDescription() << endl;
             dataSyncFailedHandler();
         }
 

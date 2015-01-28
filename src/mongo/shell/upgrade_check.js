@@ -39,10 +39,11 @@ var collUpgradeCheck = function(collObj) {
     var goodSoFar = true;
 
     // check for _id index if and only if it should be present
-    // no $, not oplog, not system
+    // no $, not oplog, not system, not config db
     var indexColl = dbObj.getSiblingDB(dbName).system.indexes;
     if (collName.indexOf('$') === -1 && 
         collName.indexOf("system.") !== 0 &&
+        dbName !== "config" &&
         (dbName !== "local" || (collName.indexOf("oplog.") !== 0 && collName !== "startup_log"))) {
         var idIdx = indexColl.find({ns: fullName, name:"_id_"}).addOption(DBQuery.Option.noTimeout);
         if (!idIdx.hasNext()) {
@@ -69,10 +70,22 @@ var collUpgradeCheck = function(collObj) {
         }
     });
 
-    // do not validate the documents in config dbs, oplog, or system collections
-    if (collName.indexOf("system.") === 0 ||
-        dbName === "config" ||
-        (dbName === "local" && collName.indexOf("oplog.") === 0)) {
+    // do not validate the documents in system collections
+    if (collName.indexOf("system.") === 0) {
+        return goodSoFar;
+    }
+    // do not validate the documents in config dbs
+    if (dbName === "config") {
+        return goodSoFar;
+    }
+
+    // do not validate the documents in the oplog collection
+    if (dbName === "local" && collName.indexOf("oplog.") === 0) {
+        return goodSoFar;
+    }
+
+    // do not validate the documents in the minvalid collection
+    if (dbName === "local" && collName.indexOf("replset.minvalid") === 0) {
         return goodSoFar;
     }
 

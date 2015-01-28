@@ -38,6 +38,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context_noop.h"
 #include "mongo/db/ops/update_driver.h"
 #include "mongo/platform/unordered_set.h"
 #include "mongo/util/map_util.h"
@@ -47,7 +48,7 @@ namespace mongo {
 namespace {
     void addRoleNameToObjectElement(mutablebson::Element object, const RoleName& role) {
         fassert(17175, object.appendString(AuthorizationManager::ROLE_NAME_FIELD_NAME, role.getRole()));
-        fassert(17176, object.appendString(AuthorizationManager::ROLE_SOURCE_FIELD_NAME, role.getDB()));
+        fassert(17176, object.appendString(AuthorizationManager::ROLE_DB_FIELD_NAME, role.getDB()));
     }
 
     void addRoleNameObjectsToArrayElement(mutablebson::Element array, RoleNameIterator roles) {
@@ -88,8 +89,10 @@ namespace {
     }
 
     void AuthzManagerExternalStateMock::setAuthzVersion(int version) {
+        OperationContextNoop opCtx;
         uassertStatusOK(
-                updateOne(AuthorizationManager::versionCollectionNamespace,
+                updateOne(&opCtx,
+                          AuthorizationManager::versionCollectionNamespace,
                           AuthorizationManager::versionDocumentQuery,
                           BSON("$set" << BSON(AuthorizationManager::schemaVersionFieldName <<
                                               version)),
@@ -97,60 +100,8 @@ namespace {
                           BSONObj()));
     }
 
-    Status AuthzManagerExternalStateMock::_getUserDocument(const UserName& userName,
-                                                           BSONObj* userDoc) {
-        int authzVersion;
-        Status status = getStoredAuthorizationVersion(&authzVersion);
-        if (!status.isOK())
-            return status;
-
-        switch (authzVersion) {
-        case AuthorizationManager::schemaVersion26Upgrade:
-        case AuthorizationManager::schemaVersion26Final:
-            break;
-        default:
-            return Status(ErrorCodes::AuthSchemaIncompatible, mongoutils::str::stream() <<
-                          "Unsupported schema version for getUserDescription(): " <<
-                          authzVersion);
-        }
-
-        status = findOne(
-                (authzVersion == AuthorizationManager::schemaVersion26Final ?
-                 AuthorizationManager::usersCollectionNamespace :
-                 AuthorizationManager::usersAltCollectionNamespace),
-                BSON(AuthorizationManager::USER_NAME_FIELD_NAME << userName.getUser() <<
-                     AuthorizationManager::USER_DB_FIELD_NAME << userName.getDB()),
-                userDoc);
-        if (status == ErrorCodes::NoMatchingDocument) {
-            status = Status(ErrorCodes::UserNotFound, mongoutils::str::stream() <<
-                            "Could not find user " << userName.getFullName());
-        }
-        return status;
-    }
-
-    Status AuthzManagerExternalStateMock::getAllDatabaseNames(
-            std::vector<std::string>* dbnames) {
-        unordered_set<std::string> dbnameSet;
-        NamespaceDocumentMap::const_iterator it;
-        for (it = _documents.begin(); it != _documents.end(); ++it) {
-            dbnameSet.insert(it->first.db().toString());
-        }
-        *dbnames = std::vector<std::string>(dbnameSet.begin(), dbnameSet.end());
-        return Status::OK();
-    }
-
-    Status AuthzManagerExternalStateMock::_findUser(
-            const std::string& usersNamespace,
-            const BSONObj& query,
-            BSONObj* result) {
-        if (!findOne(NamespaceString(usersNamespace), query, result).isOK()) {
-            return Status(ErrorCodes::UserNotFound,
-                          "No matching user for query " + query.toString());
-        }
-        return Status::OK();
-    }
-
     Status AuthzManagerExternalStateMock::findOne(
+            OperationContext* txn,
             const NamespaceString& collectionName,
             const BSONObj& query,
             BSONObj* result) {
@@ -163,10 +114,11 @@ namespace {
     }
 
     Status AuthzManagerExternalStateMock::query(
+            OperationContext* txn,
             const NamespaceString& collectionName,
             const BSONObj& query,
             const BSONObj&,
-            const boost::function<void(const BSONObj&)>& resultProcessor) {
+            const stdx::function<void(const BSONObj&)>& resultProcessor) {
         std::vector<BSONObjCollection::iterator> iterVector;
         Status status = _queryVector(collectionName, query, &iterVector);
         if (!status.isOK()) {
@@ -185,6 +137,7 @@ namespace {
     }
 
     Status AuthzManagerExternalStateMock::insert(
+            OperationContext* txn,
             const NamespaceString& collectionName,
             const BSONObj& document,
             const BSONObj&) {
@@ -211,6 +164,7 @@ namespace {
     }
 
     Status AuthzManagerExternalStateMock::updateOne(
+            OperationContext* txn,
             const NamespaceString& collectionName,
             const BSONObj& query,
             const BSONObj& updatePattern,
@@ -250,7 +204,7 @@ namespace {
             if (query.hasField("_id")) {
                 document.root().appendElement(query["_id"]);
             }
-            status = driver.populateDocumentWithQueryFields(query, document);
+            status = driver.populateDocumentWithQueryFields(query, NULL, document);
             if (!status.isOK()) {
                 return status;
             }
@@ -258,14 +212,15 @@ namespace {
             if (!status.isOK()) {
                 return status;
             }
-            return insert(collectionName, document.getObject(), writeConcern);
+            return insert(txn, collectionName, document.getObject(), writeConcern);
         }
         else {
             return status;
         }
     }
 
-    Status AuthzManagerExternalStateMock::update(const NamespaceString& collectionName,
+    Status AuthzManagerExternalStateMock::update(OperationContext* txn,
+                                                 const NamespaceString& collectionName,
                                                  const BSONObj& query,
                                                  const BSONObj& updatePattern,
                                                  bool upsert,
@@ -277,6 +232,7 @@ namespace {
     }
 
     Status AuthzManagerExternalStateMock::remove(
+            OperationContext* txn,
             const NamespaceString& collectionName,
             const BSONObj& query,
             const BSONObj&,
@@ -297,20 +253,6 @@ namespace {
             }
         }
         *numRemoved = n;
-        return Status::OK();
-    }
-
-    Status AuthzManagerExternalStateMock::createIndex(
-            const NamespaceString& collectionName,
-            const BSONObj& pattern,
-            bool unique,
-            const BSONObj&) {
-        return Status::OK();
-    }
-
-    Status AuthzManagerExternalStateMock::dropIndexes(
-            const NamespaceString& collectionName,
-            const BSONObj& writeConcern) {
         return Status::OK();
     }
 
@@ -346,11 +288,12 @@ namespace {
             const BSONObj& query,
             std::vector<BSONObjCollection::iterator>* result) {
 
-        StatusWithMatchExpression parseResult = MatchExpressionParser::parse(query);
+        StatusWithMatchExpression parseResult = 
+                MatchExpressionParser::parse(query, MatchExpressionParser::WhereCallback());
         if (!parseResult.isOK()) {
             return parseResult.getStatus();
         }
-        MatchExpression* matcher = parseResult.getValue();
+        const boost::scoped_ptr<MatchExpression> matcher(parseResult.getValue());
 
         NamespaceDocumentMap::iterator mapIt = _documents.find(collectionName);
         if (mapIt == _documents.end())

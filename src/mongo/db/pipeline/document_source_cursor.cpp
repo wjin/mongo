@@ -26,19 +26,27 @@
  * it in the license file.
  */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include "mongo/db/pipeline/document_source.h"
 
+#include <boost/shared_ptr.hpp>
+
+#include "mongo/db/catalog/database_holder.h"
+#include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/pipeline/document.h"
+#include "mongo/db/query/explain.h"
 #include "mongo/db/query/find_constants.h"
-#include "mongo/db/query/type_explain.h"
 #include "mongo/db/storage_options.h"
-#include "mongo/s/d_logic.h"
-#include "mongo/s/stale_exception.h" // for SendStaleConfigException
+#include "mongo/s/d_state.h"
+
 
 namespace mongo {
+
+    using boost::intrusive_ptr;
+    using boost::shared_ptr;
+    using std::string;
 
     DocumentSourceCursor::~DocumentSourceCursor() {
         dispose();
@@ -64,29 +72,29 @@ namespace mongo {
     }
 
     void DocumentSourceCursor::dispose() {
-        // Can't call in to Runner or ClientCursor registries from this function since it will be
-        // called when an agg cursor is killed which would cause a deadlock.
-        _runner.reset();
+        // Can't call in to PlanExecutor or ClientCursor registries from this function since it
+        // will be called when an agg cursor is killed which would cause a deadlock.
+        _exec.reset();
         _currentBatch.clear();
     }
 
     void DocumentSourceCursor::loadBatch() {
-        if (!_runner) {
+        if (!_exec) {
             dispose();
             return;
         }
 
-        // We have already validated the sharding version when we constructed the Runner
+        // We have already validated the sharding version when we constructed the PlanExecutor
         // so we shouldn't check it again.
-        Lock::DBRead lk(_ns);
-        Client::Context ctx(_ns, storageGlobalParams.dbpath, /*doVersion=*/false);
+        const NamespaceString nss(_ns);
+        AutoGetCollectionForRead autoColl(pExpCtx->opCtx, nss);
 
-        _runner->restoreState();
+        _exec->restoreState(pExpCtx->opCtx);
 
         int memUsageBytes = 0;
         BSONObj obj;
-        Runner::RunnerState state;
-        while ((state = _runner->getNext(&obj, NULL)) == Runner::RUNNER_ADVANCED) {
+        PlanExecutor::ExecState state;
+        while ((state = _exec->getNext(&obj, NULL)) == PlanExecutor::ADVANCED) {
             if (_dependencies) {
                 _currentBatch.push_back(_dependencies->extractFields(obj));
             }
@@ -104,25 +112,24 @@ namespace mongo {
             memUsageBytes += _currentBatch.back().getApproximateSize();
 
             if (memUsageBytes > MaxBytesToReturnToClientAtOnce) {
-                // End this batch and prepare Runner for yielding.
-                _runner->saveState();
-                cc().curop()->yielded();
+                // End this batch and prepare PlanExecutor for yielding.
+                _exec->saveState();
                 return;
             }
         }
 
-        // If we got here, there won't be any more documents, so destroy the runner. Can't use
+        // If we got here, there won't be any more documents, so destroy the executor. Can't use
         // dispose since we want to keep the _currentBatch.
-        _runner.reset();
+        _exec.reset();
 
         uassert(16028, "collection or index disappeared when cursor yielded",
-                state != Runner::RUNNER_DEAD);
+                state != PlanExecutor::DEAD);
 
-        uassert(17285, "cursor encountered an error",
-                state != Runner::RUNNER_ERROR);
+        uassert(17285, "cursor encountered an error: " + WorkingSetCommon::toStatusString(obj),
+                state != PlanExecutor::FAILURE);
 
-        massert(17286, str::stream() << "Unexpected return from Runner::getNext: " << state,
-                state == Runner::RUNNER_EOF || state == Runner::RUNNER_ADVANCED);
+        massert(17286, str::stream() << "Unexpected return from PlanExecutor::getNext: " << state,
+                state == PlanExecutor::IS_EOF || state == PlanExecutor::ADVANCED);
     }
 
     void DocumentSourceCursor::setSource(DocumentSource *pSource) {
@@ -141,7 +148,7 @@ namespace mongo {
 
         if (!_limit) {
             _limit = dynamic_cast<DocumentSourceLimit*>(nextSource.get());
-            return _limit; // false if next is not a $limit
+            return _limit.get(); // false if next is not a $limit
         }
         else {
             return _limit->coalesce(nextSource);
@@ -150,68 +157,22 @@ namespace mongo {
         return false;
     }
 
-namespace {
-    Document extractInfo(ptr<const TypeExplain> info) {
-        MutableDocument out;
-
-        if (info->isClausesSet()) {
-            vector<Value> clauses;
-            for (size_t i = 0; i < info->sizeClauses(); i++) {
-                clauses.push_back(Value(extractInfo(info->getClausesAt(i))));
-            }
-            out[TypeExplain::clauses()] = Value::consume(clauses);
-        }
-
-        if (info->isCursorSet())
-            out[TypeExplain::cursor()] = Value(info->getCursor());
-
-        if (info->isIsMultiKeySet())
-            out[TypeExplain::isMultiKey()] = Value(info->getIsMultiKey());
-
-        if (info->isScanAndOrderSet())
-            out[TypeExplain::scanAndOrder()] = Value(info->getScanAndOrder());
-
-#if 0 // Disabled pending SERVER-12015 since until then no aggs will be index only.
-        if (info->isIndexOnlySet())
-            out[TypeExplain::indexOnly()] = Value(info->getIndexOnly());
-#endif
-
-        if (info->isIndexBoundsSet())
-            out[TypeExplain::indexBounds()] = Value(info->getIndexBounds());
-
-        if (info->isAllPlansSet()) {
-            vector<Value> allPlans;
-            for (size_t i = 0; i < info->sizeAllPlans(); i++) {
-                allPlans.push_back(Value(extractInfo(info->getAllPlansAt(i))));
-            }
-            out[TypeExplain::allPlans()] = Value::consume(allPlans);
-        }
-
-        return out.freeze();
-    }
-} // namespace
-
     Value DocumentSourceCursor::serialize(bool explain) const {
         // we never parse a documentSourceCursor, so we only serialize for explain
         if (!explain)
             return Value();
 
-        Status explainStatus(ErrorCodes::InternalError, "");
-        scoped_ptr<TypeExplain> plan;
+        // Get planner-level explain info from the underlying PlanExecutor.
+        BSONObjBuilder explainBuilder;
         {
-            Lock::DBRead lk(_ns);
-            Client::Context ctx(_ns, storageGlobalParams.dbpath, /*doVersion=*/false);
-            massert(17392, "No _runner. Were we disposed before explained?",
-                    _runner);
+            const NamespaceString nss(_ns);
+            AutoGetCollectionForRead autoColl(pExpCtx->opCtx, nss);
 
-            _runner->restoreState();
+            massert(17392, "No _exec. Were we disposed before explained?", _exec);
 
-            TypeExplain* explainRaw;
-            explainStatus = _runner->getInfo(&explainRaw, NULL);
-            if (explainStatus.isOK())
-                plan.reset(explainRaw);
-
-            _runner->saveState();
+            _exec->restoreState(pExpCtx->opCtx);
+            Explain::explainStages(_exec.get(), ExplainCommon::QUERY_PLANNER, &explainBuilder);
+            _exec->saveState();
         }
 
         MutableDocument out;
@@ -226,29 +187,28 @@ namespace {
         if (!_projection.isEmpty())
             out["fields"] = Value(_projection);
 
-        if (explainStatus.isOK()) {
-            out["plan"] = Value(extractInfo(plan));
-        } else {
-            out["planError"] = Value(explainStatus.toString());
-        }
+        // Add explain results from the query system into the agg explain output.
+        BSONObj explainObj = explainBuilder.obj();
+        invariant(explainObj.hasField("queryPlanner"));
+        out["queryPlanner"] = Value(explainObj["queryPlanner"]);
 
         return Value(DOC(getSourceName() << out.freezeToValue()));
     }
 
     DocumentSourceCursor::DocumentSourceCursor(const string& ns,
-                                               const boost::shared_ptr<Runner>& runner,
+                                               const boost::shared_ptr<PlanExecutor>& exec,
                                                const intrusive_ptr<ExpressionContext> &pCtx)
         : DocumentSource(pCtx)
         , _docsAddedToBatches(0)
         , _ns(ns)
-        , _runner(runner)
+        , _exec(exec)
     {}
 
     intrusive_ptr<DocumentSourceCursor> DocumentSourceCursor::create(
             const string& ns,
-            const boost::shared_ptr<Runner>& runner,
+            const boost::shared_ptr<PlanExecutor>& exec,
             const intrusive_ptr<ExpressionContext> &pExpCtx) {
-        return new DocumentSourceCursor(ns, runner, pExpCtx);
+        return new DocumentSourceCursor(ns, exec, pExpCtx);
     }
 
     void DocumentSourceCursor::setProjection(

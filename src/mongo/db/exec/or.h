@@ -28,20 +28,20 @@
 
 #pragma once
 
-#include "mongo/db/diskloc.h"
 #include "mongo/db/exec/plan_stage.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/expression.h"
+#include "mongo/db/record_id.h"
 #include "mongo/platform/unordered_set.h"
 
 namespace mongo {
 
     /**
-     * This stage outputs the union of its children.  It optionally deduplicates on DiskLoc.
+     * This stage outputs the union of its children.  It optionally deduplicates on RecordId.
      *
-     * Preconditions: Valid DiskLoc.
+     * Preconditions: Valid RecordId.
      *
-     * If we're deduping, we may fail to dedup any invalidated DiskLoc properly.
+     * If we're deduping, we may fail to dedup any invalidated RecordId properly.
      */
     class OrStage : public PlanStage {
     public:
@@ -54,11 +54,21 @@ namespace mongo {
 
         virtual StageState work(WorkingSetID* out);
 
-        virtual void prepareToYield();
-        virtual void recoverFromYield();
-        virtual void invalidate(const DiskLoc& dl, InvalidationType type);
+        virtual void saveState();
+        virtual void restoreState(OperationContext* opCtx);
+        virtual void invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type);
+
+        virtual std::vector<PlanStage*> getChildren() const;
+
+        virtual StageType stageType() const { return STAGE_OR; }
 
         virtual PlanStageStats* getStats();
+
+        virtual const CommonStats* getCommonStats();
+
+        virtual const SpecificStats* getSpecificStats();
+
+        static const char* kStageType;
 
     private:
         // Not owned by us.
@@ -68,16 +78,16 @@ namespace mongo {
         const MatchExpression* _filter;
 
         // Owned by us.
-        vector<PlanStage*> _children;
+        std::vector<PlanStage*> _children;
 
         // Which of _children are we calling work(...) on now?
         size_t _currentChild;
 
-        // True if we dedup on DiskLoc, false otherwise.
+        // True if we dedup on RecordId, false otherwise.
         bool _dedup;
 
-        // Which DiskLocs have we returned?
-        unordered_set<DiskLoc, DiskLoc::Hasher> _seen;
+        // Which RecordIds have we returned?
+        unordered_set<RecordId, RecordId::Hasher> _seen;
 
         // Stats
         CommonStats _commonStats;

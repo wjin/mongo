@@ -1,24 +1,41 @@
 /* Copyright 2013 10gen Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ *    This program is free software: you can redistribute it and/or  modify
+ *    it under the terms of the GNU Affero General Public License, version 3,
+ *    as published by the Free Software Foundation.
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ *    You should have received a copy of the GNU Affero General Public License
+ *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
  */
 
 #include "mongo/util/options_parser/option_description.h"
+
+#include <algorithm>
+#include <boost/shared_ptr.hpp>
 
 #include "mongo/util/assert_util.h"
 
 namespace mongo {
 namespace optionenvironment {
+
+    using boost::shared_ptr;
 
     namespace {
         /**
@@ -81,6 +98,59 @@ namespace optionenvironment {
         }
     } // namespace
 
+    OptionDescription::OptionDescription(const std::string& dottedName,
+                                         const std::string& singleName,
+                                         const OptionType type,
+                                         const std::string& description)
+        : _dottedName(dottedName),
+          _singleName(singleName),
+          _type(type),
+          _description(description),
+          _isVisible(true),
+          _default(Value()),
+          _implicit(Value()),
+          _isComposing(false),
+          _sources(SourceAll),
+          _positionalStart(-1),
+          _positionalEnd(-1),
+          _constraints(),
+          _deprecatedDottedNames() { }
+
+    OptionDescription::OptionDescription(const std::string& dottedName,
+                                         const std::string& singleName,
+                                         const OptionType type,
+                                         const std::string& description,
+                                         const std::vector<std::string>& deprecatedDottedNames)
+        : _dottedName(dottedName),
+          _singleName(singleName),
+          _type(type),
+          _description(description),
+          _isVisible(true),
+          _default(Value()),
+          _implicit(Value()),
+          _isComposing(false),
+          _sources(SourceAll),
+          _positionalStart(-1),
+          _positionalEnd(-1),
+          _constraints(),
+          _deprecatedDottedNames(deprecatedDottedNames) {
+
+        // Verify deprecated dotted names.
+        // No empty deprecated dotted names.
+        if (std::count(_deprecatedDottedNames.begin(), _deprecatedDottedNames.end(), "")) {
+            StringBuilder sb;
+            sb << "Attempted to register option with empty string for deprecated dotted name";
+            throw DBException(sb.str(), ErrorCodes::BadValue);
+        }
+        // Should not be the same as _dottedName.
+        if (std::count(_deprecatedDottedNames.begin(), _deprecatedDottedNames.end(), dottedName)) {
+            StringBuilder sb;
+            sb << "Attempted to register option with conflict between dottedName and deprecated "
+               << "dotted name: " << _dottedName;
+            throw DBException(sb.str(), ErrorCodes::BadValue);
+        }
+    }
+
     OptionDescription& OptionDescription::hidden() {
         _isVisible = false;
         return *this;
@@ -107,6 +177,14 @@ namespace optionenvironment {
             throw DBException(sb.str(), ErrorCodes::InternalError);
         }
 
+        // It doesn't make sense to set a "default value" for switch options, so disallow it here
+        if (_type == Switch) {
+            StringBuilder sb;
+            sb << "Could not register option \"" << _dottedName << "\": "
+                << "the default value of a Switch option is false and cannot be changed";
+            throw DBException(sb.str(), ErrorCodes::InternalError);
+        }
+
         _default = defaultValue;
         return *this;
     }
@@ -129,6 +207,15 @@ namespace optionenvironment {
             sb << "Could not register option \"" << _dottedName << "\": "
             << "mismatch between declared type and type of implicit value: "
             << ret.toString();
+            throw DBException(sb.str(), ErrorCodes::InternalError);
+        }
+
+        // It doesn't make sense to set an "implicit value" for switch options since they can never
+        // have an argument anyway, so disallow it here
+        if (_type == Switch) {
+            StringBuilder sb;
+            sb << "Could not register option \"" << _dottedName << "\": "
+                << "the implicit value of a Switch option is true and cannot be changed";
             throw DBException(sb.str(), ErrorCodes::InternalError);
         }
 

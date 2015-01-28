@@ -2,33 +2,53 @@
 /*
  *    Copyright 2010 10gen Inc.
  *
- *    Licensed under the Apache License, Version 2.0 (the "License");
- *    you may not use this file except in compliance with the License.
- *    You may obtain a copy of the License at
+ *    This program is free software: you can redistribute it and/or  modify
+ *    it under the terms of the GNU Affero General Public License, version 3,
+ *    as published by the Free Software Foundation.
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License for more details.
  *
- *    Unless required by applicable law or agreed to in writing, software
- *    distributed under the License is distributed on an "AS IS" BASIS,
- *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *    See the License for the specific language governing permissions and
- *    limitations under the License.
+ *    You should have received a copy of the GNU Affero General Public License
+ *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
  */
 
-#include "mongo/pch.h"
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+
+#include "mongo/platform/basic.h"
 
 #include <boost/filesystem/operations.hpp>
 #include <fstream>
+#include <iostream>
 #include <pcrecpp.h>
+#include <signal.h>
 #include <stdio.h>
 #include <string.h>
+#include <boost/algorithm/string/predicate.hpp>
+#include <boost/algorithm/string/trim.hpp>
 
 #include "mongo/base/initializer.h"
 #include "mongo/base/status.h"
 #include "mongo/client/clientOnly-private.h"
 #include "mongo/client/dbclientinterface.h"
 #include "mongo/client/sasl_client_authenticate.h"
-#include "mongo/db/repl/heartbeat_info.h"
+#include "mongo/db/client.h"
+#include "mongo/db/log_process_details.h"
+#include "mongo/db/server_options.h"
 #include "mongo/logger/console_appender.h"
 #include "mongo/logger/logger.h"
 #include "mongo/logger/message_event_utf8_encoder.h"
@@ -37,9 +57,13 @@
 #include "mongo/shell/shell_options.h"
 #include "mongo/shell/shell_utils.h"
 #include "mongo/shell/shell_utils_launcher.h"
+#include "mongo/util/exit_code.h"
 #include "mongo/util/file.h"
+#include "mongo/util/log.h"
 #include "mongo/util/net/ssl_options.h"
 #include "mongo/util/password.h"
+#include "mongo/util/quick_exit.h"
+#include "mongo/util/signal_handlers.h"
 #include "mongo/util/stacktrace.h"
 #include "mongo/util/startup_test.h"
 #include "mongo/util/text.h"
@@ -61,12 +85,6 @@ string historyFile;
 bool gotInterrupted = false;
 bool inMultiLine = false;
 static volatile bool atPrompt = false; // can eval before getting to prompt
-
-#if !defined(__freebsd__) && !defined(__openbsd__) && !defined(_WIN32)
-// this is for ctrl-c handling
-#include <setjmp.h>
-jmp_buf jbuf;
-#endif
 
 namespace mongo {
 
@@ -133,11 +151,12 @@ void shellHistoryAdd( const char * line ) {
         return;
     lastLine = line;
 
-    // We don't want any .auth() or .addUser() shell helpers added, but we want to
+    // We don't want any .auth() or .createUser() shell helpers added, but we want to
     // be able to add things like `.author`, so be smart about how this is
-    // detected by using regular expresions.
+    // detected by using regular expresions. This is so we can avoid storing passwords
+    // in the history file in plaintext.
     static pcrecpp::RE hiddenHelpers(
-            "\\.\\s*(auth|addUser|createUser|updateUser|changeUserPassword)\\s*\\(");
+            "\\.\\s*(auth|createUser|updateUser|changeUserPassword)\\s*\\(");
     // Also don't want the raw user management commands to show in the shell when run directly
     // via runCommand.
     static pcrecpp::RE hiddenCommands(
@@ -147,12 +166,6 @@ void shellHistoryAdd( const char * line ) {
         linenoiseHistoryAdd( line );
     }
 }
-
-#ifdef CTRLC_HANDLE
-void intr( int sig ) {
-    longjmp( jbuf , 1 );
-}
-#endif
 
 void killOps() {
     if ( mongo::shell_utils::_nokillop )
@@ -167,103 +180,45 @@ void killOps() {
         killOperationsOnAllConnections(!shellGlobalParams.autoKillOp);
 }
 
-void quitNicely( int sig ) {
-    {
-        mongo::mutex::scoped_lock lk(mongo::shell_utils::mongoProgramOutputMutex);
-        mongo::dbexitCalled = true;
-    }
-    if ( sig == SIGINT && inMultiLine ) {
-        gotInterrupted = 1;
-        return;
-    }
+// Stubs for signal_handlers.cpp
+namespace mongo {
+    void Client::initThread(const char *desc, mongo::AbstractMessagingPort *mp) {}
+    void logProcessDetailsForLogRotate() {}
 
-    killOps();
-    shellHistoryDone();
-    ::_exit(0);
+    void exitCleanly(ExitCode code) {
+        {
+            mongo::mutex::scoped_lock lk(mongo::shell_utils::mongoProgramOutputMutex);
+            mongo::dbexitCalled = true;
+        }
+
+        ::killOps();
+        ::shellHistoryDone();
+        quickExit(0);
+    }
+}
+
+void quitNicely( int sig ) {
+    exitCleanly(EXIT_CLEAN);
 }
 
 // the returned string is allocated with strdup() or malloc() and must be freed by calling free()
 char * shellReadline( const char * prompt , int handlesigint = 0 ) {
     atPrompt = true;
 
-#ifdef CTRLC_HANDLE
-    if ( ! handlesigint ) {
-        char* ret = linenoise( prompt );
-        atPrompt = false;
-        return ret;
-    }
-    if ( setjmp( jbuf ) ) {
-        gotInterrupted = 1;
-        sigrelse(SIGINT);
-        signal( SIGINT , quitNicely );
-        return 0;
-    }
-    signal( SIGINT , intr );
-#endif
-
     char * ret = linenoise( prompt );
     if ( ! ret ) {
         gotInterrupted = true;  // got ^C, break out of multiline
     }
 
-    signal( SIGINT , quitNicely );
     atPrompt = false;
     return ret;
 }
 
-#ifdef _WIN32
-char * strsignal(int sig){
-    switch (sig){
-        case SIGINT: return "SIGINT";
-        case SIGTERM: return "SIGTERM";
-        case SIGABRT: return "SIGABRT";
-        case SIGSEGV: return "SIGSEGV";
-        case SIGFPE: return "SIGFPE";
-        default: return "unknown";
-    }
-}
-#endif
-
-void quitAbruptly( int sig ) {
-    log() << "mongo got signal " << sig << " (" << strsignal( sig ) << "), stack trace: ";
-    mongo::printStackTrace();
-
-    mongo::shell_utils::KillMongoProgramInstances();
-    ::_exit( 14 );
-}
-
-// this will be called in certain c++ error cases, for example if there are two active
-// exceptions
-void myterminate() {
-    mongo::printStackTrace(severe().stream() << "terminate() called in shell, printing stack:\n");
-    ::_exit( 14 );
-}
-
-static void ignoreSignal(int ignored) {}
-
 void setupSignals() {
     signal( SIGINT , quitNicely );
-    signal( SIGTERM , quitNicely );
-    signal( SIGABRT , quitAbruptly );
-    signal( SIGSEGV , quitAbruptly );
-    signal( SIGFPE , quitAbruptly );
-
-#if !defined(_WIN32) // surprisingly these are the only ones that don't work on windows
-    struct sigaction sigactionSignals;
-    sigactionSignals.sa_handler = ignoreSignal;
-    sigemptyset(&sigactionSignals.sa_mask);
-    sigactionSignals.sa_flags = 0;
-    sigaction(SIGPIPE, &sigactionSignals, NULL); // errors are handled in socket code directly
-
-    signal( SIGBUS , quitAbruptly );
-#endif
-
-    set_terminate( myterminate );
 }
 
 string fixHost( const std::string& url, const std::string& host, const std::string& port ) {
-    //cout << "fixHost url: " << url << " host: " << host << " port: " << port << endl;
-
     if ( host.size() == 0 && port.size() == 0 ) {
         if ( url.find( "/" ) == string::npos ) {
             // check for ips
@@ -279,7 +234,7 @@ string fixHost( const std::string& url, const std::string& host, const std::stri
 
     if ( url.find( "/" ) != string::npos ) {
         cerr << "url can't have host or port if you specify them individually" << endl;
-        ::_exit(-1);
+        quickExit(-1);
     }
 
     string newurl( ( host.size() == 0 ) ? "127.0.0.1" : host );
@@ -464,7 +419,7 @@ string finishCode( string code ) {
             return "";
 
         char * linePtr = line;
-        while ( startsWith( linePtr, "... " ) )
+        while ( str::startsWith( linePtr, "... " ) )
             linePtr += 4;
 
         code += linePtr;
@@ -638,6 +593,7 @@ static void edit( const string& whatToEdit ) {
 
 int _main( int argc, char* argv[], char **envp ) {
     mongo::isShell = true;
+    setupSignalHandlers(true);
     setupSignals();
 
     mongo::shell_utils::RecordMyLocation( argv[ 0 ] );
@@ -826,13 +782,9 @@ int _main( int argc, char* argv[], char **envp ) {
         string prompt;
         int promptType;
 
-        //v8::Handle<v8::Object> shellHelper = baseContext_->Global()->Get( v8::String::New( "shellHelper" ) )->ToObject();
-
         while ( 1 ) {
             inMultiLine = false;
             gotInterrupted = false;
-//            shellMainScope->localConnect;
-            //DBClientWithCommands *c = getConnection( JSContext *cx, JSObject *obj );
 
             promptType = scope->type( "prompt" );
             if ( promptType == String ) {
@@ -847,99 +799,80 @@ int _main( int argc, char* argv[], char **envp ) {
                 prompt = "> ";
             }
 
-            char * line = shellReadline( prompt.c_str() );
+            char * lineCStr = shellReadline( prompt.c_str() );
 
-            char * linePtr = line;  // can't clobber 'line', we need to free() it later
-            if ( linePtr ) {
-                while ( linePtr[0] == ' ' )
-                    ++linePtr;
-                int lineLen = strlen( linePtr );
-                while ( lineLen > 0 && linePtr[lineLen - 1] == ' ' )
-                    linePtr[--lineLen] = 0;
-            }
-
-            if ( ! linePtr || ( strlen( linePtr ) == 4 && strstr( linePtr , "exit" ) ) ) {
-                if (!mongo::serverGlobalParams.quiet)
-                    cout << "bye" << endl;
-                if ( line )
-                    free( line );
+            if ( !lineCStr ) {
+                // User must have hit ^C; treat this like an exit.
+                if( !mongo::serverGlobalParams.quiet )
+                    cout << "User interrupt detected; exiting..." << endl;
                 break;
             }
 
-            string code = linePtr;
-            if ( code == "exit" || code == "exit;" ) {
-                free( line );
-                break;
-            }
-            if ( code == "cls" ) {
-                free( line );
-                linenoiseClearScreen();
-                continue;
-            }
+            string line = lineCStr;
+            boost::algorithm::trim(line);
 
-            if ( code.size() == 0 ) {
-                free( line );
-                continue;
-            }
+            // Free line before we forget.
+            free(lineCStr);
+            lineCStr = NULL;
 
-            if ( startsWith( linePtr, "edit " ) ) {
-                shellHistoryAdd( linePtr );
-
-                const char* s = linePtr + 5; // skip "edit "
-                while( *s && isspace( *s ) )
-                    s++;
-
-                edit( s );
-                free( line );
-                continue;
-            }
-
+            // First, check to see if this code needs to be finished.  If it
+            // does, we'll need to do some parsing before we look at commands.
             gotInterrupted = false;
-            code = finishCode( code );
+            line = finishCode( line );
+
+            if ( line == "quit" || line == "exit" ) {
+              // Replace this with the real command that the shell expects
+              line += "(0)";
+            }
+
             if ( gotInterrupted ) {
+                // If we got interrupted in multiline editing, just print a new
+                // line so that the next command will be entered (correctly) on
+                // the next line.
                 cout << endl;
-                free( line );
-                continue;
-            }
+            } else if ( line == "cls" ) {
+                linenoiseClearScreen();
+            } else if( boost::algorithm::starts_with( line, "edit " ) ) {
+                string s = line.c_str() + 5; // skip "edit "
+                boost::algorithm::trim_left(s);
+                edit( s );
+            } else if ( !line.empty() ) {
+                // Whatever we have now will be in the form:
+                //   CMD ARGS
+                bool wasCmd = false;
+                const string cmd(line, 0, line.find(' '));
 
-            if ( code.size() == 0 ) {
-                free( line );
-                break;
-            }
-
-            bool wascmd = false;
-            {
-                string cmd = linePtr;
-                if ( cmd.find( " " ) > 0 )
-                    cmd = cmd.substr( 0 , cmd.find( " " ) );
-
-                if ( cmd.find( "\"" ) == string::npos ) {
+                if ( cmd.find("\"") == string::npos ) {
                     try {
-                        scope->exec( (string)"__iscmd__ = shellHelper[\"" + cmd + "\"];" , "(shellhelp1)" , false , true , true );
+                        scope->exec(
+                                (string) "__iscmd__ = shellHelper[\"" + cmd + "\"];",
+                                "(shellhelp1)" , false , true , true );
                         if ( scope->getBoolean( "__iscmd__" )  ) {
-                            scope->exec( (string)"shellHelper( \"" + cmd + "\" , \"" + code.substr( cmd.size() ) + "\");" , "(shellhelp2)" , false , true , false );
-                            wascmd = true;
+                            scope->exec(
+                                    (string) "shellHelper( \"" + cmd + "\" , \"" + line.substr( cmd.size() ) + "\");",
+                                    "(shellhelp2)" , false , true , false );
+                            wasCmd = true;
                         }
+                    } catch ( std::exception& exc) {
+                        cout << "error2:" << exc.what() << endl;
+                        wasCmd = true;
                     }
-                    catch ( std::exception& e ) {
-                        cout << "error2:" << e.what() << endl;
-                        wascmd = true;
+                }
+
+                if ( !wasCmd ) {
+                    try {
+                        if ( scope->exec( line.c_str() , "(shell)" , false , true , false ) )
+                            scope->exec( "shellPrintHelper( __lastres__ );" , "(shell2)" , true , true , false );
+                    }
+                    catch ( std::exception& exc ) {
+                        cout << "error:" << exc.what() << endl;
                     }
                 }
             }
 
-            if ( ! wascmd ) {
-                try {
-                    if ( scope->exec( code.c_str() , "(shell)" , false , true , false ) )
-                        scope->exec( "shellPrintHelper( __lastres__ );" , "(shell2)" , true , true , false );
-                }
-                catch ( std::exception& e ) {
-                    cout << "error:" << e.what() << endl;
-                }
-            }
-
-            shellHistoryAdd( code.c_str() );
-            free( line );
+            // If the line contained anything, add it to the history.
+            if(!line.empty())
+                shellHistoryAdd( line.c_str() );
         }
 
         shellHistoryDone();
@@ -964,7 +897,7 @@ int wmain(int argc, wchar_t* argvW[], wchar_t* envpW[]) {
         cerr << "exception: " << e.what() << endl;
         returnCode = 1;
     }
-    ::_exit(returnCode);
+    quickExit(returnCode);
 }
 #else // #ifdef _WIN32
 int main( int argc, char* argv[], char **envp ) {
@@ -977,6 +910,6 @@ int main( int argc, char* argv[], char **envp ) {
         cerr << "exception: " << e.what() << endl;
         returnCode = 1;
     }
-    _exit(returnCode);
+    quickExit(returnCode);
 }
 #endif // #ifdef _WIN32

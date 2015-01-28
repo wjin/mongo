@@ -1,7 +1,7 @@
 // collection.h
 
 /**
-*    Copyright (C) 2012 10gen Inc.
+*    Copyright (C) 2012-2014 MongoDB Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -34,37 +34,29 @@
 
 #include "mongo/base/string_data.h"
 #include "mongo/bson/mutable/damage_vector.h"
-#include "mongo/db/catalog/collection_cursor_cache.h"
+#include "mongo/db/catalog/collection_info_cache.h"
+#include "mongo/db/catalog/cursor_manager.h"
 #include "mongo/db/catalog/index_catalog.h"
-#include "mongo/db/diskloc.h"
 #include "mongo/db/exec/collection_scan_common.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/structure/record_store.h"
-#include "mongo/db/catalog/collection_info_cache.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/storage/capped_callback.h"
+#include "mongo/db/storage/record_store.h"
 #include "mongo/platform/cstdint.h"
 
 namespace mongo {
 
-    class Database;
+    class CollectionCatalogEntry;
+    class DatabaseCatalogEntry;
     class ExtentManager;
-    class NamespaceDetails;
     class IndexCatalog;
     class MultiIndexBlock;
-    class TransactionExperiment;
+    class OperationContext;
 
     class RecordIterator;
-    class FlatIterator;
-    class CappedIterator;
+    class RecordFetcher;
 
     class OpDebug;
-
-    class DocWriter {
-    public:
-        virtual ~DocWriter() {}
-        virtual void writeDocument( char* buf ) const = 0;
-        virtual size_t documentSize() const = 0;
-        virtual bool addPadding() const { return true; }
-    };
 
     struct CompactOptions {
 
@@ -107,19 +99,20 @@ namespace mongo {
      * this is NOT safe through a yield right now
      * not sure if it will be, or what yet
      */
-    class Collection {
+    class Collection : CappedDocumentDeleteCallback, UpdateNotifier {
     public:
-        Collection( TransactionExperiment* txn,
+        Collection( OperationContext* txn,
                     const StringData& fullNS,
-                    NamespaceDetails* details,
-                    Database* database );
+                    CollectionCatalogEntry* details, // does not own
+                    RecordStore* recordStore, // does not own
+                    DatabaseCatalogEntry* dbce ); // does not own
 
         ~Collection();
 
         bool ok() const { return _magic == 1357924; }
 
-        NamespaceDetails* detailsWritable() { return _details; } // TODO: remove
-        const NamespaceDetails* details() const { return _details; }
+        CollectionCatalogEntry* getCatalogEntry() { return _details; }
+        const CollectionCatalogEntry* getCatalogEntry() const { return _details; }
 
         CollectionInfoCache* infoCache() { return &_infoCache; }
         const CollectionInfoCache* infoCache() const { return &_infoCache; }
@@ -129,21 +122,27 @@ namespace mongo {
         const IndexCatalog* getIndexCatalog() const { return &_indexCatalog; }
         IndexCatalog* getIndexCatalog() { return &_indexCatalog; }
 
-        const RecordStore* getRecordStore() const { return _recordStore.get(); }
+        const RecordStore* getRecordStore() const { return _recordStore; }
+        RecordStore* getRecordStore() { return _recordStore; }
 
-        CollectionCursorCache* cursorCache() const { return &_cursorCache; }
+        CursorManager* getCursorManager() const { return &_cursorManager; }
 
         bool requiresIdIndex() const;
 
-        BSONObj docFor(const DiskLoc& loc) const;
+        BSONObj docFor(OperationContext* txn, const RecordId& loc) const;
+
+        /**
+         * @param out - contents set to the right docs if exists, or nothing.
+         * @return true iff loc exists
+         */
+        bool findDoc(OperationContext* txn, const RecordId& loc, BSONObj* out) const;
 
         // ---- things that should move to a CollectionAccessMethod like thing
         /**
-         * canonical to get all would be
-         * getIterator( DiskLoc(), false, CollectionScanParams::FORWARD )
+         * Default arguments will return all items in the collection.
          */
-        RecordIterator* getIterator( const DiskLoc& start = DiskLoc(),
-                                     bool tailable = false,
+        RecordIterator* getIterator( OperationContext* txn,
+                                     const RecordId& start = RecordId(),
                                      const CollectionScanParams::Direction& dir = CollectionScanParams::FORWARD ) const;
 
         /**
@@ -151,7 +150,7 @@ namespace mongo {
          * all returned iterators is equivalent to Iterating the full collection.
          * Caller owns all pointers in the vector.
          */
-        std::vector<RecordIterator*> getManyIterators() const;
+        std::vector<RecordIterator*> getManyIterators( OperationContext* txn ) const;
 
 
         /**
@@ -159,10 +158,10 @@ namespace mongo {
          * this should only be used at a very low level
          * does no yielding, indexes, etc...
          */
-        int64_t countTableScan( const MatchExpression* expression );
+        int64_t countTableScan( OperationContext* txn, const MatchExpression* expression );
 
-        void deleteDocument( TransactionExperiment* txn,
-                             const DiskLoc& loc,
+        void deleteDocument( OperationContext* txn,
+                             const RecordId& loc,
                              bool cappedOK = false,
                              bool noWarn = false,
                              BSONObj* deletedId = 0 );
@@ -170,18 +169,33 @@ namespace mongo {
         /**
          * this does NOT modify the doc before inserting
          * i.e. will not add an _id field for documents that are missing it
+         *
+         * If enforceQuota is false, quotas will be ignored.
          */
-        StatusWith<DiskLoc> insertDocument( TransactionExperiment* txn,
+        StatusWith<RecordId> insertDocument( OperationContext* txn,
                                             const BSONObj& doc,
                                             bool enforceQuota );
 
-        StatusWith<DiskLoc> insertDocument( TransactionExperiment* txn,
+        StatusWith<RecordId> insertDocument( OperationContext* txn,
                                             const DocWriter* doc,
                                             bool enforceQuota );
 
-        StatusWith<DiskLoc> insertDocument( TransactionExperiment* txn,
+        StatusWith<RecordId> insertDocument( OperationContext* txn,
                                             const BSONObj& doc,
-                                            MultiIndexBlock& indexBlock );
+                                            MultiIndexBlock* indexBlock,
+                                            bool enforceQuota );
+
+        /**
+         * If the document at 'loc' is unlikely to be in physical memory, the storage
+         * engine gives us back a RecordFetcher functor which we can invoke in order
+         * to page fault on that record.
+         *
+         * Returns NULL if the document does not need to be fetched.
+         *
+         * Caller takes ownership of the returned RecordFetcher*.
+         */
+        RecordFetcher* documentNeedsFetch( OperationContext* txn,
+                                           const RecordId& loc ) const;
 
         /**
          * updates the document @ oldLocation with newDoc
@@ -189,33 +203,33 @@ namespace mongo {
          * if not, it is moved
          * @return the post update location of the doc (may or may not be the same as oldLocation)
          */
-        StatusWith<DiskLoc> updateDocument( TransactionExperiment* txn,
-                                            const DiskLoc& oldLocation,
-                                            const BSONObj& newDoc,
-                                            bool enforceQuota,
-                                            OpDebug* debug );
+        StatusWith<RecordId> updateDocument( OperationContext* txn,
+                                             const RecordId& oldLocation,
+                                             const BSONObj& oldDoc,
+                                             const BSONObj& newDoc,
+                                             bool enforceQuota,
+                                             bool indexesAffected,
+                                             OpDebug* debug );
 
         /**
          * right now not allowed to modify indexes
          */
-        Status updateDocumentWithDamages( TransactionExperiment* txn,
-                                          const DiskLoc& loc,
-                                          const char* damangeSource,
+        Status updateDocumentWithDamages( OperationContext* txn,
+                                          const RecordId& loc,
+                                          const RecordData& oldRec,
+                                          const char* damageSource,
                                           const mutablebson::DamageVector& damages );
-
-
-        int64_t storageSize( int* numExtents = NULL, BSONArrayBuilder* extentInfo = NULL ) const;
 
         // -----------
 
-        StatusWith<CompactStats> compact(TransactionExperiment* txn, const CompactOptions* options);
+        StatusWith<CompactStats> compact(OperationContext* txn, const CompactOptions* options);
 
         /**
          * removes all documents as fast as possible
          * indexes before and after will be the same
          * as will other characteristics
          */
-        Status truncate(TransactionExperiment* txn);
+        Status truncate(OperationContext* txn);
 
         /**
          * @param full - does more checks
@@ -224,14 +238,14 @@ namespace mongo {
          *         OK will be returned even if corruption is found
          *         deatils will be in result
          */
-        Status validate( TransactionExperiment* txn,
+        Status validate( OperationContext* txn,
                          bool full, bool scanData,
                          ValidateResults* results, BSONObjBuilder* output );
 
         /**
          * forces data into cache
          */
-        Status touch( TransactionExperiment* txn,
+        Status touch( OperationContext* txn,
                       bool touchData, bool touchIndexes,
                       BSONObjBuilder* output ) const;
 
@@ -242,91 +256,71 @@ namespace mongo {
          * @param inclusive - Truncate 'end' as well iff true
          * XXX: this will go away soon, just needed to move for now
          */
-        void temp_cappedTruncateAfter( TransactionExperiment* txn, DiskLoc end, bool inclusive );
+        void temp_cappedTruncateAfter( OperationContext* txn, RecordId end, bool inclusive );
 
         // -----------
-
-
-        // this is temporary, moving up from DB for now
-        // this will add a new extent the collection
-        // the new extent will be returned
-        // it will have been added to the linked list already
-        void increaseStorageSize( TransactionExperiment* txn, int size, bool enforceQuota );
 
         //
         // Stats
         //
 
-        /**
-         * @param scaleSize - amount by which to scale size metrics
-         * appends any custom stats from the RecordStore or other unique stats
-         */
-        void appendCustomStats( BSONObjBuilder* resuits, double scaleSize = 1 ) const;
-
         bool isCapped() const;
 
-        uint64_t numRecords() const;
+        uint64_t numRecords( OperationContext* txn ) const;
 
-        uint64_t dataSize() const;
+        uint64_t dataSize( OperationContext* txn ) const;
 
-        int averageObjectSize() const {
-            uint64_t n = numRecords();
+        int averageObjectSize( OperationContext* txn ) const {
+            uint64_t n = numRecords( txn );
             if ( n == 0 )
                 return 5;
-            return static_cast<int>( dataSize() / n );
+            return static_cast<int>( dataSize( txn ) / n );
         }
 
-        // TODO(erh) - below till next mark are suspect
-        bool isUserFlagSet( int flag ) const;
-        bool setUserFlag( TransactionExperiment* txn, int flag );
-        bool clearUserFlag( TransactionExperiment* txn, int flag );
+        uint64_t getIndexSize(OperationContext* opCtx,
+                              BSONObjBuilder* details = NULL,
+                              int scale = 1);
 
-        void setMaxCappedDocs( long long max );
         // --- end suspect things
 
     private:
+
+        Status recordStoreGoingToMove( OperationContext* txn,
+                                       const RecordId& oldLocation,
+                                       const char* oldBuffer,
+                                       size_t oldSize );
+
+        Status recordStoreGoingToUpdateInPlace( OperationContext* txn,
+                                                const RecordId& loc );
+
+        Status aboutToDeleteCapped( OperationContext* txn, const RecordId& loc, RecordData data );
+
         /**
          * same semantics as insertDocument, but doesn't do:
          *  - some user error checks
          *  - adjust padding
          */
-        StatusWith<DiskLoc> _insertDocument( TransactionExperiment* txn,
+        StatusWith<RecordId> _insertDocument( OperationContext* txn,
                                              const BSONObj& doc,
                                              bool enforceQuota );
 
-        void _compactExtent(TransactionExperiment* txn,
-                            const DiskLoc diskloc,
-                            int extentNumber,
-                            MultiIndexBlock& indexesToInsertTo,
-                            const CompactOptions* compactOptions,
-                            CompactStats* stats );
-
-        void _syncUserFlags(TransactionExperiment* txn); // TODO: this is bizarre, should go away
-
-
-        // @return 0 for inf., otherwise a number of files
-        int largestFileNumberInQuota() const;
-
-        ExtentManager* getExtentManager();
-        const ExtentManager* getExtentManager() const;
+        bool _enforceQuota( bool userEnforeQuota ) const;
 
         int _magic;
 
         NamespaceString _ns;
-        NamespaceDetails* _details;
-        Database* _database;
-        scoped_ptr<RecordStore> _recordStore;
+        CollectionCatalogEntry* _details;
+        RecordStore* _recordStore;
+        DatabaseCatalogEntry* _dbce;
         CollectionInfoCache _infoCache;
         IndexCatalog _indexCatalog;
 
         // this is mutable because read only users of the Collection class
         // use it keep state.  This seems valid as const correctness of Collection
         // should be about the data.
-        mutable CollectionCursorCache _cursorCache;
+        mutable CursorManager _cursorManager;
 
         friend class Database;
-        friend class FlatIterator;
-        friend class CappedIterator;
         friend class IndexCatalog;
         friend class NamespaceDetails;
     };

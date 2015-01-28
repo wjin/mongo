@@ -29,16 +29,127 @@
  *    then also delete it in the license file.
  */
 
-#include "mongo/pch.h"
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+
+#include "mongo/platform/basic.h"
+
+#include <iostream>
 
 #include "mongo/bson/util/builder.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
-#include "mongo/db/structure/btree/key.h"
+#include "mongo/db/storage/mmap_v1/btree/key.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/platform/float_utils.h"
-#include "mongo/util/mongoutils/checksum.h"
+#include "mongo/util/allocator.h"
+#include "mongo/util/embedded_builder.h"
+#include "mongo/util/log.h"
 #include "mongo/util/stringutils.h"
+
+namespace mongo {
+
+    using std::cout;
+    using std::endl;
+    using std::numeric_limits;
+    using std::string;
+    using std::stringstream;
+    using std::vector;
+
+    typedef std::map<std::string, BSONElement> BSONMap;
+    BSONMap bson2map(const BSONObj& obj) {
+        BSONMap m;
+        BSONObjIterator it(obj);
+        while (it.more()) {
+            BSONElement e = it.next();
+            m[e.fieldName()] = e;
+        }
+        return m;
+    }
+
+    void dotted2nested(BSONObjBuilder& b, const BSONObj& obj) {
+        //use map to sort fields
+        BSONMap sorted = bson2map(obj);
+        EmbeddedBuilder eb(&b);
+        for(BSONMap::const_iterator it=sorted.begin(); it!=sorted.end(); ++it) {
+            eb.appendAs(it->second, it->first);
+        }
+        eb.done();
+    }
+
+    // {a.b:1} -> {a: {b:1}}
+    BSONObj dotted2nested(const BSONObj& obj) {
+        BSONObjBuilder b;
+        dotted2nested(b, obj);
+        return b.obj();
+    }
+
+
+    // {a: {b:1}} -> {a.b:1}
+    void nested2dotted(BSONObjBuilder& b, const BSONObj& obj, const string& base="") {
+        BSONObjIterator it(obj);
+        while (it.more()) {
+            BSONElement e = it.next();
+            if (e.type() == Object) {
+                string newbase = base + e.fieldName() + ".";
+                nested2dotted(b, e.embeddedObject(), newbase);
+            }
+            else {
+                string newbase = base + e.fieldName();
+                b.appendAs(e, newbase);
+            }
+        }
+    }
+
+    BSONObj nested2dotted(const BSONObj& obj) {
+        BSONObjBuilder b;
+        nested2dotted(b, obj);
+        return b.obj();
+    }
+
+    FieldCompareResult compareDottedFieldNames( const string& l , const string& r ,
+                                               const LexNumCmp& cmp ) {
+        static int maxLoops = 1024 * 1024;
+
+        size_t lstart = 0;
+        size_t rstart = 0;
+
+        for ( int i=0; i<maxLoops; i++ ) {
+
+            size_t a = l.find( '.' , lstart );
+            size_t b = r.find( '.' , rstart );
+
+            size_t lend = a == string::npos ? l.size() : a;
+            size_t rend = b == string::npos ? r.size() : b;
+
+            const string& c = l.substr( lstart , lend - lstart );
+            const string& d = r.substr( rstart , rend - rstart );
+
+            int x = cmp.cmp( c.c_str(), d.c_str() );
+
+            if ( x < 0 )
+                return LEFT_BEFORE;
+            if ( x > 0 )
+                return RIGHT_BEFORE;
+
+            lstart = lend + 1;
+            rstart = rend + 1;
+
+            if ( lstart >= l.size() ) {
+                if ( rstart >= r.size() )
+                    return SAME;
+                return RIGHT_SUBFIELD;
+            }
+            if ( rstart >= r.size() )
+                return LEFT_SUBFIELD;
+        }
+
+        log() << "compareDottedFieldNames ERROR  l: " << l << " r: " << r << "  TOO MANY LOOPS" << endl;
+        verify(0);
+        return SAME; // will never get here
+    }
+
+
+}
 
 namespace JsobjTests {
 
@@ -703,6 +814,9 @@ namespace JsobjTests {
 
                 b.append( "g" , -123.456 );
 
+                b.append( "h" , 0.0 );
+                b.append( "i" , -0.0 );
+
                 BSONObj x = b.obj();
                 keyTest(x);
 
@@ -716,6 +830,8 @@ namespace JsobjTests {
 
                 ASSERT_EQUALS( "-123.456" , x["g"].toString( false , true ) );
 
+                ASSERT_EQUALS( "0.0" , x["h"].toString( false , true ) );
+                ASSERT_EQUALS( "-0.0" , x["i"].toString( false , true ) );
             }
         };
 
@@ -786,21 +902,6 @@ namespace JsobjTests {
                     b.appendAs( foo.firstElement(), "bar" );
                 }
                 ASSERT_EQUALS( BSON( "bar" << 1 ), b.done() );
-            }
-        };
-
-        class ArrayAppendAs {
-        public:
-            void run() {
-                BSONArrayBuilder b;
-                {
-                    BSONObj foo = BSON( "foo" << 1 );
-                    b.appendAs( foo.firstElement(), "3" );
-                }
-                BSONArray a = b.arr();
-                BSONObj expected = BSON( "3" << 1 );
-                ASSERT_EQUALS( expected.firstElement(), a[ 3 ] );
-                ASSERT_EQUALS( 4, a.nFields() );
             }
         };
 
@@ -1158,7 +1259,7 @@ namespace JsobjTests {
                 OID b;
 
                 a.init();
-                b.init( a.str() );
+                b.init( a.toString() );
 
                 ASSERT( a == b );
             }
@@ -1174,9 +1275,9 @@ namespace JsobjTests {
                 BSONObj o = b.obj();
                 keyTest(o);
 
-                ASSERT( o["a"].__oid().str() == "000000000000000000000000" );
-                ASSERT( o["b"].__oid().str() == "000000000000000000000000" );
-                ASSERT( o["c"].__oid().str() != "000000000000000000000000" );
+                ASSERT( o["a"].__oid().toString() == "000000000000000000000000" );
+                ASSERT( o["b"].__oid().toString() == "000000000000000000000000" );
+                ASSERT( o["c"].__oid().toString() != "000000000000000000000000" );
 
             }
         };
@@ -1232,20 +1333,6 @@ namespace JsobjTests {
             }
         };
 
-        class Seq {
-        public:
-            void run() {
-                for ( int i=0; i<10000; i++ ) {
-                    OID a;
-                    OID b;
-                    
-                    a.initSequential();
-                    b.initSequential();
-
-                    ASSERT( a < b );
-                }
-            }
-        };
     } // namespace OIDTests
 
 
@@ -1607,21 +1694,21 @@ namespace JsobjTests {
     class CompatBSON {
     public:
 
-#define JSONBSONTEST(j,s,m) ASSERT_EQUALS( fromjson( j ).objsize() , s ); ASSERT_EQUALS( fromjson( j ).md5() , m );
-#define RAWBSONTEST(j,s,m) ASSERT_EQUALS( j.objsize() , s ); ASSERT_EQUALS( j.md5() , m );
+#define JSONBSONTEST(j,s) ASSERT_EQUALS( fromjson( j ).objsize() , s );
+#define RAWBSONTEST(j,s) ASSERT_EQUALS( j.objsize() , s );
 
         void run() {
 
-            JSONBSONTEST( "{ 'x' : true }" , 9 , "6fe24623e4efc5cf07f027f9c66b5456" );
-            JSONBSONTEST( "{ 'x' : null }" , 8 , "12d43430ff6729af501faf0638e68888" );
-            JSONBSONTEST( "{ 'x' : 5.2 }" , 16 , "aaeeac4a58e9c30eec6b0b0319d0dff2" );
-            JSONBSONTEST( "{ 'x' : 'eliot' }" , 18 , "331a3b8b7cbbe0706c80acdb45d4ebbe" );
-            JSONBSONTEST( "{ 'x' : 5.2 , 'y' : 'truth' , 'z' : 1.1 }" , 40 , "7c77b3a6e63e2f988ede92624409da58" );
-            JSONBSONTEST( "{ 'a' : { 'b' : 1.1 } }" , 24 , "31887a4b9d55cd9f17752d6a8a45d51f" );
-            JSONBSONTEST( "{ 'x' : 5.2 , 'y' : { 'a' : 'eliot' , b : true } , 'z' : null }" , 44 , "b3de8a0739ab329e7aea138d87235205" );
-            JSONBSONTEST( "{ 'x' : 5.2 , 'y' : [ 'a' , 'eliot' , 'b' , true ] , 'z' : null }" , 62 , "cb7bad5697714ba0cbf51d113b6a0ee8" );
+            JSONBSONTEST( "{ 'x' : true }" , 9 );
+            JSONBSONTEST( "{ 'x' : null }" , 8 );
+            JSONBSONTEST( "{ 'x' : 5.2 }" , 16 );
+            JSONBSONTEST( "{ 'x' : 'eliot' }" , 18 );
+            JSONBSONTEST( "{ 'x' : 5.2 , 'y' : 'truth' , 'z' : 1.1 }" , 40 );
+            JSONBSONTEST( "{ 'a' : { 'b' : 1.1 } }" , 24 );
+            JSONBSONTEST( "{ 'x' : 5.2 , 'y' : { 'a' : 'eliot' , b : true } , 'z' : null }" , 44 );
+            JSONBSONTEST( "{ 'x' : 5.2 , 'y' : [ 'a' , 'eliot' , 'b' , true ] , 'z' : null }" , 62 );
 
-            RAWBSONTEST( BSON( "x" << 4 ) , 12 , "d1ed8dbf79b78fa215e2ded74548d89d" );
+            RAWBSONTEST( BSON( "x" << 4 ) , 12 );
 
         }
     };
@@ -1716,17 +1803,42 @@ namespace JsobjTests {
             objb.appendUndefined(objb.numStr(i++));
             arrb.appendUndefined();
 
+            objb.appendRegex(objb.numStr(i++), "test", "imx");
+            arrb.appendRegex("test", "imx");
+
+            objb.appendBinData(objb.numStr(i++), 4, BinDataGeneral, "wow");
+            arrb.appendBinData(4, BinDataGeneral, "wow");
+
+            objb.appendCode(objb.numStr(i++), "function(){ return 1; }");
+            arrb.appendCode("function(){ return 1; }");
+
+            objb.appendCodeWScope(objb.numStr(i++), "function(){ return a; }", BSON("a" << 1));
+            arrb.appendCodeWScope("function(){ return a; }", BSON("a" << 1));
+
+            time_t dt(0);
+            objb.appendTimeT(objb.numStr(i++), dt);
+            arrb.appendTimeT(dt);
+
+            Date_t date(0);
+            objb.appendDate(objb.numStr(i++), date);
+            arrb.appendDate(date);
+
+            objb.append(objb.numStr(i++), BSONRegEx("test2", "s"));
+            arrb.append(BSONRegEx("test2", "s"));
+
             BSONObj obj = objb.obj();
             BSONArray arr = arrb.arr();
 
             ASSERT_EQUALS(obj, arr);
 
-            BSONObj o = BSON( "obj" << obj << "arr" << arr << "arr2" << BSONArray(obj) );
+            BSONObj o = BSON( "obj" << obj << "arr" << arr << "arr2" << BSONArray(obj)
+                    << "regex" << BSONRegEx("reg", "x"));
             keyTest(o);
 
             ASSERT_EQUALS(o["obj"].type(), Object);
             ASSERT_EQUALS(o["arr"].type(), Array);
             ASSERT_EQUALS(o["arr2"].type(), Array);
+            ASSERT_EQUALS(o["regex"].type(), RegEx);
         }
     };
 
@@ -1910,7 +2022,7 @@ namespace JsobjTests {
         void run() {
             BSONObj x = BSON( "_id" << 5 << "t" << 2 );
             {
-                char * crap = (char*)malloc( x.objsize() );
+                char * crap = (char*)mongoMalloc( x.objsize() );
                 memcpy( crap , x.objdata() , x.objsize() );
                 BSONObj y( crap );
                 ASSERT_EQUALS( x , y );
@@ -1918,7 +2030,7 @@ namespace JsobjTests {
             }
 
             {
-                char * crap = (char*)malloc( x.objsize() );
+                char * crap = (char*)mongoMalloc( x.objsize() );
                 memcpy( crap , x.objdata() , x.objsize() );
                 int * foo = (int*)crap;
                 foo[0] = 123123123;
@@ -2065,41 +2177,6 @@ namespace JsobjTests {
         }
     };
 
-    class HashingTest {
-    public:
-        void run() {
-            int N = 100000;
-            BSONObj x = BSON( "name" << "eliot was here"
-                              << "x" << 5
-                              << "asdasdasdas" << "asldkasldjasldjasldjlasjdlasjdlasdasdasdasdasdasdasd" );
-
-            {
-	        //Timer t;
-                for ( int i=0; i<N; i++ )
-                    x.md5();
-                //int millis = t.millis();
-                //cout << "md5 : " << millis << endl;
-            }
-
-            {
-	        //Timer t;
-                for ( int i=0; i<N; i++ )
-                    x.toString();
-                //int millis = t.millis();
-                //cout << "toString : " << millis << endl;
-            }
-
-            {
-	        //Timer t;
-                for ( int i=0; i<N; i++ )
-                    checksum( x.objdata() , x.objsize() );
-                //int millis = t.millis();
-                //cout << "checksum : " << millis << endl;
-            }
-
-        }
-    };
-
     class NestedBuilderOversize {
     public:
         void run() {
@@ -2148,7 +2225,6 @@ namespace JsobjTests {
             add< BSONObjTests::ToStringArray >();
             add< BSONObjTests::ToStringNumber >();
             add< BSONObjTests::AppendAs >();
-            add< BSONObjTests::ArrayAppendAs >();
             add< BSONObjTests::GetField >();
             add< BSONObjTests::ToStringRecursionDepth >();
             add< BSONObjTests::StringWithNull >();
@@ -2186,7 +2262,6 @@ namespace JsobjTests {
             add< OIDTests::increasing >();
             add< OIDTests::ToDate >();
             add< OIDTests::FromDate >();
-            add< OIDTests::Seq >();
             add< ValueStreamTests::LabelBasic >();
             add< ValueStreamTests::LabelShares >();
             add< ValueStreamTests::LabelDouble >();
@@ -2221,10 +2296,11 @@ namespace JsobjTests {
             add< BuilderPartialItearte >();
             add< BSONForEachTest >();
             add< CompareOps >();
-            add< HashingTest >();
             add< NestedBuilderOversize >();
         }
-    } myall;
+    };
+
+    SuiteInstance<All> myall;
 
 } // namespace JsobjTests
 

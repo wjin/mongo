@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2013 MongoDB Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -29,8 +29,11 @@
 #include "mongo/db/exec/working_set.h"
 
 #include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/storage/record_fetcher.h"
 
 namespace mongo {
+
+    using std::string;
 
     WorkingSet::MemberHolder::MemberHolder() : member(NULL) { }
     WorkingSet::MemberHolder::~MemberHolder() {}
@@ -88,6 +91,88 @@ namespace mongo {
         return _flagged.end() != _flagged.find(id);
     }
 
+    void WorkingSet::clear() {
+        for (size_t i = 0; i < _data.size(); i++) {
+            delete _data[i].member;
+        }
+        _data.clear();
+
+        // Since working set is now empty, the free list pointer should
+        // point to nothing.
+        _freeList = INVALID_ID;
+
+        _flagged.clear();
+    }
+
+    //
+    // Iteration
+    //
+
+    WorkingSet::iterator::iterator(WorkingSet* ws, size_t index)
+        : _ws(ws),
+          _index(index) {
+        // If we're currently not pointing at an allocated member, then we have
+        // to advance to the first one, unless we're already at the end.
+        if (_index < _ws->_data.size() && isFree()) {
+            advance();
+        }
+    }
+
+    void WorkingSet::iterator::advance() {
+        // Move forward at least once in the data list.
+        _index++;
+
+        // While we haven't hit the end and the current member is not in use. (Skips ahead until
+        // we find the next allocated member.)
+        while (_index < _ws->_data.size() && isFree()) {
+            _index++;
+        }
+    }
+
+    bool WorkingSet::iterator::isFree() const {
+        return _ws->_data[_index].nextFreeOrSelf != _index;
+    }
+
+    void WorkingSet::iterator::free() {
+        dassert(!isFree());
+        _ws->free(_index);
+    }
+
+    void WorkingSet::iterator::operator++() {
+        dassert(_index < _ws->_data.size());
+        advance();
+    }
+
+    bool WorkingSet::iterator::operator==(const WorkingSet::iterator& other) const {
+        return (_index == other._index);
+    }
+
+    bool WorkingSet::iterator::operator!=(const WorkingSet::iterator& other) const {
+        return (_index != other._index);
+    }
+
+    WorkingSetMember& WorkingSet::iterator::operator*() {
+        dassert(_index < _ws->_data.size() && !isFree());
+        return *_ws->_data[_index].member;
+    }
+
+    WorkingSetMember* WorkingSet::iterator::operator->() {
+        dassert(_index < _ws->_data.size() && !isFree());
+        return _ws->_data[_index].member;
+    }
+
+    WorkingSet::iterator WorkingSet::begin() {
+        return WorkingSet::iterator(this, 0);
+    }
+
+    WorkingSet::iterator WorkingSet::end() {
+        return WorkingSet::iterator(this, _data.size());
+    }
+
+    //
+    // WorkingSetMember
+    //
+
     WorkingSetMember::WorkingSetMember() : state(WorkingSetMember::INVALID) { }
 
     WorkingSetMember::~WorkingSetMember() { }
@@ -103,7 +188,7 @@ namespace mongo {
     }
 
     bool WorkingSetMember::hasLoc() const {
-        return state == LOC_AND_IDX || state == LOC_AND_UNOWNED_OBJ;
+        return state == LOC_AND_IDX || state == LOC_AND_UNOWNED_OBJ || state == LOC_AND_OWNED_OBJ;
     }
 
     bool WorkingSetMember::hasObj() const {
@@ -111,7 +196,7 @@ namespace mongo {
     }
 
     bool WorkingSetMember::hasOwnedObj() const {
-        return state == OWNED_OBJ;
+        return state == OWNED_OBJ || state == LOC_AND_OWNED_OBJ;
     }
 
     bool WorkingSetMember::hasUnownedObj() const {
@@ -119,7 +204,7 @@ namespace mongo {
     }
 
     bool WorkingSetMember::hasComputed(const WorkingSetComputedDataType type) const {
-        return _computed[type];
+        return _computed[type].get();
     }
 
     const WorkingSetComputedData* WorkingSetMember::getComputed(const WorkingSetComputedDataType type) const {
@@ -130,6 +215,18 @@ namespace mongo {
     void WorkingSetMember::addComputed(WorkingSetComputedData* data) {
         verify(!hasComputed(data->type()));
         _computed[data->type()].reset(data);
+    }
+
+    void WorkingSetMember::setFetcher(RecordFetcher* fetcher) {
+        _fetcher.reset(fetcher);
+    }
+
+    RecordFetcher* WorkingSetMember::releaseFetcher() {
+        return _fetcher.release();
+    }
+
+    bool WorkingSetMember::hasFetcher() const {
+        return NULL != _fetcher.get();
     }
 
     bool WorkingSetMember::getFieldDotted(const string& field, BSONElement* out) const {
@@ -163,7 +260,7 @@ namespace mongo {
         size_t memUsage = 0;
 
         if (hasLoc()) {
-            memUsage += sizeof(DiskLoc);
+            memUsage += sizeof(RecordId);
         }
 
         // XXX: Unowned objects count towards current size.

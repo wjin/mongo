@@ -26,9 +26,13 @@
 *    it in the license file.
 */
 
+#include "mongo/platform/basic.h"
+
+#include <boost/scoped_ptr.hpp>
 #include <string>
 #include <sstream>
 
+#include "mongo/db/matcher/expression_parser.h"
 #include "mongo/base/init.h"
 #include "mongo/base/owned_pointer_vector.h"
 #include "mongo/base/status.h"
@@ -39,6 +43,7 @@
 #include "mongo/db/commands/index_filter_commands.h"
 #include "mongo/db/commands/plan_cache_commands.h"
 #include "mongo/db/catalog/collection.h"
+
 
 namespace {
 
@@ -63,12 +68,14 @@ namespace {
     /**
      * Retrieves a collection's query settings and plan cache from the database.
      */
-    Status getQuerySettingsAndPlanCache(Database* db, const string& ns,
-                                        QuerySettings** querySettingsOut,
-                                        PlanCache** planCacheOut) {
-        invariant(db);
+    static Status getQuerySettingsAndPlanCache(OperationContext* txn,
+                                               Collection* collection,
+                                               const string& ns,
+                                               QuerySettings** querySettingsOut,
+                                               PlanCache** planCacheOut) {
 
-        Collection* collection = db->getCollection(ns);
+        *querySettingsOut = NULL;
+        *planCacheOut = NULL;
         if (NULL == collection) {
             return Status(ErrorCodes::BadValue, "no such collection");
         }
@@ -118,11 +125,11 @@ namespace mongo {
         : Command(name),
           helpText(helpText) { }
 
-    bool IndexFilterCommand::run(const string& dbname, BSONObj& cmdObj, int options,
+    bool IndexFilterCommand::run(OperationContext* txn, const string& dbname, BSONObj& cmdObj, int options,
                            string& errmsg, BSONObjBuilder& result, bool fromRepl) {
         string ns = parseNs(dbname, cmdObj);
 
-        Status status = runIndexFilterCommand(ns, cmdObj, &result);
+        Status status = runIndexFilterCommand(txn, ns, cmdObj, &result);
 
         if (!status.isOK()) {
             addStatus(status, result);
@@ -138,12 +145,17 @@ namespace mongo {
         return false;
     }
 
+    bool IndexFilterCommand::slaveOverrideOk() const {
+        return true;
+    }
+
     void IndexFilterCommand::help(stringstream& ss) const {
         ss << helpText;
     }
 
-    Status IndexFilterCommand::checkAuthForCommand(ClientBasic* client, const std::string& dbname,
-                                            const BSONObj& cmdObj) {
+    Status IndexFilterCommand::checkAuthForCommand(ClientBasic* client,
+                                                   const std::string& dbname,
+                                                   const BSONObj& cmdObj) {
         AuthorizationSession* authzSession = client->getAuthorizationSession();
         ResourcePattern pattern = parseResourcePattern(dbname, cmdObj);
 
@@ -157,13 +169,17 @@ namespace mongo {
     ListFilters::ListFilters() : IndexFilterCommand("planCacheListFilters",
         "Displays index filters for all query shapes in a collection.") { }
 
-    Status ListFilters::runIndexFilterCommand(const string& ns, BSONObj& cmdObj, BSONObjBuilder* bob) {
+    Status ListFilters::runIndexFilterCommand(OperationContext* txn,
+                                              const string& ns,
+                                              BSONObj& cmdObj,
+                                              BSONObjBuilder* bob) {
         // This is a read lock. The query settings is owned by the collection.
-        Client::ReadContext readCtx(ns);
-        Client::Context& ctx = readCtx.ctx();
+        AutoGetCollectionForRead ctx(txn, ns);
+
         QuerySettings* querySettings;
         PlanCache* unused;
-        Status status = getQuerySettingsAndPlanCache(ctx.db(), ns, &querySettings, &unused);
+        Status status = 
+            getQuerySettingsAndPlanCache(txn, ctx.getCollection(), ns, &querySettings, &unused);
         if (!status.isOK()) {
             // No collection - return empty array of filters.
             BSONArrayBuilder hintsBuilder(bob->subarrayStart("filters"));
@@ -216,23 +232,30 @@ namespace mongo {
         "Clears index filter for a single query shape or, "
         "if the query shape is omitted, all filters for the collection.") { }
 
-    Status ClearFilters::runIndexFilterCommand(const string& ns, BSONObj& cmdObj, BSONObjBuilder* bob) {
+    Status ClearFilters::runIndexFilterCommand(OperationContext* txn,
+                                               const std::string& ns,
+                                               BSONObj& cmdObj,
+                                               BSONObjBuilder* bob) {
         // This is a read lock. The query settings is owned by the collection.
-        Client::ReadContext readCtx(ns);
-        Client::Context& ctx = readCtx.ctx();
+        AutoGetCollectionForRead ctx(txn, ns);
+
         QuerySettings* querySettings;
         PlanCache* planCache;
-        Status status = getQuerySettingsAndPlanCache(ctx.db(), ns, &querySettings, &planCache);
+        Status status =
+            getQuerySettingsAndPlanCache(txn, ctx.getCollection(), ns, &querySettings, &planCache);
         if (!status.isOK()) {
             // No collection - do nothing.
             return Status::OK();
         }
-        return clear(querySettings, planCache, ns, cmdObj);
+        return clear(txn, querySettings, planCache, ns, cmdObj);
     }
 
     // static
-    Status ClearFilters::clear(QuerySettings* querySettings, PlanCache* planCache,
-                             const std::string& ns, const BSONObj& cmdObj) {
+    Status ClearFilters::clear(OperationContext* txn,
+                               QuerySettings* querySettings,
+                               PlanCache* planCache,
+                               const std::string& ns,
+                               const BSONObj& cmdObj) {
         invariant(querySettings);
 
         // According to the specification, the planCacheClearFilters command runs in two modes:
@@ -241,7 +264,7 @@ namespace mongo {
         //   command arguments.
         if (cmdObj.hasField("query")) {
             CanonicalQuery* cqRaw;
-            Status status = PlanCacheCommand::canonicalize(ns, cmdObj, &cqRaw);
+            Status status = PlanCacheCommand::canonicalize(txn, ns, cmdObj, &cqRaw);
             if (!status.isOK()) {
                 return status;
             }
@@ -269,6 +292,9 @@ namespace mongo {
         // OK to proceed with clearing entire cache.
         querySettings->clearAllowedIndices();
 
+        const NamespaceString nss(ns);
+        const WhereCallbackReal whereCallback(txn, nss.db());
+
         // Remove corresponding entries from plan cache.
         // Admin hints affect the planning process directly. If there were
         // plans generated as a result of applying index filter, these need to be
@@ -286,8 +312,8 @@ namespace mongo {
 
             // Create canonical query.
             CanonicalQuery* cqRaw;
-            Status result = CanonicalQuery::canonicalize(ns, entry->query, entry->sort,
-                                                         entry->projection, &cqRaw);
+            Status result = CanonicalQuery::canonicalize(
+                    ns, entry->query, entry->sort, entry->projection, &cqRaw, whereCallback);
             invariant(result.isOK());
             scoped_ptr<CanonicalQuery> cq(cqRaw);
 
@@ -301,22 +327,30 @@ namespace mongo {
     SetFilter::SetFilter() : IndexFilterCommand("planCacheSetFilter",
         "Sets index filter for a query shape. Overrides existing filter.") { }
 
-    Status SetFilter::runIndexFilterCommand(const string& ns, BSONObj& cmdObj, BSONObjBuilder* bob) {
+    Status SetFilter::runIndexFilterCommand(OperationContext* txn,
+                                            const std::string& ns,
+                                            BSONObj& cmdObj,
+                                            BSONObjBuilder* bob) {
         // This is a read lock. The query settings is owned by the collection.
-        Client::ReadContext readCtx(ns);
-        Client::Context& ctx = readCtx.ctx();
+        const NamespaceString nss(ns);
+        AutoGetCollectionForRead ctx(txn, nss);
+
         QuerySettings* querySettings;
         PlanCache* planCache;
-        Status status = getQuerySettingsAndPlanCache(ctx.db(), ns, &querySettings, &planCache);
+        Status status =
+            getQuerySettingsAndPlanCache(txn, ctx.getCollection(), ns, &querySettings, &planCache);
         if (!status.isOK()) {
             return status;
         }
-        return set(querySettings, planCache, ns, cmdObj);
+        return set(txn, querySettings, planCache, ns, cmdObj);
     }
 
     // static
-    Status SetFilter::set(QuerySettings* querySettings, PlanCache* planCache,
-                        const string& ns, const BSONObj& cmdObj) {
+    Status SetFilter::set(OperationContext* txn,
+                          QuerySettings* querySettings,
+                          PlanCache* planCache,
+                          const string& ns,
+                          const BSONObj& cmdObj) {
         // indexes - required
         BSONElement indexesElt = cmdObj.getField("indexes");
         if (indexesElt.eoo()) {
@@ -345,7 +379,7 @@ namespace mongo {
         }
 
         CanonicalQuery* cqRaw;
-        Status status = PlanCacheCommand::canonicalize(ns, cmdObj, &cqRaw);
+        Status status = PlanCacheCommand::canonicalize(txn, ns, cmdObj, &cqRaw);
         if (!status.isOK()) {
             return status;
         }

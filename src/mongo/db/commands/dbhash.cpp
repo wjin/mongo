@@ -1,7 +1,7 @@
 // dbhash.cpp
 
 /**
-*    Copyright (C) 2013 10gen Inc.
+*    Copyright (C) 2013-2014 MongoDB Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -28,26 +28,35 @@
 *    it in the license file.
 */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+
 #include "mongo/db/commands/dbhash.h"
+
+#include <boost/scoped_ptr.hpp>
 
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/catalog/database_catalog_entry.h"
 #include "mongo/db/query/internal_plans.h"
+#include "mongo/util/log.h"
 #include "mongo/util/md5.hpp"
 #include "mongo/util/timer.h"
 
 namespace mongo {
 
+    using boost::scoped_ptr;
+    using std::auto_ptr;
+    using std::list;
+    using std::endl;
+    using std::set;
+    using std::string;
+    using std::vector;
+
     DBHashCmd dbhashCmd;
 
 
-    void logOpForDbHash( const char* opstr,
-                         const char* ns,
-                         const BSONObj& obj,
-                         BSONObj* patt,
-                         const BSONObj* fullObj,
-                         bool forMigrateCleanup ) {
+    void logOpForDbHash(const char* ns) {
         dbhashCmd.wipeCacheForCollection( ns );
     }
 
@@ -66,8 +75,7 @@ namespace mongo {
         out->push_back(Privilege(ResourcePattern::forDatabaseName(dbname), actions));
     }
 
-    string DBHashCmd::hashCollection( Database* db, const string& fullCollectionName, bool* fromCache ) {
-
+    string DBHashCmd::hashCollection( OperationContext* opCtx, Database* db, const string& fullCollectionName, bool* fromCache ) {
         scoped_ptr<scoped_lock> cachedHashedLock;
 
         if ( isCachable( fullCollectionName ) ) {
@@ -84,21 +92,23 @@ namespace mongo {
         if ( !collection )
             return "";
 
-        IndexDescriptor* desc = collection->getIndexCatalog()->findIdIndex();
+        IndexDescriptor* desc = collection->getIndexCatalog()->findIdIndex( opCtx );
 
-        auto_ptr<Runner> runner;
+        auto_ptr<PlanExecutor> exec;
         if ( desc ) {
-            runner.reset(InternalPlanner::indexScan(collection,
-                                                    desc,
-                                                    BSONObj(),
-                                                    BSONObj(),
-                                                    false,
-                                                    InternalPlanner::FORWARD,
-                                                    InternalPlanner::IXSCAN_FETCH));
+            exec.reset(InternalPlanner::indexScan(opCtx,
+                                                  collection,
+                                                  desc,
+                                                  BSONObj(),
+                                                  BSONObj(),
+                                                  false,
+                                                  InternalPlanner::FORWARD,
+                                                  InternalPlanner::IXSCAN_FETCH));
         }
         else if ( collection->isCapped() ) {
-            runner.reset(InternalPlanner::collectionScan(fullCollectionName,
-                                                         collection));
+            exec.reset(InternalPlanner::collectionScan(opCtx,
+                                                       fullCollectionName,
+                                                       collection));
         }
         else {
             log() << "can't find _id index for: " << fullCollectionName << endl;
@@ -109,14 +119,14 @@ namespace mongo {
         md5_init(&st);
 
         long long n = 0;
-        Runner::RunnerState state;
+        PlanExecutor::ExecState state;
         BSONObj c;
-        verify(NULL != runner.get());
-        while (Runner::RUNNER_ADVANCED == (state = runner->getNext(&c, NULL))) {
+        verify(NULL != exec.get());
+        while (PlanExecutor::ADVANCED == (state = exec->getNext(&c, NULL))) {
             md5_append( &st , (const md5_byte_t*)c.objdata() , c.objsize() );
             n++;
         }
-        if (Runner::RUNNER_EOF != state) {
+        if (PlanExecutor::IS_EOF != state) {
             warning() << "error while hashing, db dropped? ns=" << fullCollectionName << endl;
         }
         md5digest d;
@@ -130,7 +140,7 @@ namespace mongo {
         return hash;
     }
 
-    bool DBHashCmd::run(const string& dbname , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+    bool DBHashCmd::run(OperationContext* txn, const string& dbname , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
         Timer timer;
 
         set<string> desiredCollections;
@@ -149,11 +159,15 @@ namespace mongo {
         list<string> colls;
         const string ns = parseNs(dbname, cmdObj);
 
-        Client::ReadContext ctx(ns);
-        Database* db = ctx.ctx().db();
-        if ( db )
-            db->namespaceIndex().getNamespaces( colls );
-        colls.sort();
+        // We lock the entire database in S-mode in order to ensure that the contents will not
+        // change for the snapshot.
+        ScopedTransaction scopedXact(txn, MODE_IS);
+        AutoGetDb autoDb(txn, ns, MODE_S);
+        Database* db = autoDb.getDb();
+        if (db) {
+            db->getDatabaseCatalogEntry()->getCollectionNamespaces(&colls);
+            colls.sort();
+        }
 
         result.appendNumber( "numCollections" , (long long)colls.size() );
         result.append( "host" , prettyHostName() );
@@ -180,7 +194,7 @@ namespace mongo {
                 continue;
 
             bool fromCache = false;
-            string hash = hashCollection( db, fullCollectionName, &fromCache );
+            string hash = hashCollection( txn, db, fullCollectionName, &fromCache );
 
             bb.append( shortCollectionName, hash );
 

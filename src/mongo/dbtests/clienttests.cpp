@@ -1,3 +1,5 @@
+// client.cpp
+
 /*
  *    Copyright (C) 2010 10gen Inc.
  *
@@ -26,34 +28,40 @@
  *    then also delete it in the license file.
  */
 
-// client.cpp
-
-#include "mongo/pch.h"
-
 #include "mongo/client/dbclientcursor.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
-#include "mongo/db/d_concurrency.h"
+#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/operation_context_impl.h"
 #include "mongo/dbtests/dbtests.h"
 
+
 namespace ClientTests {
+
+    using std::auto_ptr;
+    using std::string;
+    using std::vector;
 
     class Base {
     public:
 
-        Base( string coll ) {
+        Base( string coll ) : _ns("test." + coll) {
+            OperationContextImpl txn;
+            DBDirectClient db(&txn);
+
             db.dropDatabase("test");
-            _ns = (string)"test." + coll;
         }
 
         virtual ~Base() {
+            OperationContextImpl txn;
+            DBDirectClient db(&txn);
+
             db.dropCollection( _ns );
         }
 
         const char * ns() { return _ns.c_str(); }
 
-        string _ns;
-        DBDirectClient db;
+        const string _ns;
     };
 
 
@@ -61,57 +69,24 @@ namespace ClientTests {
     public:
         DropIndex() : Base( "dropindex" ) {}
         void run() {
-            db.insert( ns() , BSON( "x" << 2 ) );
-            ASSERT_EQUALS( 1 , db.getIndexes( ns() )->itcount() );
+            OperationContextImpl txn;
+            DBDirectClient db(&txn);
 
-            db.ensureIndex( ns() , BSON( "x" << 1 ) );
-            ASSERT_EQUALS( 2 , db.getIndexes( ns() )->itcount() );
+            db.insert( ns() , BSON( "x" << 2 ) );
+            ASSERT_EQUALS( 1u , db.getIndexSpecs(ns()).size() );
+
+            ASSERT_OK(dbtests::createIndex( &txn, ns(), BSON( "x" << 1 ) ));
+            ASSERT_EQUALS( 2u , db.getIndexSpecs(ns()).size() );
 
             db.dropIndex( ns() , BSON( "x" << 1 ) );
-            ASSERT_EQUALS( 1 , db.getIndexes( ns() )->itcount() );
+            ASSERT_EQUALS( 1u , db.getIndexSpecs(ns()).size() );
 
-            db.ensureIndex( ns() , BSON( "x" << 1 ) );
-            ASSERT_EQUALS( 2 , db.getIndexes( ns() )->itcount() );
+            ASSERT_OK(dbtests::createIndex( &txn, ns(), BSON( "x" << 1 ) ));
+            ASSERT_EQUALS( 2u , db.getIndexSpecs(ns()).size() );
 
             db.dropIndexes( ns() );
-            ASSERT_EQUALS( 1 , db.getIndexes( ns() )->itcount() );
+            ASSERT_EQUALS( 1u , db.getIndexSpecs(ns()).size() );
         }
-    };
-
-    class ReIndex : public Base {
-    public:
-        ReIndex() : Base( "reindex" ) {}
-        void run() {
-
-            db.insert( ns() , BSON( "x" << 2 ) );
-            ASSERT_EQUALS( 1 , db.getIndexes( ns() )->itcount() );
-
-            db.ensureIndex( ns() , BSON( "x" << 1 ) );
-            ASSERT_EQUALS( 2 , db.getIndexes( ns() )->itcount() );
-
-            db.reIndex( ns() );
-            ASSERT_EQUALS( 2 , db.getIndexes( ns() )->itcount() );
-        }
-
-    };
-
-    class ReIndex2 : public Base {
-    public:
-        ReIndex2() : Base( "reindex2" ) {}
-        void run() {
-
-            db.insert( ns() , BSON( "x" << 2 ) );
-            ASSERT_EQUALS( 1 , db.getIndexes( ns() )->itcount() );
-
-            db.ensureIndex( ns() , BSON( "x" << 1 ) );
-            ASSERT_EQUALS( 2 , db.getIndexes( ns() )->itcount() );
-
-            BSONObj out;
-            ASSERT( db.runCommand( "test" , BSON( "reIndex" << "reindex2" ) , out ) );
-            ASSERT_EQUALS( 2 , out["nIndexes"].number() );
-            ASSERT_EQUALS( 2 , db.getIndexes( ns() )->itcount() );
-        }
-
     };
 
     /**
@@ -123,35 +98,32 @@ namespace ClientTests {
     public:
         BuildIndex() : Base("buildIndex") {}
         void run() {
-            Lock::DBWrite lock(ns());
-            Client::WriteContext ctx(ns());
+            OperationContextImpl txn;
+
+            Client::WriteContext ctx(&txn, ns());
+            DBDirectClient db(&txn);
 
             db.insert(ns(), BSON("x" << 1 << "y" << 2));
             db.insert(ns(), BSON("x" << 2 << "y" << 2));
 
-            Collection* collection = ctx.ctx().db()->getCollection( ns() );
+            Collection* collection = ctx.getCollection();
             ASSERT( collection );
             IndexCatalog* indexCatalog = collection->getIndexCatalog();
 
-            ASSERT_EQUALS(1, indexCatalog->numIndexesReady());
+            ASSERT_EQUALS(1, indexCatalog->numIndexesReady(&txn));
             // _id index
-            ASSERT_EQUALS(1U, db.count("test.system.indexes"));
-            // test.buildindex
-            // test.buildindex_$id
-            // test.system.indexes
-            ASSERT_EQUALS(3U, db.count("test.system.namespaces"));
+            ASSERT_EQUALS(1U, db.getIndexSpecs(ns()).size());
 
-            db.ensureIndex(ns(), BSON("y" << 1), true);
+            ASSERT_EQUALS(ErrorCodes::DuplicateKey,
+                          dbtests::createIndex(&txn, ns(), BSON("y" << 1), true));
 
-            ASSERT_EQUALS(1, indexCatalog->numIndexesReady());
-            ASSERT_EQUALS(1U, db.count("test.system.indexes"));
-            ASSERT_EQUALS(3U, db.count("test.system.namespaces"));
+            ASSERT_EQUALS(1, indexCatalog->numIndexesReady(&txn));
+            ASSERT_EQUALS(1U, db.getIndexSpecs(ns()).size());
 
-            db.ensureIndex(ns(), BSON("x" << 1), true);
+            ASSERT_OK(dbtests::createIndex(&txn, ns(), BSON("x" << 1), true));
 
-            ASSERT_EQUALS(2, indexCatalog->numIndexesReady());
-            ASSERT_EQUALS(2U, db.count("test.system.indexes"));
-            ASSERT_EQUALS(4U, db.count("test.system.namespaces"));
+            ASSERT_EQUALS(2, indexCatalog->numIndexesReady(&txn));
+            ASSERT_EQUALS(2U, db.getIndexSpecs(ns()).size());
         }
     };
 
@@ -159,10 +131,15 @@ namespace ClientTests {
     public:
         CS_10() : Base( "CS_10" ) {}
         void run() {
-            string longs( 770, 'c' );
-            for( int i = 0; i < 1111; ++i )
-                db.insert( ns(), BSON( "a" << i << "b" << longs ) );
-            db.ensureIndex( ns(), BSON( "a" << 1 << "b" << 1 ) );
+            OperationContextImpl txn;
+            DBDirectClient db(&txn);
+
+            const string longs( 770, 'c' );
+            for (int i = 0; i < 1111; ++i) {
+                db.insert(ns(), BSON("a" << i << "b" << longs));
+            }
+
+            ASSERT_OK(dbtests::createIndex(&txn, ns(), BSON( "a" << 1 << "b" << 1 ) ));
 
             auto_ptr< DBClientCursor > c = db.query( ns(), Query().sort( BSON( "a" << 1 << "b" << 1 ) ) );
             ASSERT_EQUALS( 1111, c->itcount() );
@@ -173,8 +150,13 @@ namespace ClientTests {
     public:
         PushBack() : Base( "PushBack" ) {}
         void run() {
-            for( int i = 0; i < 10; ++i )
-                db.insert( ns(), BSON( "i" << i ) );
+            OperationContextImpl txn;
+            DBDirectClient db(&txn);
+
+            for (int i = 0; i < 10; ++i) {
+                db.insert(ns(), BSON("i" << i));
+            }
+
             auto_ptr< DBClientCursor > c = db.query( ns(), Query().sort( BSON( "i" << 1 ) ) );
 
             BSONObj o = c->next();
@@ -213,7 +195,10 @@ namespace ClientTests {
     public:
         Create() : Base( "Create" ) {}
         void run() {
-            db.createCollection( "unittests.clienttests.create", 4096, true );
+            OperationContextImpl txn;
+            DBDirectClient db(&txn);
+
+            db.createCollection("unittests.clienttests.create", 4096, true);
             BSONObj info;
             ASSERT( db.runCommand( "unittests", BSON( "collstats" << "clienttests.create" ), info ) );
         }
@@ -238,12 +223,11 @@ namespace ClientTests {
     class All : public Suite {
     public:
         All() : Suite( "client" ) {
+
         }
 
         void setupTests() {
             add<DropIndex>();
-            add<ReIndex>();
-            add<ReIndex2>();
             add<BuildIndex>();
             add<CS_10>();
             add<PushBack>();
@@ -251,5 +235,7 @@ namespace ClientTests {
             add<ConnectionStringTests>();
         }
 
-    } all;
+    };
+
+    SuiteInstance<All> all;
 }

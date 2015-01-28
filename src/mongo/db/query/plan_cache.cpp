@@ -26,6 +26,10 @@
  *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/query/plan_cache.h"
 
 #include <algorithm>
@@ -38,9 +42,13 @@
 #include "mongo/db/query/query_solution.h"
 #include "mongo/db/query/qlog.h"
 #include "mongo/db/query/query_knobs.h"
+#include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
+
+    using std::string;
+    using std::vector;
 
     //
     // Cache-related functions for CanonicalQuery
@@ -84,7 +92,7 @@ namespace mongo {
         }
 
         // Tailable cursors won't get cached, just turn into collscans.
-        if (query.getParsed().hasOption(QueryOption_CursorTailable)) {
+        if (query.getParsed().getOptions().tailable) {
             return false;
         }
 

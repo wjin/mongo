@@ -1,16 +1,28 @@
 /*    Copyright 2012 10gen Inc.
  *
- *    Licensed under the Apache License, Version 2.0 (the "License");
- *    you may not use this file except in compliance with the License.
- *    You may obtain a copy of the License at
+ *    This program is free software: you can redistribute it and/or  modify
+ *    it under the terms of the GNU Affero General Public License, version 3,
+ *    as published by the Free Software Foundation.
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License for more details.
  *
- *    Unless required by applicable law or agreed to in writing, software
- *    distributed under the License is distributed on an "AS IS" BASIS,
- *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *    See the License for the specific language governing permissions and
- *    limitations under the License.
+ *    You should have received a copy of the GNU Affero General Public License
+ *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
  */
 
 #include <string>
@@ -263,6 +275,48 @@ namespace {
         ASSERT_EQUALS( "e", a.dottedField(4) );
         ASSERT_EQUALS( "", a.dottedField(5) );
         ASSERT_EQUALS( "", a.dottedField(6) );
+    }
+
+    TEST(DottedSubstring, Short) {
+        FieldRef path("a");
+        ASSERT_EQUALS(1u, path.numParts());
+        ASSERT_EQUALS("a", path.dottedSubstring(0, path.numParts()));
+        ASSERT_EQUALS("", path.dottedSubstring(1, path.numParts()));
+        ASSERT_EQUALS("", path.dottedSubstring(0, 0));
+    }
+
+    TEST(DottedSubstring, Empty) {
+        FieldRef path("");
+        ASSERT_EQUALS(0u, path.numParts());
+        ASSERT_EQUALS("", path.dottedSubstring(0, path.numParts()));
+        ASSERT_EQUALS("", path.dottedSubstring(1, path.numParts()));
+        ASSERT_EQUALS("", path.dottedSubstring(0, 0));
+    }
+
+    TEST(DottedSubstring, Nested) {
+        FieldRef path("a.b.c.d.e");
+        ASSERT_EQUALS(5u, path.numParts());
+
+        ASSERT_EQUALS("b.c.d.e", path.dottedSubstring(1, path.numParts()));
+        ASSERT_EQUALS("c.d.e", path.dottedSubstring(2, path.numParts()));
+        ASSERT_EQUALS("d.e", path.dottedSubstring(3, path.numParts()));
+        ASSERT_EQUALS("e", path.dottedSubstring(4, path.numParts()));
+        ASSERT_EQUALS("", path.dottedSubstring(5, path.numParts()));
+        ASSERT_EQUALS("", path.dottedSubstring(6, path.numParts()));
+
+        ASSERT_EQUALS("a.b.c.d.e", path.dottedSubstring(0, path.numParts()));
+        ASSERT_EQUALS("a.b.c.d", path.dottedSubstring(0, path.numParts() - 1));
+        ASSERT_EQUALS("a.b.c", path.dottedSubstring(0, path.numParts() - 2));
+        ASSERT_EQUALS("a.b", path.dottedSubstring(0, path.numParts() - 3));
+        ASSERT_EQUALS("a", path.dottedSubstring(0, path.numParts() - 4));
+        ASSERT_EQUALS("", path.dottedSubstring(0, path.numParts() - 5));
+        ASSERT_EQUALS("", path.dottedSubstring(0, path.numParts() - 6));
+
+        ASSERT_EQUALS("b.c.d", path.dottedSubstring(1, path.numParts() - 1));
+        ASSERT_EQUALS("b.c", path.dottedSubstring(1, path.numParts() - 2));
+        ASSERT_EQUALS("b", path.dottedSubstring(1, path.numParts() - 3));
+        ASSERT_EQUALS("", path.dottedSubstring(1, path.numParts() - 4));
+        ASSERT_EQUALS("", path.dottedSubstring(1, path.numParts() - 5));
     }
 
 } // namespace

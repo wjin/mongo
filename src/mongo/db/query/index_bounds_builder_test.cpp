@@ -43,6 +43,9 @@ using namespace mongo;
 namespace {
 
     using std::auto_ptr;
+    using std::numeric_limits;
+    using std::string;
+    using std::vector;
 
     double numberMin = -numeric_limits<double>::max();
     double numberMax = numeric_limits<double>::max();
@@ -492,8 +495,9 @@ namespace {
 
     TEST(IndexBoundsBuilderTest, ExistsTrueSparse) {
         IndexEntry testIndex = IndexEntry(BSONObj(),
-                                          false,
-                                          true,
+                                          false, // multikey
+                                          true, // sparse
+                                          false, // unique
                                           "exists_true_sparse",
                                           BSONObj());
         BSONObj obj = fromjson("{a: {$exists: true}}");
@@ -820,6 +824,23 @@ namespace {
         ASSERT_EQUALS(tightness, IndexBoundsBuilder::EXACT);
     }
 
+    // A regular expression with the "|" character is not considered simple. See SERVER-15235.
+    TEST(SimpleRegexTest, PipeCharacterDisallowed) {
+        IndexBoundsBuilder::BoundsTightness tightness;
+        string prefix = IndexBoundsBuilder::simpleRegex(
+            "^(a(a|$)|b", "", &tightness);
+        ASSERT_EQUALS(prefix, "");
+        ASSERT_EQUALS(tightness, IndexBoundsBuilder::INEXACT_COVERED);
+    }
+
+    TEST(SimpleRegexTest, PipeCharacterDisallowed2) {
+        IndexBoundsBuilder::BoundsTightness tightness;
+        string prefix = IndexBoundsBuilder::simpleRegex(
+            "^(a(a|$)|^b", "", &tightness);
+        ASSERT_EQUALS(prefix, "");
+        ASSERT_EQUALS(tightness, IndexBoundsBuilder::INEXACT_COVERED);
+    }
+
     //
     // Regex bounds
     //
@@ -837,6 +858,22 @@ namespace {
             Interval(fromjson("{'': '', '': {}}"), true, false)));
         ASSERT_EQUALS(Interval::INTERVAL_EQUALS, oil.intervals[1].compare(
             Interval(fromjson("{'': /foo/, '': /foo/}"), true, true)));
+        ASSERT(tightness == IndexBoundsBuilder::INEXACT_COVERED);
+    }
+
+    TEST(IndexBoundsBuilderTest, NonSimpleRegexWithPipe) {
+        IndexEntry testIndex = IndexEntry(BSONObj());
+        BSONObj obj = fromjson("{a: /^foo.*|bar/}");
+        auto_ptr<MatchExpression> expr(parseMatchExpression(obj));
+        BSONElement elt = obj.firstElement();
+        OrderedIntervalList oil;
+        IndexBoundsBuilder::BoundsTightness tightness;
+        IndexBoundsBuilder::translate(expr.get(), elt, testIndex, &oil, &tightness);
+        ASSERT_EQUALS(oil.intervals.size(), 2U);
+        ASSERT_EQUALS(Interval::INTERVAL_EQUALS, oil.intervals[0].compare(
+            Interval(fromjson("{'': '', '': {}}"), true, false)));
+        ASSERT_EQUALS(Interval::INTERVAL_EQUALS, oil.intervals[1].compare(
+            Interval(fromjson("{'': /^foo.*|bar/, '': /^foo.*|bar/}"), true, true)));
         ASSERT(tightness == IndexBoundsBuilder::INEXACT_COVERED);
     }
 
@@ -1102,6 +1139,71 @@ namespace {
         ASSERT_EQUALS(Interval::INTERVAL_EQUALS, oil.intervals[1].compare(
             Interval(BSON("" << 2 << "" << 6), false, true)));
         ASSERT_EQUALS(tightness, IndexBoundsBuilder::EXACT);
+    }
+
+    TEST(IndexBoundsBuilderTest, UnionizeWithNE) {
+        IndexEntry testIndex = IndexEntry(BSONObj());
+        vector<BSONObj> toUnionize;
+        toUnionize.push_back(fromjson("{a: {$ne: 3}}"));
+        toUnionize.push_back(fromjson("{a: {$ne: 4}}}"));
+        OrderedIntervalList oil;
+        IndexBoundsBuilder::BoundsTightness tightness;
+        testTranslateAndUnion(toUnionize, &oil, &tightness);
+        ASSERT_EQUALS(oil.name, "a");
+        ASSERT_EQUALS(oil.intervals.size(), 1U);
+        ASSERT_EQUALS(Interval::INTERVAL_EQUALS, oil.intervals[0].compare(
+            IndexBoundsBuilder::allValues()));
+        ASSERT_EQUALS(tightness, IndexBoundsBuilder::EXACT);
+    }
+
+    // Test $type bounds for Code BSON type.
+    TEST(IndexBoundsBuilderTest, CodeTypeBounds) {
+        IndexEntry testIndex = IndexEntry(BSONObj());
+        BSONObj obj = fromjson("{a: {$type: 13}}");
+        auto_ptr<MatchExpression> expr(parseMatchExpression(obj));
+        BSONElement elt = obj.firstElement();
+
+        OrderedIntervalList oil;
+        IndexBoundsBuilder::BoundsTightness tightness;
+        IndexBoundsBuilder::translate(expr.get(), elt, testIndex, &oil, &tightness);
+
+        // Build the expected interval.
+        BSONObjBuilder bob;
+        bob.appendCode("", "");
+        bob.appendCodeWScope("", "", BSONObj());
+        BSONObj expectedInterval = bob.obj();
+
+        // Check the output of translate().
+        ASSERT_EQUALS(oil.name, "a");
+        ASSERT_EQUALS(oil.intervals.size(), 1U);
+        ASSERT_EQUALS(Interval::INTERVAL_EQUALS, oil.intervals[0].compare(
+            Interval(expectedInterval, true, true)));
+        ASSERT(tightness == IndexBoundsBuilder::INEXACT_FETCH);
+    }
+
+    // Test $type bounds for Code With Scoped BSON type.
+    TEST(IndexBoundsBuilderTest, CodeWithScopeTypeBounds) {
+        IndexEntry testIndex = IndexEntry(BSONObj());
+        BSONObj obj = fromjson("{a: {$type: 15}}");
+        auto_ptr<MatchExpression> expr(parseMatchExpression(obj));
+        BSONElement elt = obj.firstElement();
+
+        OrderedIntervalList oil;
+        IndexBoundsBuilder::BoundsTightness tightness;
+        IndexBoundsBuilder::translate(expr.get(), elt, testIndex, &oil, &tightness);
+
+        // Build the expected interval.
+        BSONObjBuilder bob;
+        bob.appendCodeWScope("", "", BSONObj());
+        bob.appendMaxKey("");
+        BSONObj expectedInterval = bob.obj();
+
+        // Check the output of translate().
+        ASSERT_EQUALS(oil.name, "a");
+        ASSERT_EQUALS(oil.intervals.size(), 1U);
+        ASSERT_EQUALS(Interval::INTERVAL_EQUALS, oil.intervals[0].compare(
+            Interval(expectedInterval, true, true)));
+        ASSERT(tightness == IndexBoundsBuilder::INEXACT_FETCH);
     }
 
 }  // namespace

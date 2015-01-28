@@ -29,11 +29,14 @@
 #pragma once
 
 #include <algorithm>
-#include "bson/bsonobj.h"
-#include "bson/bsontypes.h"
-#include "bson/bsonmisc.h"
-#include "bson/oid.h"
-#include "util/intrusive_counter.h"
+#include <boost/intrusive_ptr.hpp>
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/oid.h"
+#include "mongo/util/debug_util.h"
+#include "mongo/util/intrusive_counter.h"
 #include "mongo/bson/optime.h"
 
 
@@ -47,21 +50,21 @@ namespace mongo {
     class RCVector : public RefCountable {
     public:
         RCVector() {}
-        RCVector(const vector<Value>& v) :vec(v) {}
-        vector<Value> vec;
+        RCVector(const std::vector<Value>& v) :vec(v) {}
+        std::vector<Value> vec;
     };
 
     class RCCodeWScope : public RefCountable {
     public:
-        RCCodeWScope(const string& str, BSONObj obj) :code(str), scope(obj.getOwned()) {}
-        const string code;
+        RCCodeWScope(const std::string& str, BSONObj obj) :code(str), scope(obj.getOwned()) {}
+        const std::string code;
         const BSONObj scope; // Not worth converting to Document for now
     };
 
     class RCDBRef : public RefCountable {
     public:
-        RCDBRef(const string& str, const OID& o) :ns(str), oid(o) {}
-        const string ns;
+        RCDBRef(const std::string& str, const OID& o) :ns(str), oid(o) {}
+        const std::string ns;
         const OID oid;
     };
 
@@ -91,8 +94,7 @@ namespace mongo {
         ValueStorage(BSONType t, const OID& o) {
             zero();
             type = t;
-            memcpy(&oid, &o, sizeof(OID));
-            BOOST_STATIC_ASSERT(sizeof(OID) == sizeof(oid));
+            memcpy(&oid, o.view().view(), OID::kOIDSize);
         }
 
         ValueStorage(const ValueStorage& rhs) {
@@ -147,7 +149,7 @@ namespace mongo {
             putRefCountable(new RCCodeWScope(cws.code.toString(), cws.scope));
         }
 
-        void putRefCountable(intrusive_ptr<const RefCountable> ptr) {
+        void putRefCountable(boost::intrusive_ptr<const RefCountable> ptr) {
             genericRCPtr = ptr.get();
 
             if (genericRCPtr) {
@@ -168,18 +170,18 @@ namespace mongo {
             }
         }
 
-        const vector<Value>& getArray() const {
+        const std::vector<Value>& getArray() const {
             dassert(typeid(*genericRCPtr) == typeid(const RCVector));
             const RCVector* arrayPtr = static_cast<const RCVector*>(genericRCPtr);
             return arrayPtr->vec;
         }
 
-        intrusive_ptr<const RCCodeWScope> getCodeWScope() const {
+        boost::intrusive_ptr<const RCCodeWScope> getCodeWScope() const {
             dassert(typeid(*genericRCPtr) == typeid(const RCCodeWScope));
             return static_cast<const RCCodeWScope*>(genericRCPtr);
         }
 
-        intrusive_ptr<const RCDBRef> getDBRef() const {
+        boost::intrusive_ptr<const RCDBRef> getDBRef() const {
             dassert(typeid(*genericRCPtr) == typeid(const RCDBRef));
             return static_cast<const RCDBRef*>(genericRCPtr);
         }

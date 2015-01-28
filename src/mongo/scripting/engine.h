@@ -2,53 +2,72 @@
 
 /*    Copyright 2009 10gen Inc.
  *
- *    Licensed under the Apache License, Version 2.0 (the "License");
- *    you may not use this file except in compliance with the License.
- *    You may obtain a copy of the License at
+ *    This program is free software: you can redistribute it and/or  modify
+ *    it under the terms of the GNU Affero General Public License, version 3,
+ *    as published by the Free Software Foundation.
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License for more details.
  *
- *    Unless required by applicable law or agreed to in writing, software
- *    distributed under the License is distributed on an "AS IS" BASIS,
- *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *    See the License for the specific language governing permissions and
- *    limitations under the License.
+ *    You should have received a copy of the GNU Affero General Public License
+ *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
  */
 
 #pragma once
 
+#include "mongo/db/global_environment_experiment.h"
 #include "mongo/db/jsobj.h"
 
 namespace mongo {
     typedef unsigned long long ScriptingFunction;
     typedef BSONObj (*NativeFunction)(const BSONObj& args, void* data);
-    typedef map<string, ScriptingFunction> FunctionCacheMap;
+    typedef std::map<std::string, ScriptingFunction> FunctionCacheMap;
 
     class DBClientWithCommands;
     class DBClientBase;
+    class OperationContext;
 
     struct JSFile {
         const char* name;
         const StringData& source;
     };
 
-    class Scope : boost::noncopyable {
+    class Scope {
+        MONGO_DISALLOW_COPYING(Scope);
     public:
         Scope();
         virtual ~Scope();
 
         virtual void reset() = 0;
         virtual void init(const BSONObj* data) = 0;
+        virtual void registerOperation(OperationContext* txn) = 0;
+        virtual void unregisterOperation() = 0;
+
         void init(const char* data) {
             BSONObj o(data);
             init(&o);
         }
 
-        virtual void localConnect(const char* dbName) = 0;
+        virtual void localConnectForDbEval(OperationContext* txn, const char* dbName) = 0;
         virtual void externalSetup() = 0;
-        virtual void setLocalDB(const string& localDBName) { _localDBName = localDBName; }
+        virtual void setLocalDB(const std::string& localDBName) { _localDBName = localDBName; }
+
         virtual BSONObj getObject(const char* field) = 0;
-        virtual string getString(const char* field) = 0;
+        virtual std::string getString(const char* field) = 0;
         virtual bool getBoolean(const char* field) = 0;
         virtual double getNumber(const char* field) = 0;
         virtual int getNumberInt(const char* field) { return (int)getNumber(field); }
@@ -69,11 +88,9 @@ namespace mongo {
 
         virtual void rename(const char* from, const char* to) = 0;
 
-        virtual string getError() = 0;
+        virtual std::string getError() = 0;
 
         virtual bool hasOutOfMemoryException() = 0;
-
-        virtual void installBenchRun();
 
         virtual bool isKillPending() const = 0;
 
@@ -97,22 +114,22 @@ namespace mongo {
                              readOnlyArgs, readOnlyRecv);
             if (res == 0)
                 return;
-            uasserted(9004, string("invoke failed: ") + getError());
+            uasserted(9004, std::string("invoke failed: ") + getError());
         }
 
         void invokeSafe(const char* code, const BSONObj* args, const BSONObj* recv,
                         int timeoutMs = 0) {
             if (invoke(code, args, recv, timeoutMs) == 0)
                 return;
-            uasserted(9005, string("invoke failed: ") + getError());
+            uasserted(9005, std::string("invoke failed: ") + getError());
         }
 
         virtual void injectNative(const char* field, NativeFunction func, void* data = 0) = 0;
 
-        virtual bool exec(const StringData& code, const string& name, bool printResult,
+        virtual bool exec(const StringData& code, const std::string& name, bool printResult,
                           bool reportError, bool assertOnError, int timeoutMs = 0) = 0;
 
-        virtual void execSetup(const StringData& code, const string& name = "setup") {
+        virtual void execSetup(const StringData& code, const std::string& name = "setup") {
             exec(code, name, false, true, true, 0);
         }
 
@@ -120,12 +137,12 @@ namespace mongo {
             execSetup(file.source, file.name);
         }
 
-        virtual bool execFile(const string& filename, bool printResult, bool reportError,
+        virtual bool execFile(const std::string& filename, bool printResult, bool reportError,
                               int timeoutMs = 0);
 
         void execCoreFiles();
 
-        virtual void loadStored(bool ignoreNotConnected = false);
+        virtual void loadStored(OperationContext* txn, bool ignoreNotConnected = false);
 
         /**
          * if any changes are made to .system.js, call this
@@ -133,13 +150,13 @@ namespace mongo {
          */
         static void storedFuncMod();
 
-        static void validateObjectIdString(const string& str);
+        static void validateObjectIdString(const std::string& str);
 
         /** increments the number of times a scope was used */
         void incTimesUsed() { ++_numTimesUsed; }
 
         /** gets the number of times a scope was used */
-        int getTimesUsed() { return _numTimesUsed; }
+        int getTimesUsed() const { return _numTimesUsed; }
 
         /** return true if last invoke() return'd native code */
         virtual bool isLastRetNativeCode() { return _lastRetIsNativeCode; }
@@ -164,16 +181,17 @@ namespace mongo {
         virtual ScriptingFunction _createFunction(const char* code,
                                                   ScriptingFunction functionNumber = 0) = 0;
 
-        string _localDBName;
+        std::string _localDBName;
         long long _loadedVersion;
-        set<string> _storedNames;
+        std::set<std::string> _storedNames;
         static long long _lastVersion;
         FunctionCacheMap _cachedFunctions;
         int _numTimesUsed;
         bool _lastRetIsNativeCode; // v8 only: set to true if eval'd script returns a native func
     };
 
-    class ScriptEngine : boost::noncopyable {
+    class ScriptEngine : public KillOpListenerInterface {
+        MONGO_DISALLOW_COPYING(ScriptEngine);
     public:
         ScriptEngine();
         virtual ~ScriptEngine();
@@ -194,7 +212,9 @@ namespace mongo {
          *                  This must include authenticated users.
          * @return the scope
          */
-        auto_ptr<Scope> getPooledScope(const string& db, const string& scopeType);
+        std::auto_ptr<Scope> getPooledScope(OperationContext* txn,
+                                            const std::string& db,
+                                            const std::string& scopeType);
 
         void setScopeInitCallback(void (*func)(Scope&)) { _scopeInitCallback = func; }
         static void setConnectCallback(void (*func)(DBClientWithCommands&)) {
@@ -209,25 +229,6 @@ namespace mongo {
         // poll for interrupts.  the interrupt functions must not wait indefinitely on a lock.
         virtual void interrupt(unsigned opId) {}
         virtual void interruptAll() {}
-        static void setGetCurrentOpIdCallback(unsigned (*func)()) {
-            _getCurrentOpIdCallback = func;
-        }
-        static bool haveGetCurrentOpIdCallback() { return _getCurrentOpIdCallback; }
-        static unsigned getCurrentOpId() {
-            massert(13474, "no _getCurrentOpIdCallback", _getCurrentOpIdCallback);
-            return _getCurrentOpIdCallback();
-        }
-        static void setCheckInterruptCallback(const char* (*func)()) {
-            _checkInterruptCallback = func;
-        }
-        static bool haveCheckInterruptCallback() { return _checkInterruptCallback; }
-        static const char* checkInterrupt() {
-            return _checkInterruptCallback ? _checkInterruptCallback() : "";
-        }
-        static bool interrupted() {
-            const char* r = checkInterrupt();
-            return r && r[0];
-        }
 
         static std::string getInterpreterVersionString();
 
@@ -237,14 +238,13 @@ namespace mongo {
 
     private:
         static void (*_connectCallback)(DBClientWithCommands&);
-        static const char* (*_checkInterruptCallback)();
-        static unsigned (*_getCurrentOpIdCallback)();
     };
 
     void installGlobalUtils(Scope& scope);
-    bool hasJSReturn(const string& s);
+    bool hasJSReturn(const std::string& s);
     const char* jsSkipWhiteSpace(const char* raw);
 
+    DBClientBase* createDirectClient(OperationContext* txn);
+
     extern ScriptEngine* globalScriptEngine;
-    extern DBClientBase* directDBClient;
 }

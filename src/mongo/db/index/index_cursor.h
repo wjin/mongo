@@ -29,8 +29,9 @@
 #pragma once
 
 #include <vector>
-#include "mongo/db/diskloc.h"
+
 #include "mongo/db/jsobj.h"
+#include "mongo/db/record_id.h"
 
 namespace mongo {
 
@@ -40,7 +41,7 @@ namespace mongo {
      * An IndexCursor is the interface through which one traverses the entries of a given
      * index. The internal structure of an index is kept isolated.
      *
-     * The cursor must be initiailized by seek()ing to a given entry in the index.  The index is
+     * The cursor must be initialized by seek()ing to a given entry in the index.  The index is
      * traversed by calling next() or skip()-ping ahead.
      *
      * The set of predicates a given index can understand is known a priori.  These predicates may
@@ -53,11 +54,6 @@ namespace mongo {
     class IndexCursor {
     public:
         virtual ~IndexCursor() { }
-
-        /**
-         * Set options on the cursor (direction).  See CursorOptions below.
-         */
-        virtual Status setOptions(const CursorOptions& options) = 0;
 
         /**
          * A cursor doesn't point anywhere by default.  You must seek to the start position.
@@ -89,7 +85,7 @@ namespace mongo {
         virtual BSONObj getKey() const = 0;
 
         // Current value we point at.  Assumes !isEOF().
-        virtual DiskLoc getValue() const = 0;
+        virtual RecordId getValue() const = 0;
 
         //
         // Yielding support
@@ -108,9 +104,7 @@ namespace mongo {
          */
 
         /**
-         * Save our current position in the index.  Assumes that we are currently pointing to a
-         * valid position in the index.
-         * If not, we error.  Otherwise, succeed.
+         * Save our current position in the index.
          */
         virtual Status savePosition() = 0;
 
@@ -118,10 +112,10 @@ namespace mongo {
          * Restore the saved position.  Errors if there is no saved position.
          * The cursor may be EOF after a restore.
          */
-        virtual Status restorePosition() = 0;
+        virtual Status restorePosition(OperationContext* txn) = 0;
 
-        // Return a string describing the cursor.
-        virtual string toString() = 0;
+        // Return a std::string describing the cursor.
+        virtual std::string toString() = 0;
 
         /**
          *  Add debugging info to the provided builder.

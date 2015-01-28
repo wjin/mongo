@@ -2,17 +2,29 @@
 
 /*    Copyright 2009 10gen Inc.
  *
- *    Licensed under the Apache License, Version 2.0 (the "License");
- *    you may not use this file except in compliance with the License.
- *    You may obtain a copy of the License at
+ *    This program is free software: you can redistribute it and/or  modify
+ *    it under the terms of the GNU Affero General Public License, version 3,
+ *    as published by the Free Software Foundation.
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License for more details.
  *
- *    Unless required by applicable law or agreed to in writing, software
- *    distributed under the License is distributed on an "AS IS" BASIS,
- *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *    See the License for the specific language governing permissions and
- *    limitations under the License.
+ *    You should have received a copy of the GNU Affero General Public License
+ *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
  */
 
 #pragma once
@@ -21,6 +33,7 @@
 #include <string>
 #include <vector>
 
+#include "mongo/base/data_view.h"
 #include "mongo/bson/bsontypes.h"
 #include "mongo/bson/oid.h"
 #include "mongo/client/export_macros.h"
@@ -32,15 +45,10 @@ namespace mongo {
     class BSONObj;
     class BSONElement;
     class BSONObjBuilder;
-}
 
-namespace bson {
-    typedef mongo::BSONElement be;
-    typedef mongo::BSONObj bo;
-    typedef mongo::BSONObjBuilder bob;
-}
-
-namespace mongo {
+    typedef BSONElement be;
+    typedef BSONObj bo;
+    typedef BSONObjBuilder bob;
 
     /* l and r MUST have same type when called: check that first. */
     int compareElementValues(const BSONElement& l, const BSONElement& r);
@@ -67,6 +75,9 @@ namespace mongo {
             std::string foo = obj["foo"].String(); // std::exception if not a std::string type or DNE
         */
         std::string String()        const { return chk(mongo::String).str(); }
+        const StringData checkAndGetStringData() const {
+            return chk(mongo::String).valueStringData();
+        }
         Date_t Date()               const { return chk(mongo::Date).date(); }
         double Number()             const { return chk(isNumber()).number(); }
         double Double()             const { return chk(NumberDouble)._numberDouble(); }
@@ -109,7 +120,10 @@ namespace mongo {
         operator std::string() const { return toString(); }
 
         /** Returns the type of the element */
-        BSONType type() const { return (BSONType) *reinterpret_cast< const signed char * >(data); }
+        BSONType type() const {
+            const signed char typeByte = ConstDataView(data).readLE<signed char>();
+            return static_cast<BSONType>(typeByte);
+        }
 
         /** retrieve a field within this element
             throws exception if *this is not an embedded object
@@ -155,7 +169,7 @@ namespace mongo {
         }
 
         const StringData fieldNameStringData() const {
-            return StringData(fieldName(), fieldNameSize() - 1);
+            return StringData(fieldName(), eoo() ? 0 : fieldNameSize() - 1);
         }
 
         /** raw data of the element's value (so be careful). */
@@ -183,7 +197,7 @@ namespace mongo {
             @see Bool(), trueValue()
         */
         Date_t date() const {
-            return *reinterpret_cast< const Date_t* >( value() );
+            return Date_t(ConstDataView(value()).readLE<unsigned long long>());
         }
 
         /** Convert the value to boolean, regardless of its type, in a javascript-like fashion
@@ -198,11 +212,19 @@ namespace mongo {
         bool isNumber() const;
 
         /** Return double value for this field. MUST be NumberDouble type. */
-        double _numberDouble() const {return (reinterpret_cast< const PackedDouble* >( value() ))->d; }
+        double _numberDouble() const {
+            return ConstDataView(value()).readLE<double>();
+        }
+
         /** Return int value for this field. MUST be NumberInt type. */
-        int _numberInt() const {return *reinterpret_cast< const int* >( value() ); }
+        int _numberInt() const {
+            return ConstDataView(value()).readLE<int>();
+        }
+
         /** Return long long value for this field. MUST be NumberLong type. */
-        long long _numberLong() const {return *reinterpret_cast< const long long* >( value() ); }
+        long long _numberLong() const {
+            return ConstDataView(value()).readLE<long long>();
+        }
 
         /** Retrieve int value for the element safely.  Zero returned if not a number. */
         int numberInt() const;
@@ -229,24 +251,26 @@ namespace mongo {
 
         /** Retrieve the object ID stored in the object.
             You must ensure the element is of type jstOID first. */
-        const mongo::OID &__oid() const { return *reinterpret_cast< const mongo::OID* >( value() ); }
+        mongo::OID __oid() const {
+            return OID::from(value());
+        }
 
         /** True if element is null. */
         bool isNull() const {
             return type() == jstNULL;
         }
 
-        /** Size (length) of a string element.
-            You must assure of type String first.
-            @return string size including terminating null
+        /** Size (length) of a std::string element.
+            You must assure of type std::string first.
+            @return std::string size including terminating null
         */
         int valuestrsize() const {
-            return *reinterpret_cast< const int* >( value() );
+            return ConstDataView(value()).readLE<int>();
         }
 
         // for objects the size *includes* the size of the size field
         size_t objsize() const {
-            return static_cast< const size_t >( *reinterpret_cast< const uint32_t* >( value() ) );
+            return ConstDataView(value()).readLE<uint32_t>();
         }
 
         /** Get a string's value.  Also gives you start of the real data for an embedded object.
@@ -256,13 +280,21 @@ namespace mongo {
             return value() + 4;
         }
 
-        /** Get the string value of the element.  If not a string returns "". */
+        /** Get the std::string value of the element.  If not a std::string returns "". */
         const char *valuestrsafe() const {
             return type() == mongo::String ? valuestr() : "";
         }
-        /** Get the string value of the element.  If not a string returns "". */
+        /** Get the std::string value of the element.  If not a std::string returns "". */
         std::string str() const {
             return type() == mongo::String ? std::string(valuestr(), valuestrsize()-1) : std::string();
+        }
+
+        /**
+         * Returns a StringData pointing into this element's data.  Does not validate that the
+         * element is actually of type String.
+         */
+        const StringData valueStringData() const {
+            return StringData(valuestr(), valuestrsize() - 1);
         }
 
         /** Get javascript code of a CodeWScope data element. */
@@ -275,7 +307,7 @@ namespace mongo {
          *  This INCLUDES the null char at the end */
         int codeWScopeCodeLen() const {
             massert( 16178 , "not codeWScope" , type() == CodeWScope );
-            return *(int *)( value() + 4 );
+            return ConstDataView(value() + 4).readLE<int>();
         }
 
         /** Get the scope SavedContext of a CodeWScope data element.
@@ -335,7 +367,7 @@ namespace mongo {
             return (BinDataType)c;
         }
 
-        /** Retrieve the regex string for a Regex element */
+        /** Retrieve the regex std::string for a Regex element */
         const char *regex() const {
             verify(type() == RegEx);
             return value();
@@ -367,6 +399,15 @@ namespace mongo {
             If considerFieldName is true, pay attention to the field name.
         */
         int woCompare( const BSONElement &e, bool considerFieldName = true ) const;
+
+        /**
+         * Functor compatible with std::hash for std::unordered_{map,set}
+         * Warning: The hash function is subject to change. Do not use in cases where hashes need
+         *          to be consistent across versions.
+         */
+        struct Hasher {
+            size_t operator() (const BSONElement& elem) const;
+        };
 
         const char * rawdata() const { return data; }
 
@@ -400,15 +441,15 @@ namespace mongo {
         }
 
         Date_t timestampTime() const {
-            unsigned long long t = ((unsigned int*)(value() + 4 ))[0];
+            unsigned long long t = ConstDataView(value() + 4).readLE<unsigned int>();
             return t * 1000;
         }
         unsigned int timestampInc() const {
-            return ((unsigned int*)(value() ))[0];
+            return ConstDataView(value()).readLE<unsigned int>();
         }
 
         unsigned long long timestampValue() const {
-            return reinterpret_cast<const unsigned long long*>( value() )[0];
+            return ConstDataView(value()).readLE<unsigned long long>();
         }
 
         const char * dbrefNS() const {
@@ -416,11 +457,11 @@ namespace mongo {
             return value() + 4;
         }
 
-        const mongo::OID& dbrefOID() const {
+        const mongo::OID dbrefOID() const {
             uassert( 10064 ,  "not a dbref" , type() == DBRef );
             const char * start = value();
-            start += 4 + *reinterpret_cast< const int* >( start );
-            return *reinterpret_cast< const mongo::OID* >( start );
+            start += 4 + ConstDataView(start).readLE<int>();
+            return mongo::OID::from(start);
         }
 
         /** this does not use fieldName in the comparison, just the value */
@@ -441,8 +482,8 @@ namespace mongo {
                 totalSize = -1;
                 fieldNameSize_ = -1;
                 if ( maxLen != -1 ) {
-                    int size = (int) strnlen( fieldName(), maxLen - 1 );
-                    uassert( 10333 ,  "Invalid field name", size != -1 );
+                    size_t size = strnlen( fieldName(), maxLen - 1 );
+                    uassert( 10333 ,  "Invalid field name", size < size_t(maxLen - 1) );
                     fieldNameSize_ = size + 1;
                 }
             }
@@ -504,11 +545,11 @@ namespace mongo {
         // NOTE Behavior changes must be replicated in Value::coerceToBool().
         switch( type() ) {
         case NumberLong:
-            return *reinterpret_cast< const long long* >( value() ) != 0;
+            return _numberLong() != 0;
         case NumberDouble:
-            return (reinterpret_cast < const PackedDouble* >(value ()))->d != 0;
+            return _numberDouble() != 0;
         case NumberInt:
-            return *reinterpret_cast< const int* >( value() ) != 0;
+            return _numberInt() != 0;
         case mongo::Bool:
             return boolean();
         case EOO:
@@ -554,9 +595,9 @@ namespace mongo {
         case NumberDouble:
             return _numberDouble();
         case NumberInt:
-            return *reinterpret_cast< const int* >( value() );
+            return _numberInt();
         case NumberLong:
-            return (double) *reinterpret_cast< const long long* >( value() );
+            return _numberLong();
         default:
             return 0;
         }
@@ -615,10 +656,13 @@ namespace mongo {
     }
 
     inline BSONElement::BSONElement() {
-        static char z = 0;
-        data = &z;
+        static const char kEooElement[] = "";
+        data = kEooElement;
         fieldNameSize_ = 0;
         totalSize = 1;
     }
+
+    // TODO(SERVER-14596): move to a better place; take a StringData.
+    std::string escape( const std::string& s , bool escape_slash=false);
 
 }

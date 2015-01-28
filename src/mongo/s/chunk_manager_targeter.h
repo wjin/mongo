@@ -28,6 +28,7 @@
 
 #pragma once
 
+#include <boost/scoped_ptr.hpp>
 #include <map>
 
 #include "mongo/bson/bsonobj.h"
@@ -116,11 +117,28 @@ namespace mongo {
         Status refreshNow( RefreshType refreshType );
 
         /**
+         * Returns a vector of ShardEndpoints where a document might need to be placed.
+         *
+         * Returns !OK with message if replacement could not be targeted
+         */
+        Status targetDoc(const BSONObj& doc, std::vector<ShardEndpoint*>* endpoints) const;
+
+        /**
          * Returns a vector of ShardEndpoints for a potentially multi-shard query.
          *
          * Returns !OK with message if query could not be targeted.
          */
         Status targetQuery( const BSONObj& query, std::vector<ShardEndpoint*>* endpoints ) const;
+
+        /**
+         * Returns a ShardEndpoint for an exact shard key query.
+         *
+         * Also has the side effect of updating the chunks stats with an estimate of the amount of
+         * data targeted at this shard key.
+         */
+        Status targetShardKey(const BSONObj& doc,
+                              long long estDataSize,
+                              ShardEndpoint** endpoint) const;
 
         NamespaceString _nss;
 

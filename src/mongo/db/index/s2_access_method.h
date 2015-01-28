@@ -29,7 +29,7 @@
 #pragma once
 
 #include "mongo/base/status.h"
-#include "mongo/db/geo/s2common.h"
+#include "mongo/db/index/s2_common.h"
 #include "mongo/db/index/btree_based_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/jsobj.h"
@@ -43,7 +43,7 @@ namespace mongo {
     public:
         using BtreeBasedAccessMethod::_descriptor;
 
-        S2AccessMethod(IndexCatalogEntry* btreeState);
+        S2AccessMethod(IndexCatalogEntry* btreeState, SortedDataInterface* btree);
         virtual ~S2AccessMethod() { }
 
         /**

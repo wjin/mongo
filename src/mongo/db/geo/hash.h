@@ -28,9 +28,8 @@
 
 #pragma once
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 #include "mongo/db/jsobj.h"
-#include <iostream>
 
 namespace mongo {
 
@@ -45,10 +44,12 @@ namespace mongo {
      */
     class GeoHash {
     public:
+        static unsigned int const kMaxBits; // = 32;
+
         GeoHash();
         // The strings are binary values of length <= 64,
         // examples: 1001010100101, 1
-        explicit GeoHash(const string& hash);
+        explicit GeoHash(const std::string& hash);
         explicit GeoHash(const char *s);
         // bits is how many bits are used to hash each of x and y.
         GeoHash(unsigned x, unsigned y, unsigned bits = 32);
@@ -70,8 +71,8 @@ namespace mongo {
 
         bool hasPrefix(const GeoHash& other) const;
 
-        string toString() const;
-        string toStringHex1() const;
+        std::string toString() const;
+        std::string toStringHex1() const;
 
         void setBit(unsigned pos, bool value);
         bool getBit(unsigned pos) const;
@@ -107,17 +108,37 @@ namespace mongo {
         GeoHash operator+(const char *s) const;
         GeoHash operator+(const std::string& s) const;
 
-        // Append the hash to the builder provided.
-        void appendToBuilder(BSONObjBuilder* b, const char * name) const;
+        // Append the minimum range of the hash to the builder provided (inclusive)
+        void appendHashMin(BSONObjBuilder* builder, const char* fieldName) const;
+        // Append the maximum range of the hash to the builder provided (inclusive)
+        void appendHashMax(BSONObjBuilder* builder, const char* fieldName) const;
+
         long long getHash() const;
         unsigned getBits() const;
 
         GeoHash commonPrefix(const GeoHash& other) const;
+
+        // If this is not a leaf cell, set children[0..3] to the four children of
+        // this cell (in traversal order) and return true. Otherwise returns false.
+        bool subdivide(GeoHash children[4]) const;
+        // Return true if the given cell is contained within this one.
+        bool contains(const GeoHash& other) const;
+        // Return the parent at given level.
+        GeoHash parent(unsigned int level) const;
+        GeoHash parent() const;
+
+        // Return the neighbors of closest vertex to this cell at the given level,
+        // by appending them to "output".  Normally there are four neighbors, but
+        // the closest vertex may only have two or one neighbor if it is next to the
+        // boundary.
+        //
+        // Requires: level < this->_bits, so that we can determine which vertex is
+        // closest (in particular, level == kMaxBits is not allowed).
+        void appendVertexNeighbors(unsigned level, std::vector<GeoHash>* output) const;
+
     private:
-        // XXX not sure why this is done exactly.  Why does binary
-        // data need to be reversed?  byte ordering of some sort?
-        static void _copyAndReverse(char *dst, const char *src);
-        // Create a hash from the provided string.  Used by the string and char* cons.
+
+        // Create a hash from the provided string.  Used by the std::string and char* cons.
         void initFromString(const char *s);
         /* Keep the upper _bits*2 bits of _hash, clear the lower bits.
          * Maybe there's junk in there?  XXX Not sure why this is done.
@@ -142,6 +163,8 @@ namespace mongo {
      */
     class GeoHashConverter {
     public:
+        static double const kMachinePrecision; // = 1.1e-16
+
         struct Parameters {
             // How many bits to use for the hash?
             int bits;
@@ -153,6 +176,13 @@ namespace mongo {
         };
 
         GeoHashConverter(const Parameters &params);
+
+        /**
+         * Returns hashing parameters parsed from a BSONObj
+         */
+        static Status parseParameters(const BSONObj& paramDoc, Parameters* params);
+
+        static double calcUnhashToBoxError(const GeoHashConverter::Parameters& params);
 
         /**
          * Return converter parameterss which can be used to
@@ -197,17 +227,22 @@ namespace mongo {
         void unhash(const GeoHash &h, double *x, double *y) const;
 
         /**
-         * Generates bounding box from geo hash using converter.
-         * Used in GeoBrowse::fillStack and db/query/explain_plan.cpp
-         * to generate index bounds from
-         * geo hashes in plan stats.
+         * Generates bounding box from geohash, expanded by the error bound
          */
-        Box unhashToBox(const GeoHash &h) const;
+        Box unhashToBoxCovering(const GeoHash &h) const;
 
         double sizeOfDiag(const GeoHash& a) const;
-        // XXX: understand/clean this.
-        double sizeEdge(const GeoHash& a) const;
+
+        // Return the sizeEdge of a cell at a given level.
+        double sizeEdge(unsigned level) const;
+
+        // Used by test.
+        double convertDoubleFromHashScale(double in) const;
+        double convertToDoubleHashScale(double in) const;
     private:
+
+        void init();
+
         // Convert from an unsigned in [0, (max-min)*scaling] to [min, max]
         double convertFromHashScale(unsigned in) const;
 
@@ -218,5 +253,9 @@ namespace mongo {
         // We compute these based on the _params:
         double _error;
         double _errorSphere;
+
+        // Error bound of unhashToBox, see hash_test.cpp for its proof.
+        // 8 * max(|max|, |min|) * u
+        double _errorUnhashToBox;
     };
 }  // namespace mongo

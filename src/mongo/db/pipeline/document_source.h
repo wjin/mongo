@@ -28,25 +28,28 @@
 
 #pragma once
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include <boost/optional.hpp>
+#include <boost/intrusive_ptr.hpp>
+#include <boost/scoped_ptr.hpp>
+#include <boost/shared_ptr.hpp>
 #include <boost/unordered_map.hpp>
 #include <deque>
 
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/matcher.h"
+#include "mongo/db/matcher/matcher.h"
 #include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/value.h"
-#include "mongo/db/projection.h"
 #include "mongo/db/sorter/sorter.h"
 #include "mongo/s/shard.h"
 #include "mongo/s/strategy.h"
 #include "mongo/util/intrusive_counter.h"
+
 
 namespace mongo {
     class Accumulator;
@@ -55,7 +58,7 @@ namespace mongo {
     class ExpressionFieldPath;
     class ExpressionObject;
     class DocumentSourceLimit;
-    class Runner;
+    class PlanExecutor;
 
     class DocumentSource : public IntrusiveCounterUnsigned {
     public:
@@ -78,7 +81,7 @@ namespace mongo {
         /**
            Get the source's name.
 
-           @returns the string name of the source as a constant string;
+           @returns the std::string name of the source as a constant string;
              this is static, and there's no need to worry about adopting it
          */
         virtual const char *getSourceName() const;
@@ -114,7 +117,7 @@ namespace mongo {
           @returns whether or not the attempt to coalesce was successful or not;
             if the attempt was not successful, nothing has been changed
          */
-        virtual bool coalesce(const intrusive_ptr<DocumentSource> &pNextSource);
+        virtual bool coalesce(const boost::intrusive_ptr<DocumentSource> &pNextSource);
 
         /**
           Optimize the pipeline operation, if possible.  This is a local
@@ -144,13 +147,13 @@ namespace mongo {
         }
 
         /**
-         * In the default case, serializes the DocumentSource and adds it to the vector<Value>.
+         * In the default case, serializes the DocumentSource and adds it to the std::vector<Value>.
          *
          * A subclass may choose to overwrite this, rather than serialize,
          * if it should output multiple stages (eg, $sort sometimes also outputs a $limit).
          */
 
-        virtual void serializeToArray(vector<Value>& array, bool explain = false) const;
+        virtual void serializeToArray(std::vector<Value>& array, bool explain = false) const;
 
         /// Returns true if doesn't require an input source (most DocumentSources do).
         virtual bool isValidInitialSource() const { return false; }
@@ -159,7 +162,7 @@ namespace mongo {
         /**
            Base constructor.
          */
-        DocumentSource(const intrusive_ptr<ExpressionContext> &pExpCtx);
+        DocumentSource(const boost::intrusive_ptr<ExpressionContext> &pExpCtx);
 
         /*
           Most DocumentSources have an underlying source they get their data
@@ -171,7 +174,7 @@ namespace mongo {
         */
         DocumentSource *pSource;
 
-        intrusive_ptr<ExpressionContext> pExpCtx;
+        boost::intrusive_ptr<ExpressionContext> pExpCtx;
 
     private:
         /**
@@ -192,12 +195,12 @@ namespace mongo {
         /** returns a source to be run on the shards.
          *  if NULL, don't run on shards
          */
-        virtual intrusive_ptr<DocumentSource> getShardSource() = 0;
+        virtual boost::intrusive_ptr<DocumentSource> getShardSource() = 0;
 
         /** returns a source that combines results from shards.
          *  if NULL, don't run on merger
          */
-        virtual intrusive_ptr<DocumentSource> getMergeSource() = 0;
+        virtual boost::intrusive_ptr<DocumentSource> getMergeSource() = 0;
     protected:
         // It is invalid to delete through a SplittableDocumentSource-typed pointer.
         virtual ~SplittableDocumentSource() {}
@@ -215,7 +218,11 @@ namespace mongo {
         public:
             virtual ~MongodInterface() {};
 
-            virtual DBClientBase* directClient() = 0; // Always returns a DBDirectClient
+            /**
+             * Always returns a DBDirectClient.
+             * Callers must not cache the returned pointer outside the scope of a single function.
+             */
+            virtual DBClientBase* directClient() = 0;
 
             // Note that in some rare cases this could return a false negative but will never return
             // a false positive. This method will be fixed in the future once it becomes possible to
@@ -236,7 +243,7 @@ namespace mongo {
         virtual ~DocumentSourceNeedsMongod() {}
 
         // Gives subclasses access to a MongodInterface implementation
-        shared_ptr<MongodInterface> _mongod;
+        boost::shared_ptr<MongodInterface> _mongod;
     };
 
 
@@ -263,14 +270,14 @@ namespace mongo {
           @param pExpCtx the expression context for the pipeline
           @returns the newly created document source
         */
-        static intrusive_ptr<DocumentSourceBsonArray> create(
+        static boost::intrusive_ptr<DocumentSourceBsonArray> create(
             const BSONObj& array,
-            const intrusive_ptr<ExpressionContext> &pExpCtx);
+            const boost::intrusive_ptr<ExpressionContext> &pExpCtx);
 
     private:
         DocumentSourceBsonArray(
             const BSONObj& embeddedArray,
-            const intrusive_ptr<ExpressionContext> &pExpCtx);
+            const boost::intrusive_ptr<ExpressionContext> &pExpCtx);
 
         BSONObj embeddedObject;
         BSONObjIterator arrayIterator;
@@ -287,13 +294,13 @@ namespace mongo {
         virtual bool isValidInitialSource() const { return true; }
 
         /* convenient shorthand for a commonly used type */
-        typedef vector<Strategy::CommandResult> ShardOutput;
+        typedef std::vector<Strategy::CommandResult> ShardOutput;
 
         /** Returns the result arrays from shards using the 2.4 protocol.
          *  Call this instead of getNext() if you want access to the raw streams.
          *  This method should only be called at most once.
          */
-        vector<BSONArray> getArrays();
+        std::vector<BSONArray> getArrays();
 
         /**
           Create a DocumentSource that wraps the output of many shards
@@ -302,13 +309,13 @@ namespace mongo {
           @param pExpCtx the expression context for the pipeline
           @returns the newly created DocumentSource
          */
-        static intrusive_ptr<DocumentSourceCommandShards> create(
+        static boost::intrusive_ptr<DocumentSourceCommandShards> create(
             const ShardOutput& shardOutput,
-            const intrusive_ptr<ExpressionContext>& pExpCtx);
+            const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
 
     private:
         DocumentSourceCommandShards(const ShardOutput& shardOutput,
-            const intrusive_ptr<ExpressionContext>& pExpCtx);
+            const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
 
         /**
           Advance to the next document, setting pCurrent appropriately.
@@ -322,7 +329,7 @@ namespace mongo {
         bool unstarted;
         bool hasCurrent;
         bool newSource; // set to true for the first item of a new source
-        intrusive_ptr<DocumentSourceBsonArray> pBsonSource;
+        boost::intrusive_ptr<DocumentSourceBsonArray> pBsonSource;
         Document pCurrent;
         ShardOutput::const_iterator iterator;
         ShardOutput::const_iterator listEnd;
@@ -330,7 +337,9 @@ namespace mongo {
 
 
     /**
-     * Constructs and returns Documents from the BSONObj objects produced by a supplied Runner.
+     * Constructs and returns Documents from the BSONObj objects produced by a supplied
+     * PlanExecutor.
+     *
      * An object of this type may only be used by one thread, see SERVER-6123.
      */
     class DocumentSourceCursor :
@@ -342,20 +351,20 @@ namespace mongo {
         virtual const char *getSourceName() const;
         virtual Value serialize(bool explain = false) const;
         virtual void setSource(DocumentSource *pSource);
-        virtual bool coalesce(const intrusive_ptr<DocumentSource>& nextSource);
+        virtual bool coalesce(const boost::intrusive_ptr<DocumentSource>& nextSource);
         virtual bool isValidInitialSource() const { return true; }
         virtual void dispose();
 
         /**
-         * Create a document source based on a passed-in Runner.
+         * Create a document source based on a passed-in PlanExecutor.
          *
          * This is usually put at the beginning of a chain of document sources
          * in order to fetch data from the database.
          */
-        static intrusive_ptr<DocumentSourceCursor> create(
-            const string& ns,
-            const boost::shared_ptr<Runner>& runner,
-            const intrusive_ptr<ExpressionContext> &pExpCtx);
+        static boost::intrusive_ptr<DocumentSourceCursor> create(
+            const std::string& ns,
+            const boost::shared_ptr<PlanExecutor>& exec,
+            const boost::intrusive_ptr<ExpressionContext> &pExpCtx);
 
         /*
           Record the query that was specified for the cursor this wraps, if
@@ -397,9 +406,9 @@ namespace mongo {
 
     private:
         DocumentSourceCursor(
-            const string& ns,
-            const boost::shared_ptr<Runner>& runner,
-            const intrusive_ptr<ExpressionContext> &pExpCtx);
+            const std::string& ns,
+            const boost::shared_ptr<PlanExecutor>& exec,
+            const boost::intrusive_ptr<ExpressionContext> &pExpCtx);
 
         void loadBatch();
 
@@ -410,11 +419,11 @@ namespace mongo {
         BSONObj _sort;
         BSONObj _projection;
         boost::optional<ParsedDeps> _dependencies;
-        intrusive_ptr<DocumentSourceLimit> _limit;
+        boost::intrusive_ptr<DocumentSourceLimit> _limit;
         long long _docsAddedToBatches; // for _limit enforcement
 
-        const string _ns;
-        boost::shared_ptr<Runner> _runner; // PipelineRunner holds a weak_ptr to this.
+        const std::string _ns;
+        boost::shared_ptr<PlanExecutor> _exec; // PipelineProxyStage holds a weak_ptr to this.
     };
 
 
@@ -435,8 +444,8 @@ namespace mongo {
           @param pExpCtx the expression context for the pipeline
           @returns the DocumentSource
          */
-        static intrusive_ptr<DocumentSourceGroup> create(
-            const intrusive_ptr<ExpressionContext> &pExpCtx);
+        static boost::intrusive_ptr<DocumentSourceGroup> create(
+            const boost::intrusive_ptr<ExpressionContext> &pExpCtx);
 
         /**
           Add an accumulator.
@@ -451,8 +460,8 @@ namespace mongo {
                 group field
          */
         void addAccumulator(const std::string& fieldName,
-                            intrusive_ptr<Accumulator> (*pAccumulatorFactory)(),
-                            const intrusive_ptr<Expression> &pExpression);
+                            boost::intrusive_ptr<Accumulator> (*pAccumulatorFactory)(),
+                            const boost::intrusive_ptr<Expression> &pExpression);
 
         /// Tell this source if it is doing a merge from shards. Defaults to false.
         void setDoingMerge(bool doingMerge) { _doingMerge = doingMerge; }
@@ -468,21 +477,21 @@ namespace mongo {
           @param pExpCtx the expression context
           @returns the grouping DocumentSource
          */
-        static intrusive_ptr<DocumentSource> createFromBson(
+        static boost::intrusive_ptr<DocumentSource> createFromBson(
             BSONElement elem,
-            const intrusive_ptr<ExpressionContext> &pExpCtx);
+            const boost::intrusive_ptr<ExpressionContext> &pExpCtx);
 
         // Virtuals for SplittableDocumentSource
-        virtual intrusive_ptr<DocumentSource> getShardSource();
-        virtual intrusive_ptr<DocumentSource> getMergeSource();
+        virtual boost::intrusive_ptr<DocumentSource> getShardSource();
+        virtual boost::intrusive_ptr<DocumentSource> getMergeSource();
 
         static const char groupName[];
 
     private:
-        DocumentSourceGroup(const intrusive_ptr<ExpressionContext> &pExpCtx);
+        DocumentSourceGroup(const boost::intrusive_ptr<ExpressionContext> &pExpCtx);
 
         /// Spill groups map to disk and returns an iterator to the file.
-        shared_ptr<Sorter<Value, Value>::Iterator> spill();
+        boost::shared_ptr<Sorter<Value, Value>::Iterator> spill();
 
         // Only used by spill. Would be function-local if that were legal in C++03.
         class SpillSTLComparator;
@@ -513,7 +522,7 @@ namespace mongo {
         Value expandId(const Value& val);
 
 
-        typedef vector<intrusive_ptr<Accumulator> > Accumulators;
+        typedef std::vector<boost::intrusive_ptr<Accumulator> > Accumulators;
         typedef boost::unordered_map<Value, Accumulators, Value::Hash> GroupsMap;
         GroupsMap groups;
 
@@ -529,9 +538,9 @@ namespace mongo {
 
           These three vectors parallel each other.
         */
-        vector<string> vFieldName;
-        vector<intrusive_ptr<Accumulator> (*)()> vpAccumulatorFactory;
-        vector<intrusive_ptr<Expression> > vpExpression;
+        std::vector<std::string> vFieldName;
+        std::vector<boost::intrusive_ptr<Accumulator> (*)()> vpAccumulatorFactory;
+        std::vector<boost::intrusive_ptr<Expression> > vpExpression;
 
 
         Document makeDocument(const Value& id, const Accumulators& accums, bool mergeableOutput);
@@ -542,14 +551,14 @@ namespace mongo {
         const int _maxMemoryUsageBytes;
         boost::scoped_ptr<Variables> _variables;
         std::vector<std::string> _idFieldNames; // used when id is a document
-        std::vector<intrusive_ptr<Expression> > _idExpressions;
+        std::vector<boost::intrusive_ptr<Expression> > _idExpressions;
 
         // only used when !_spilled
         GroupsMap::iterator groupsIterator;
 
         // only used when _spilled
-        scoped_ptr<Sorter<Value, Value>::Iterator> _sorterIterator;
-        pair<Value, Value> _firstPartOfNextGroup;
+        boost::scoped_ptr<Sorter<Value, Value>::Iterator> _sorterIterator;
+        std::pair<Value, Value> _firstPartOfNextGroup;
         Value _currentId;
         Accumulators _currentAccumulators;
     };
@@ -560,7 +569,7 @@ namespace mongo {
         // virtuals from DocumentSource
         virtual boost::optional<Document> getNext();
         virtual const char *getSourceName() const;
-        virtual bool coalesce(const intrusive_ptr<DocumentSource>& nextSource);
+        virtual bool coalesce(const boost::intrusive_ptr<DocumentSource>& nextSource);
         virtual Value serialize(bool explain = false) const;
         virtual void setSource(DocumentSource* Source);
 
@@ -570,9 +579,9 @@ namespace mongo {
           @param pBsonElement the raw BSON specification for the filter
           @returns the filter
          */
-        static intrusive_ptr<DocumentSource> createFromBson(
+        static boost::intrusive_ptr<DocumentSource> createFromBson(
             BSONElement elem,
-            const intrusive_ptr<ExpressionContext> &pCtx);
+            const boost::intrusive_ptr<ExpressionContext> &pCtx);
 
         /// Returns the query in Matcher syntax.
         BSONObj getQuery() const;
@@ -596,16 +605,16 @@ namespace mongo {
 
     private:
         DocumentSourceMatch(const BSONObj &query,
-            const intrusive_ptr<ExpressionContext> &pExpCtx);
+            const boost::intrusive_ptr<ExpressionContext> &pExpCtx);
 
-        scoped_ptr<Matcher> matcher;
+        boost::scoped_ptr<Matcher> matcher;
         bool _isTextQuery;
     };
 
     class DocumentSourceMergeCursors :
         public DocumentSource {
     public:
-        typedef vector<pair<ConnectionString, CursorId> > CursorIds;
+        typedef std::vector<std::pair<ConnectionString, CursorId> > CursorIds;
 
         // virtuals from DocumentSource
         boost::optional<Document> getNext();
@@ -615,13 +624,13 @@ namespace mongo {
         virtual Value serialize(bool explain = false) const;
         virtual bool isValidInitialSource() const { return true; }
 
-        static intrusive_ptr<DocumentSource> createFromBson(
+        static boost::intrusive_ptr<DocumentSource> createFromBson(
             BSONElement elem,
-            const intrusive_ptr<ExpressionContext> &pExpCtx);
+            const boost::intrusive_ptr<ExpressionContext> &pExpCtx);
 
-        static intrusive_ptr<DocumentSource> create(
+        static boost::intrusive_ptr<DocumentSource> create(
             const CursorIds& cursorIds,
-            const intrusive_ptr<ExpressionContext> &pExpCtx);
+            const boost::intrusive_ptr<ExpressionContext> &pExpCtx);
 
         static const char name[];
 
@@ -629,7 +638,7 @@ namespace mongo {
          *  Call this instead of getNext() if you want access to the raw streams.
          *  This method should only be called at most once.
          */
-        vector<DBClientCursor*> getCursors();
+        std::vector<DBClientCursor*> getCursors();
 
         /**
          * Returns the next object from the cursor, throwing an appropriate exception if the cursor
@@ -646,11 +655,11 @@ namespace mongo {
         };
 
         // using list to enable removing arbitrary elements
-        typedef list<boost::shared_ptr<CursorAndConnection> > Cursors;
+        typedef std::list<boost::shared_ptr<CursorAndConnection> > Cursors;
 
         DocumentSourceMergeCursors(
             const CursorIds& cursorIds,
-            const intrusive_ptr<ExpressionContext> &pExpCtx);
+            const boost::intrusive_ptr<ExpressionContext> &pExpCtx);
 
         // Converts _cursorIds into active _cursors.
         void start();
@@ -677,8 +686,8 @@ namespace mongo {
         virtual GetDepsReturn getDependencies(DepsTracker* deps) const;
 
         // Virtuals for SplittableDocumentSource
-        virtual intrusive_ptr<DocumentSource> getShardSource() { return NULL; }
-        virtual intrusive_ptr<DocumentSource> getMergeSource() { return this; }
+        virtual boost::intrusive_ptr<DocumentSource> getShardSource() { return NULL; }
+        virtual boost::intrusive_ptr<DocumentSource> getMergeSource() { return this; }
 
         const NamespaceString& getOutputNs() const { return _outputNs; }
 
@@ -692,20 +701,20 @@ namespace mongo {
           @param pExpCtx the expression context for the pipeline
           @returns the newly created document source
         */
-        static intrusive_ptr<DocumentSource> createFromBson(
+        static boost::intrusive_ptr<DocumentSource> createFromBson(
             BSONElement elem,
-            const intrusive_ptr<ExpressionContext> &pExpCtx);
+            const boost::intrusive_ptr<ExpressionContext> &pExpCtx);
 
         static const char outName[];
 
     private:
         DocumentSourceOut(const NamespaceString& outputNs,
-                          const intrusive_ptr<ExpressionContext> &pExpCtx);
+                          const boost::intrusive_ptr<ExpressionContext> &pExpCtx);
 
         // Sets _tempsNs and prepares it to receive data.
         void prepTempCollection();
 
-        void spill(DBClientBase* conn, const vector<BSONObj>& toInsert);
+        void spill(DBClientBase* conn, const std::vector<BSONObj>& toInsert);
 
         bool _done;
 
@@ -714,8 +723,7 @@ namespace mongo {
     };
 
     
-    class DocumentSourceProject :
-        public DocumentSource {
+    class DocumentSourceProject : public DocumentSource {
     public:
         // virtuals from DocumentSource
         virtual boost::optional<Document> getNext();
@@ -735,9 +743,9 @@ namespace mongo {
           @param pExpCtx the expression context for the pipeline
           @returns the created projection
          */
-        static intrusive_ptr<DocumentSource> createFromBson(
+        static boost::intrusive_ptr<DocumentSource> createFromBson(
             BSONElement elem,
-            const intrusive_ptr<ExpressionContext> &pExpCtx);
+            const boost::intrusive_ptr<ExpressionContext> &pExpCtx);
 
         static const char projectName[];
 
@@ -745,18 +753,13 @@ namespace mongo {
         BSONObj getRaw() const { return _raw; }
 
     private:
-        DocumentSourceProject(const intrusive_ptr<ExpressionContext>& pExpCtx,
-                              const intrusive_ptr<ExpressionObject>& exprObj);
+        DocumentSourceProject(const boost::intrusive_ptr<ExpressionContext>& pExpCtx,
+                              const boost::intrusive_ptr<ExpressionObject>& exprObj);
 
         // configuration state
         boost::scoped_ptr<Variables> _variables;
-        intrusive_ptr<ExpressionObject> pEO;
+        boost::intrusive_ptr<ExpressionObject> pEO;
         BSONObj _raw;
-
-#if defined(_DEBUG)
-        // this is used in DEBUG builds to ensure we are compatible
-        Projection _simpleProjection;
-#endif
     };
 
     class DocumentSourceRedact :
@@ -768,15 +771,15 @@ namespace mongo {
 
         static const char redactName[];
 
-        static intrusive_ptr<DocumentSource> createFromBson(
+        static boost::intrusive_ptr<DocumentSource> createFromBson(
             BSONElement elem,
-            const intrusive_ptr<ExpressionContext>& expCtx);
+            const boost::intrusive_ptr<ExpressionContext>& expCtx);
 
         virtual Value serialize(bool explain = false) const;
 
     private:
-        DocumentSourceRedact(const intrusive_ptr<ExpressionContext>& expCtx,
-                             const intrusive_ptr<Expression>& previsit);
+        DocumentSourceRedact(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                             const boost::intrusive_ptr<Expression>& previsit);
 
         // These both work over _variables
         boost::optional<Document> redactObject(); // redacts CURRENT
@@ -784,7 +787,7 @@ namespace mongo {
 
         Variables::Id _currentId;
         boost::scoped_ptr<Variables> _variables;
-        intrusive_ptr<Expression> _expression;
+        boost::intrusive_ptr<Expression> _expression;
     };
 
     class DocumentSourceSort : public DocumentSource
@@ -793,14 +796,14 @@ namespace mongo {
         // virtuals from DocumentSource
         virtual boost::optional<Document> getNext();
         virtual const char *getSourceName() const;
-        virtual void serializeToArray(vector<Value>& array, bool explain = false) const;
-        virtual bool coalesce(const intrusive_ptr<DocumentSource> &pNextSource);
+        virtual void serializeToArray(std::vector<Value>& array, bool explain = false) const;
+        virtual bool coalesce(const boost::intrusive_ptr<DocumentSource> &pNextSource);
         virtual void dispose();
 
         virtual GetDepsReturn getDependencies(DepsTracker* deps) const;
 
-        virtual intrusive_ptr<DocumentSource> getShardSource();
-        virtual intrusive_ptr<DocumentSource> getMergeSource();
+        virtual boost::intrusive_ptr<DocumentSource> getShardSource();
+        virtual boost::intrusive_ptr<DocumentSource> getMergeSource();
 
         /**
           Add sort key field.
@@ -812,7 +815,7 @@ namespace mongo {
           @param ascending if true, use the key for an ascending sort,
             otherwise, use it for descending
         */
-        void addKey(const string &fieldPath, bool ascending);
+        void addKey(const std::string &fieldPath, bool ascending);
 
         /// Write out a Document whose contents are the sort key.
         Document serializeSortKey(bool explain) const;
@@ -828,25 +831,25 @@ namespace mongo {
           @param pExpCtx the expression context for the pipeline
           @returns the grouping DocumentSource
          */
-        static intrusive_ptr<DocumentSource> createFromBson(
+        static boost::intrusive_ptr<DocumentSource> createFromBson(
             BSONElement elem,
-            const intrusive_ptr<ExpressionContext> &pExpCtx);
+            const boost::intrusive_ptr<ExpressionContext> &pExpCtx);
 
         /// Create a DocumentSourceSort with a given sort and (optional) limit
-        static intrusive_ptr<DocumentSourceSort> create(
-            const intrusive_ptr<ExpressionContext> &pExpCtx,
+        static boost::intrusive_ptr<DocumentSourceSort> create(
+            const boost::intrusive_ptr<ExpressionContext> &pExpCtx,
             BSONObj sortOrder,
             long long limit=-1);
 
         /// returns -1 for no limit
         long long getLimit() const;
 
-        intrusive_ptr<DocumentSourceLimit> getLimitSrc() const { return limitSrc; }
+        boost::intrusive_ptr<DocumentSourceLimit> getLimitSrc() const { return limitSrc; }
 
         static const char sortName[];
 
     private:
-        DocumentSourceSort(const intrusive_ptr<ExpressionContext> &pExpCtx);
+        DocumentSourceSort(const boost::intrusive_ptr<ExpressionContext> &pExpCtx);
 
         virtual Value serialize(bool explain = false) const {
             verify(false); // should call addToBsonArray instead
@@ -868,13 +871,13 @@ namespace mongo {
         // not.
         class IteratorFromCursor;
         class IteratorFromBsonArray;
-        void populateFromCursors(const vector<DBClientCursor*>& cursors);
-        void populateFromBsonArrays(const vector<BSONArray>& arrays);
+        void populateFromCursors(const std::vector<DBClientCursor*>& cursors);
+        void populateFromBsonArrays(const std::vector<BSONArray>& arrays);
 
         /* these two parallel each other */
-        typedef vector<intrusive_ptr<Expression> > SortKey;
+        typedef std::vector<boost::intrusive_ptr<Expression> > SortKey;
         SortKey vSortKey;
-        vector<char> vAscending; // used like vector<bool> but without specialization
+        std::vector<char> vAscending; // used like std::vector<bool> but without specialization
 
         /// Extracts the fields in vSortKey from the Document;
         Value extractKey(const Document& d) const;
@@ -895,11 +898,11 @@ namespace mongo {
             const DocumentSourceSort& _source;
         };
 
-        intrusive_ptr<DocumentSourceLimit> limitSrc;
+        boost::intrusive_ptr<DocumentSourceLimit> limitSrc;
 
         bool _done;
         bool _mergingPresorted;
-        scoped_ptr<MySorter::Iterator> _output;
+        boost::scoped_ptr<MySorter::Iterator> _output;
     };
 
     class DocumentSourceLimit : public DocumentSource
@@ -908,7 +911,7 @@ namespace mongo {
         // virtuals from DocumentSource
         virtual boost::optional<Document> getNext();
         virtual const char *getSourceName() const;
-        virtual bool coalesce(const intrusive_ptr<DocumentSource> &pNextSource);
+        virtual bool coalesce(const boost::intrusive_ptr<DocumentSource> &pNextSource);
         virtual Value serialize(bool explain = false) const;
 
         virtual GetDepsReturn getDependencies(DepsTracker* deps) const {
@@ -921,14 +924,14 @@ namespace mongo {
           @param pExpCtx the expression context for the pipeline
           @returns the DocumentSource
          */
-        static intrusive_ptr<DocumentSourceLimit> create(
-            const intrusive_ptr<ExpressionContext> &pExpCtx,
+        static boost::intrusive_ptr<DocumentSourceLimit> create(
+            const boost::intrusive_ptr<ExpressionContext> &pExpCtx,
             long long limit);
 
         // Virtuals for SplittableDocumentSource
         // Need to run on rounter. Running on shard as well is an optimization.
-        virtual intrusive_ptr<DocumentSource> getShardSource() { return this; }
-        virtual intrusive_ptr<DocumentSource> getMergeSource() { return this; }
+        virtual boost::intrusive_ptr<DocumentSource> getShardSource() { return this; }
+        virtual boost::intrusive_ptr<DocumentSource> getMergeSource() { return this; }
 
         long long getLimit() const { return limit; }
         void setLimit(long long newLimit) { limit = newLimit; }
@@ -944,14 +947,14 @@ namespace mongo {
           @param pExpCtx the expression context
           @returns the grouping DocumentSource
          */
-        static intrusive_ptr<DocumentSource> createFromBson(
+        static boost::intrusive_ptr<DocumentSource> createFromBson(
             BSONElement elem,
-            const intrusive_ptr<ExpressionContext> &pExpCtx);
+            const boost::intrusive_ptr<ExpressionContext> &pExpCtx);
 
         static const char limitName[];
 
     private:
-        DocumentSourceLimit(const intrusive_ptr<ExpressionContext> &pExpCtx,
+        DocumentSourceLimit(const boost::intrusive_ptr<ExpressionContext> &pExpCtx,
                             long long limit);
 
         long long limit;
@@ -964,7 +967,7 @@ namespace mongo {
         // virtuals from DocumentSource
         virtual boost::optional<Document> getNext();
         virtual const char *getSourceName() const;
-        virtual bool coalesce(const intrusive_ptr<DocumentSource> &pNextSource);
+        virtual bool coalesce(const boost::intrusive_ptr<DocumentSource> &pNextSource);
         virtual Value serialize(bool explain = false) const;
 
         virtual GetDepsReturn getDependencies(DepsTracker* deps) const {
@@ -977,13 +980,13 @@ namespace mongo {
           @param pExpCtx the expression context
           @returns the DocumentSource
          */
-        static intrusive_ptr<DocumentSourceSkip> create(
-            const intrusive_ptr<ExpressionContext> &pExpCtx);
+        static boost::intrusive_ptr<DocumentSourceSkip> create(
+            const boost::intrusive_ptr<ExpressionContext> &pExpCtx);
 
         // Virtuals for SplittableDocumentSource
         // Need to run on rounter. Can't run on shards.
-        virtual intrusive_ptr<DocumentSource> getShardSource() { return NULL; }
-        virtual intrusive_ptr<DocumentSource> getMergeSource() { return this; }
+        virtual boost::intrusive_ptr<DocumentSource> getShardSource() { return NULL; }
+        virtual boost::intrusive_ptr<DocumentSource> getMergeSource() { return this; }
 
         long long getSkip() const { return _skip; }
         void setSkip(long long newSkip) { _skip = newSkip; }
@@ -999,14 +1002,14 @@ namespace mongo {
           @param pExpCtx the expression context
           @returns the grouping DocumentSource
          */
-        static intrusive_ptr<DocumentSource> createFromBson(
+        static boost::intrusive_ptr<DocumentSource> createFromBson(
             BSONElement elem,
-            const intrusive_ptr<ExpressionContext> &pExpCtx);
+            const boost::intrusive_ptr<ExpressionContext> &pExpCtx);
 
         static const char skipName[];
 
     private:
-        DocumentSourceSkip(const intrusive_ptr<ExpressionContext> &pExpCtx);
+        DocumentSourceSkip(const boost::intrusive_ptr<ExpressionContext> &pExpCtx);
 
         long long _skip;
         bool _needToSkip;
@@ -1033,24 +1036,24 @@ namespace mongo {
           @param pExpCtx the expression context for the pipeline
           @returns the created projection
          */
-        static intrusive_ptr<DocumentSource> createFromBson(
+        static boost::intrusive_ptr<DocumentSource> createFromBson(
             BSONElement elem,
-            const intrusive_ptr<ExpressionContext> &pExpCtx);
+            const boost::intrusive_ptr<ExpressionContext> &pExpCtx);
 
         static const char unwindName[];
 
     private:
-        DocumentSourceUnwind(const intrusive_ptr<ExpressionContext> &pExpCtx);
+        DocumentSourceUnwind(const boost::intrusive_ptr<ExpressionContext> &pExpCtx);
 
         /** Specify the field to unwind. */
         void unwindPath(const FieldPath &fieldPath);
 
         // Configuration state.
-        scoped_ptr<FieldPath> _unwindPath;
+        boost::scoped_ptr<FieldPath> _unwindPath;
 
         // Iteration state.
         class Unwinder;
-        scoped_ptr<Unwinder> _unwinder;
+        boost::scoped_ptr<Unwinder> _unwinder;
     };
 
     class DocumentSourceGeoNear : public DocumentSource
@@ -1061,28 +1064,28 @@ namespace mongo {
         virtual boost::optional<Document> getNext();
         virtual const char *getSourceName() const;
         virtual void setSource(DocumentSource *pSource);
-        virtual bool coalesce(const intrusive_ptr<DocumentSource> &pNextSource);
+        virtual bool coalesce(const boost::intrusive_ptr<DocumentSource> &pNextSource);
         virtual bool isValidInitialSource() const { return true; }
         virtual Value serialize(bool explain = false) const;
 
         // Virtuals for SplittableDocumentSource
-        virtual intrusive_ptr<DocumentSource> getShardSource();
-        virtual intrusive_ptr<DocumentSource> getMergeSource();
+        virtual boost::intrusive_ptr<DocumentSource> getShardSource();
+        virtual boost::intrusive_ptr<DocumentSource> getMergeSource();
 
-        static intrusive_ptr<DocumentSource> createFromBson(
+        static boost::intrusive_ptr<DocumentSource> createFromBson(
             BSONElement elem,
-            const intrusive_ptr<ExpressionContext> &pCtx);
+            const boost::intrusive_ptr<ExpressionContext> &pCtx);
 
         static char geoNearName[];
 
         long long getLimit() { return limit; }
 
         // this should only be used for testing
-        static intrusive_ptr<DocumentSourceGeoNear> create(
-            const intrusive_ptr<ExpressionContext> &pCtx);
+        static boost::intrusive_ptr<DocumentSourceGeoNear> create(
+            const boost::intrusive_ptr<ExpressionContext> &pCtx);
 
     private:
-        DocumentSourceGeoNear(const intrusive_ptr<ExpressionContext> &pExpCtx);
+        DocumentSourceGeoNear(const boost::intrusive_ptr<ExpressionContext> &pExpCtx);
 
         void parseOptions(BSONObj options);
         BSONObj buildGeoNearCmd() const;
@@ -1092,13 +1095,13 @@ namespace mongo {
         // coords and distanceField are required, rest are optional
         BSONObj coords; // "near" option, but near is a reserved keyword on windows
         bool coordsIsArray;
-        scoped_ptr<FieldPath> distanceField; // Using scoped_ptr because FieldPath can't be empty
+        boost::scoped_ptr<FieldPath> distanceField; // Using scoped_ptr because FieldPath can't be empty
         long long limit;
         double maxDistance;
         BSONObj query;
         bool spherical;
         double distanceMultiplier;
-        scoped_ptr<FieldPath> includeLocs;
+        boost::scoped_ptr<FieldPath> includeLocs;
         bool uniqueDocs;
 
         // these fields are used while processing the results

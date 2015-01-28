@@ -26,15 +26,20 @@
  *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+
 #include "mongo/db/query/canonical_query.h"
 
 #include "mongo/db/jsobj.h"
+#include "mongo/db/matcher/expression_array.h"
 #include "mongo/db/matcher/expression_geo.h"
-#include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/query/query_planner_common.h"
+#include "mongo/util/log.h"
+
 
 namespace {
 
+    using boost::shared_ptr;
     using std::auto_ptr;
     using std::string;
     using namespace mongo;
@@ -118,7 +123,6 @@ namespace {
         case MatchExpression::OR: return "or"; break;
         case MatchExpression::NOR: return "nr"; break;
         case MatchExpression::NOT: return "nt"; break;
-        case MatchExpression::ALL: return "al"; break;
         case MatchExpression::ELEM_MATCH_OBJECT: return "eo"; break;
         case MatchExpression::ELEM_MATCH_VALUE: return "ev"; break;
         case MatchExpression::SIZE: return "sz"; break;
@@ -151,31 +155,34 @@ namespace {
      * - CRS (flat or spherical)
      */
     void encodeGeoMatchExpression(const GeoMatchExpression* tree, mongoutils::str::stream* os) {
-        const GeoQuery& geoQuery = tree->getGeoQuery();
+        const GeoExpression& geoQuery = tree->getGeoExpression();
 
         // Type of geo query.
         switch (geoQuery.getPred()) {
-        case GeoQuery::WITHIN: *os << "wi"; break;
-        case GeoQuery::INTERSECT: *os << "in"; break;
-        case GeoQuery::INVALID: *os << "id"; break;
+        case GeoExpression::WITHIN: *os << "wi"; break;
+        case GeoExpression::INTERSECT: *os << "in"; break;
+        case GeoExpression::INVALID: *os << "id"; break;
         }
 
         // Geometry type.
         // Only one of the shared_ptrs in GeoContainer may be non-NULL.
-        const GeometryContainer& geoContainer = geoQuery.getGeometry();
-        if (NULL != geoContainer._point) { *os << "pt"; }
-        else if (NULL != geoContainer._line) { *os << "ln"; }
-        else if (NULL != geoContainer._polygon) { *os << "pl"; }
-        else if (NULL != geoContainer._cap ) { *os << "cc"; }
-        else if (NULL != geoContainer._multiPoint) { *os << "mp"; }
-        else if (NULL != geoContainer._multiLine) { *os << "ml"; }
-        else if (NULL != geoContainer._multiPolygon) { *os << "my"; }
-        else if (NULL != geoContainer._geometryCollection) { *os << "gc"; }
-        else { invariant(NULL != geoContainer._box); *os << "bx"; }
+        *os << geoQuery.getGeometry().getDebugType();
 
         // CRS (flat or spherical)
-        if (geoContainer.hasFlatRegion()) { *os << "fl"; }
-        else { invariant(geoContainer.hasS2Region()); *os << "sp"; }
+        if (FLAT == geoQuery.getGeometry().getNativeCRS()) {
+            *os << "fl";
+        }
+        else if (SPHERE == geoQuery.getGeometry().getNativeCRS()) {
+            *os << "sp";
+        }
+        else if (STRICT_SPHERE == geoQuery.getGeometry().getNativeCRS()) {
+            *os << "ss";
+        }
+        else {
+            error() << "unknown CRS type " << (int)geoQuery.getGeometry().getNativeCRS()
+                    << " in geometry of type " << geoQuery.getGeometry().getDebugType();
+            invariant(false);
+        }
     }
 
     /**
@@ -186,15 +193,21 @@ namespace {
      */
     void encodeGeoNearMatchExpression(const GeoNearMatchExpression* tree,
                                       mongoutils::str::stream* os) {
-        const NearQuery& nearQuery = tree->getData();
+        const GeoNearExpression& nearQuery = tree->getData();
 
         // isNearSphere
         *os << (nearQuery.isNearSphere ? "ns" : "nr");
 
-        // CRS (flat or spherical)
-        switch (nearQuery.centroid.crs) {
+        // CRS (flat or spherical or strict-winding spherical)
+        switch (nearQuery.centroid->crs) {
         case FLAT: *os << "fl"; break;
         case SPHERE: *os << "sp"; break;
+        case STRICT_SPHERE: *os << "ss"; break;
+        case UNSET:
+            error() << "unknown CRS type " << (int)nearQuery.centroid->crs
+                    << " in point geometry for near query";
+            invariant(false);
+            break;
         }
     }
 
@@ -310,48 +323,96 @@ namespace mongo {
     //
 
     // static
-    Status CanonicalQuery::canonicalize(const string& ns, const BSONObj& query,
-                                        CanonicalQuery** out) {
-        BSONObj emptyObj;
-        return CanonicalQuery::canonicalize(ns, query, emptyObj, emptyObj, 0, 0, out);
+    Status CanonicalQuery::canonicalize(const string& ns,
+                                        const BSONObj& query,
+                                        CanonicalQuery** out,
+                                        const MatchExpressionParser::WhereCallback& whereCallback) {
+        const BSONObj emptyObj;
+        return CanonicalQuery::canonicalize(
+                                    ns, query, emptyObj, emptyObj, 0, 0, out, whereCallback);
     }
 
     // static
-    Status CanonicalQuery::canonicalize(const string& ns, const BSONObj& query,
-                                        long long skip, long long limit,
-                                        CanonicalQuery** out) {
-        BSONObj emptyObj;
-        return CanonicalQuery::canonicalize(ns, query, emptyObj, emptyObj, skip, limit, out);
+    Status CanonicalQuery::canonicalize(const std::string& ns,
+                                        const BSONObj& query,
+                                        bool explain,
+                                        CanonicalQuery** out,
+                                        const MatchExpressionParser::WhereCallback& whereCallback) {
+        const BSONObj emptyObj;
+        return CanonicalQuery::canonicalize(ns,
+                                            query,
+                                            emptyObj, // sort
+                                            emptyObj, // projection
+                                            0, // skip
+                                            0, // limit
+                                            emptyObj, // hint
+                                            emptyObj, // min
+                                            emptyObj, // max
+                                            false, // snapshot
+                                            explain,
+                                            out,
+                                            whereCallback);
     }
 
     // static
-    Status CanonicalQuery::canonicalize(const string& ns, const BSONObj& query,
-                                        const BSONObj& sort, const BSONObj& proj,
-                                        CanonicalQuery** out) {
-        return CanonicalQuery::canonicalize(ns, query, sort, proj, 0, 0, out);
+    Status CanonicalQuery::canonicalize(const string& ns,
+                                        const BSONObj& query,
+                                        long long skip,
+                                        long long limit,
+                                        CanonicalQuery** out,
+                                        const MatchExpressionParser::WhereCallback& whereCallback) {
+        const BSONObj emptyObj;
+        return CanonicalQuery::canonicalize(ns, 
+                                            query, 
+                                            emptyObj, 
+                                            emptyObj, 
+                                            skip, 
+                                            limit, 
+                                            out,
+                                            whereCallback);
     }
 
     // static
-    Status CanonicalQuery::canonicalize(const string& ns, const BSONObj& query,
-                                        const BSONObj& sort, const BSONObj& proj,
-                                        long long skip, long long limit,
-                                        CanonicalQuery** out) {
-        BSONObj emptyObj;
-        return CanonicalQuery::canonicalize(ns, query, sort, proj, skip, limit, emptyObj, out);
+    Status CanonicalQuery::canonicalize(const string& ns,
+                                        const BSONObj& query,
+                                        const BSONObj& sort,
+                                        const BSONObj& proj,
+                                        CanonicalQuery** out,
+                                        const MatchExpressionParser::WhereCallback& whereCallback) {
+        return CanonicalQuery::canonicalize(ns, query, sort, proj, 0, 0, out, whereCallback);
     }
 
     // static
-    Status CanonicalQuery::canonicalize(const string& ns, const BSONObj& query,
-                                        const BSONObj& sort, const BSONObj& proj,
-                                        long long skip, long long limit,
+    Status CanonicalQuery::canonicalize(const string& ns,
+                                        const BSONObj& query,
+                                        const BSONObj& sort,
+                                        const BSONObj& proj,
+                                        long long skip,
+                                        long long limit,
+                                        CanonicalQuery** out,
+                                        const MatchExpressionParser::WhereCallback& whereCallback) {
+        const BSONObj emptyObj;
+        return CanonicalQuery::canonicalize(
+                            ns, query, sort, proj, skip, limit, emptyObj, out, whereCallback);
+    }
+
+    // static
+    Status CanonicalQuery::canonicalize(const string& ns,
+                                        const BSONObj& query,
+                                        const BSONObj& sort,
+                                        const BSONObj& proj,
+                                        long long skip,
+                                        long long limit,
                                         const BSONObj& hint,
-                                        CanonicalQuery** out) {
-        BSONObj emptyObj;
+                                        CanonicalQuery** out,
+                                        const MatchExpressionParser::WhereCallback& whereCallback) {
+        const BSONObj emptyObj;
         return CanonicalQuery::canonicalize(ns, query, sort, proj, skip, limit, hint,
                                             emptyObj, emptyObj,
                                             false, // snapshot
                                             false, // explain
-                                            out);
+                                            out,
+                                            whereCallback);
     }
 
     //
@@ -359,23 +420,34 @@ namespace mongo {
     //
 
     // static
-    Status CanonicalQuery::canonicalize(const QueryMessage& qm, CanonicalQuery** out) {
+    Status CanonicalQuery::canonicalize(const QueryMessage& qm,
+                                        CanonicalQuery** out,
+                                        const MatchExpressionParser::WhereCallback& whereCallback) {
         // Make LiteParsedQuery.
         LiteParsedQuery* lpq;
         Status parseStatus = LiteParsedQuery::make(qm, &lpq);
         if (!parseStatus.isOK()) { return parseStatus; }
 
+        return CanonicalQuery::canonicalize(lpq, out, whereCallback);
+    }
+
+    // static
+    Status CanonicalQuery::canonicalize(LiteParsedQuery* lpq,
+                                        CanonicalQuery** out,
+                                        const MatchExpressionParser::WhereCallback& whereCallback) {
+        auto_ptr<LiteParsedQuery> autoLpq(lpq);
+
         // Make MatchExpression.
-        StatusWithMatchExpression swme = MatchExpressionParser::parse(lpq->getFilter());
+        StatusWithMatchExpression swme = MatchExpressionParser::parse(autoLpq->getFilter(),
+                                                                      whereCallback);
         if (!swme.isOK()) {
-            delete lpq;
             return swme.getStatus();
         }
 
         // Make the CQ we'll hopefully return.
         auto_ptr<CanonicalQuery> cq(new CanonicalQuery());
         // Takes ownership of lpq and the MatchExpression* in swme.
-        Status initStatus = cq->init(lpq, swme.getValue());
+        Status initStatus = cq->init(autoLpq.release(), whereCallback, swme.getValue());
 
         if (!initStatus.isOK()) { return initStatus; }
         *out = cq.release();
@@ -385,7 +457,8 @@ namespace mongo {
     // static
     Status CanonicalQuery::canonicalize(const CanonicalQuery& baseQuery,
                                         MatchExpression* root,
-                                        CanonicalQuery** out) {
+                                        CanonicalQuery** out,
+                                        const MatchExpressionParser::WhereCallback& whereCallback) {
 
         LiteParsedQuery* lpq;
 
@@ -406,7 +479,7 @@ namespace mongo {
 
         // Make the CQ we'll hopefully return.
         auto_ptr<CanonicalQuery> cq(new CanonicalQuery());
-        Status initStatus = cq->init(lpq, root->shallowClone());
+        Status initStatus = cq->init(lpq, whereCallback, root->shallowClone());
 
         if (!initStatus.isOK()) { return initStatus; }
         *out = cq.release();
@@ -414,41 +487,51 @@ namespace mongo {
     }
 
     // static
-    Status CanonicalQuery::canonicalize(const string& ns, const BSONObj& query,
-                                        const BSONObj& sort, const BSONObj& proj,
-                                        long long skip, long long limit,
+    Status CanonicalQuery::canonicalize(const string& ns,
+                                        const BSONObj& query,
+                                        const BSONObj& sort,
+                                        const BSONObj& proj,
+                                        long long skip,
+                                        long long limit,
                                         const BSONObj& hint,
-                                        const BSONObj& minObj, const BSONObj& maxObj,
+                                        const BSONObj& minObj,
+                                        const BSONObj& maxObj,
                                         bool snapshot,
                                         bool explain,
-                                        CanonicalQuery** out) {
-        LiteParsedQuery* lpq;
+                                        CanonicalQuery** out,
+                                        const MatchExpressionParser::WhereCallback& whereCallback) {
+        LiteParsedQuery* lpqRaw;
         // Pass empty sort and projection.
         BSONObj emptyObj;
         Status parseStatus = LiteParsedQuery::make(ns, skip, limit, 0, query, proj, sort,
-                                                   hint, minObj, maxObj, snapshot, explain, &lpq);
+                                                   hint, minObj, maxObj, snapshot, explain,
+                                                   &lpqRaw);
         if (!parseStatus.isOK()) {
             return parseStatus;
         }
+        auto_ptr<LiteParsedQuery> lpq(lpqRaw);
 
         // Build a parse tree from the BSONObj in the parsed query.
-        StatusWithMatchExpression swme = MatchExpressionParser::parse(lpq->getFilter());
+        StatusWithMatchExpression swme = 
+                            MatchExpressionParser::parse(lpq->getFilter(), whereCallback);
         if (!swme.isOK()) {
-            delete lpq;
             return swme.getStatus();
         }
 
         // Make the CQ we'll hopefully return.
         auto_ptr<CanonicalQuery> cq(new CanonicalQuery());
         // Takes ownership of lpq and the MatchExpression* in swme.
-        Status initStatus = cq->init(lpq, swme.getValue());
+        Status initStatus = cq->init(lpq.release(), whereCallback, swme.getValue());
 
         if (!initStatus.isOK()) { return initStatus; }
         *out = cq.release();
         return Status::OK();
     }
 
-    Status CanonicalQuery::init(LiteParsedQuery* lpq, MatchExpression* root) {
+    Status CanonicalQuery::init(LiteParsedQuery* lpq,
+                                const MatchExpressionParser::WhereCallback& whereCallback,
+                                MatchExpression* root) {
+        _isForWrite = false;
         _pq.reset(lpq);
 
         // Normalize, sort and validate tree.
@@ -466,7 +549,8 @@ namespace mongo {
         // Validate the projection if there is one.
         if (!_pq->getProj().isEmpty()) {
             ParsedProjection* pp;
-            Status projStatus = ParsedProjection::make(_pq->getProj(), _root.get(), &pp);
+            Status projStatus = 
+                ParsedProjection::make(_pq->getProj(), _root.get(), &pp, whereCallback);
             if (!projStatus.isOK()) {
                 return projStatus;
             }
@@ -581,6 +665,12 @@ namespace mongo {
             // transfers ownership of its return value to 'nme'.
             nme->resetChild(normalizeTree(child));
         }
+        else if (MatchExpression::ELEM_MATCH_VALUE == root->matchType()) {
+            // Just normalize our children.
+            for (size_t i = 0; i < root->getChildVector()->size(); ++i) {
+                (*root->getChildVector())[i] = normalizeTree(root->getChild(i));
+            }
+        }
 
         return root;
     }
@@ -664,6 +754,21 @@ namespace mongo {
             }
             if (!topLevel) {
                 return Status(ErrorCodes::BadValue, "geoNear must be top-level expr");
+            }
+        }
+
+        // NEAR cannot have a $natural sort or $natural hint.
+        if (numGeoNear > 0) {
+            BSONObj sortObj = parsed.getSort();
+            if (!sortObj["$natural"].eoo()) {
+                return Status(ErrorCodes::BadValue,
+                              "geoNear expression not allowed with $natural sort order");
+            }
+
+            BSONObj hintObj = parsed.getHint();
+            if (!hintObj["$natural"].eoo()) {
+                return Status(ErrorCodes::BadValue,
+                              "geoNear expression not allowed with $natural hint");
             }
         }
 
@@ -762,7 +867,9 @@ namespace mongo {
         mongoutils::str::stream ss;
         ss << "query: " << _pq->getFilter().toString()
            << " sort: " << _pq->getSort().toString()
-           << " projection: " << _pq->getProj().toString();
+           << " projection: " << _pq->getProj().toString()
+           << " skip: " << _pq->getSkip()
+           << " limit: " << _pq->getNumToReturn();
         return ss;
     }
 

@@ -50,7 +50,7 @@ namespace mongo {
      *
      *     // Process the response.
      *     VersionType exampleType;
-     *     string errMsg;
+     *     std::string errMsg;
      *     if (!exampleType.parseBSON(exampleDoc, &errMsg) || !exampleType.isValid(&errMsg)) {
      *         // Can't use 'exampleType'. Take action.
      *     }
@@ -73,7 +73,6 @@ namespace mongo {
         static const BSONField<int> currentVersion;
         static const BSONField<BSONArray> excludingMongoVersions;
         static const BSONField<OID> clusterId;
-        static const BSONField<int> version_DEPRECATED;
         static const BSONField<OID> upgradeId;
         static const BSONField<BSONObj> upgradeState;
 
@@ -112,7 +111,7 @@ namespace mongo {
         void cloneTo(VersionType* other) const;
 
         /**
-         * Returns a string representation of the current internal state.
+         * Returns a std::string representation of the current internal state.
          */
         std::string toString() const;
 

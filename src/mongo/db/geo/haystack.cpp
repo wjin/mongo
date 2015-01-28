@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2008-2013 10gen Inc.
+ *    Copyright (C) 2008-2014 MongoDB Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -38,7 +38,6 @@
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/pdfile.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/commands.h"
 
@@ -51,6 +50,9 @@
  * Don't use when you want to find the closest open restaurants.
  */
 namespace mongo {
+
+    using std::string;
+    using std::vector;
 
     class GeoHaystackSearchCommand : public Command {
     public:
@@ -68,25 +70,20 @@ namespace mongo {
             out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
         }
 
-        bool run(const string& dbname, BSONObj& cmdObj, int,
+        bool run(OperationContext* txn, const string& dbname, BSONObj& cmdObj, int,
                  string& errmsg, BSONObjBuilder& result, bool fromRepl) {
-            const string ns = dbname + "." + cmdObj.firstElement().valuestr();
-            Client::ReadContext ctx(ns);
+            const std::string ns = parseNsCollectionRequired(dbname, cmdObj);
 
-            Database* db = ctx.ctx().db();
-            if ( !db ) {
-                errmsg = "can't find ns";
-                return false;
-            }
+            AutoGetCollectionForRead ctx(txn, ns);
 
-            Collection* collection = db->getCollection( ns );
+            Collection* collection = ctx.getCollection();
             if ( !collection ) {
                 errmsg = "can't find ns";
                 return false;
             }
 
             vector<IndexDescriptor*> idxs;
-            collection->getIndexCatalog()->findIndexByType(IndexNames::GEO_HAYSTACK, idxs);
+            collection->getIndexCatalog()->findIndexByType(txn, IndexNames::GEO_HAYSTACK, idxs);
             if (idxs.size() == 0) {
                 errmsg = "no geoSearch index";
                 return false;
@@ -111,7 +108,7 @@ namespace mongo {
             IndexDescriptor* desc = idxs[0];
             HaystackAccessMethod* ham =
                 static_cast<HaystackAccessMethod*>( collection->getIndexCatalog()->getIndex(desc) );
-            ham->searchCommand(nearElt.Obj(), maxDistance.numberDouble(), search.Obj(),
+            ham->searchCommand(txn, collection, nearElt.Obj(), maxDistance.numberDouble(), search.Obj(),
                                &result, limit);
             return 1;
         }

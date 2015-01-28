@@ -28,17 +28,20 @@
  *    then also delete it in the license file.
  */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
-#include "mongo/db/interrupt_status.h"
-#include "mongo/db/interrupt_status_mongod.h"
 #include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/field_path.h"
 #include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/operation_context_impl.h"
 #include "mongo/dbtests/dbtests.h"
 
 namespace PipelineTests {
+
+    using boost::intrusive_ptr;
+    using std::string;
+    using std::vector;
 
     namespace FieldPath {
 
@@ -252,8 +255,7 @@ namespace PipelineTests {
                     const BSONObj mergePipeExpected = pipelineFromJsonArray(mergePipeJson());
 
                     intrusive_ptr<ExpressionContext> ctx =
-                        new ExpressionContext(InterruptStatusMongod::status,
-                                              NamespaceString("a.collection"));
+                        new ExpressionContext(&_opCtx, NamespaceString("a.collection"));
                     string errmsg;
                     intrusive_ptr<Pipeline> mergePipe =
                         Pipeline::parseCommand(errmsg, inputBson, ctx);
@@ -270,6 +272,9 @@ namespace PipelineTests {
                 }
 
                 virtual ~Base() {};
+
+            private:
+                OperationContextImpl _opCtx;
             };
 
             // General test to make sure all optimizations support empty pipelines
@@ -432,6 +437,8 @@ namespace PipelineTests {
             add<Optimizations::Sharded::limitFieldsSentFromShardsToMerger::JustNeedsMetadata>();
             add<Optimizations::Sharded::limitFieldsSentFromShardsToMerger::ShardAlreadyExhaustive>();
         }
-    } myall;
-    
+    };
+
+    SuiteInstance<All> myall;
+
 } // namespace PipelineTests

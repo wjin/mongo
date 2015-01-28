@@ -26,13 +26,19 @@
 *    then also delete it in the license file.
 */
 
-#include "mongo/pch.h"
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+
+#include "mongo/platform/basic.h"
 
 #include "mongo/s/balance.h"
 
+#include <boost/scoped_ptr.hpp>
+
+#include "mongo/base/owned_pointer_map.h"
 #include "mongo/client/dbclientcursor.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/write_concern.h"
+#include "mongo/db/write_concern_options.h"
 #include "mongo/s/chunk.h"
 #include "mongo/s/cluster_write.h"
 #include "mongo/s/config.h"
@@ -41,14 +47,29 @@
 #include "mongo/s/grid.h"
 #include "mongo/s/server.h"
 #include "mongo/s/shard.h"
+#include "mongo/s/type_actionlog.h"
 #include "mongo/s/type_chunk.h"
 #include "mongo/s/type_collection.h"
 #include "mongo/s/type_mongos.h"
 #include "mongo/s/type_settings.h"
 #include "mongo/s/type_tags.h"
+#include "mongo/util/exit.h"
+#include "mongo/util/fail_point_service.h"
+#include "mongo/util/log.h"
+#include "mongo/util/timer.h"
 #include "mongo/util/version.h"
 
 namespace mongo {
+
+    using boost::scoped_ptr;
+    using std::auto_ptr;
+    using std::endl;
+    using std::map;
+    using std::set;
+    using std::string;
+    using std::vector;
+
+    MONGO_FP_DECLARE(skipBalanceRound);
 
     Balancer balancer;
 
@@ -58,7 +79,7 @@ namespace mongo {
     }
 
     int Balancer::_moveChunks(const vector<CandidateChunkPtr>* candidateChunks,
-                              bool secondaryThrottle,
+                              const WriteConcernOptions* writeConcern,
                               bool waitForDelete)
     {
         int movedCount = 0;
@@ -95,7 +116,7 @@ namespace mongo {
                 BSONObj res;
                 if (c->moveAndCommit(Shard::make(chunkInfo.to),
                                      Chunk::MaxChunkSize,
-                                     secondaryThrottle,
+                                     writeConcern,
                                      waitForDelete,
                                      0, /* maxTimeMS */
                                      res)) {
@@ -113,10 +134,10 @@ namespace mongo {
                     verify( cm );
                     c = cm->findIntersectingChunk( chunkInfo.chunk.min );
 
-                    log() << "forcing a split because migrate failed for size reasons" << endl;
+                    log() << "performing a split because migrate failed for size reasons";
 
-                    Status status = c->split( true /* atMedian */, NULL );
-                    log() << "forced split results: " << status << endl;
+                    Status status = c->split(Chunk::normal, NULL, NULL);
+                    log() << "split results: " << status << endl;
 
                     if ( !status.isOK() ) {
                         log() << "marking chunk as jumbo: " << c->toString() << endl;
@@ -147,6 +168,95 @@ namespace mongo {
                        false, // multi
                        WriteConcernOptions::Unacknowledged,
                        NULL );
+    }
+
+     /* 
+     * Builds the details object for the actionlog.
+     * Current formats for detail are:
+     * Success: {
+     *           "candidateChunks" : ,
+     *           "chunksMoved" : ,
+     *           "executionTimeMillis" : ,
+     *           "errorOccured" : false
+     *          }
+     * Failure: {
+     *           "executionTimeMillis" : ,
+     *           "errmsg" : ,
+     *           "errorOccured" : true
+     *          }
+     * @param didError, did this round end in an error?
+     * @param executionTime, the time this round took to run
+     * @param candidateChunks, the number of chunks identified to be moved
+     * @param chunksMoved, the number of chunks moved
+     * @param errmsg, the error message for this round
+     */
+
+    static BSONObj _buildDetails( bool didError, int executionTime,
+            int candidateChunks, int chunksMoved, const std::string& errmsg ) {
+
+        BSONObjBuilder builder;
+        builder.append("executionTimeMillis", executionTime);
+        builder.append("errorOccured", didError);
+
+        if ( didError ) {
+            builder.append("errmsg", errmsg);
+        } else {
+            builder.append("candidateChunks", candidateChunks);
+            builder.append("chunksMoved", chunksMoved);
+        }
+        return builder.obj();
+    }
+
+    /**
+     * Reports the result of the balancer round into config.actionlog
+     *
+     * @param actionLog, which contains the balancer round information to be logged
+     *
+     */
+
+    static void _reportRound( ActionLogType& actionLog) {
+        try {
+            ScopedDbConnection conn( configServer.getConnectionString(), 30 );
+
+            // send a copy of the message to the log in case it doesn't reach config.actionlog
+            actionLog.setTime(jsTime());
+
+            LOG(1) << "about to log balancer result: " << actionLog;
+
+            // The following method is not thread safe. However, there is only one balancer
+            // thread per mongos process. The create collection is a a no-op when the collection
+            // already exists
+            static bool createActionlog = false;
+            if ( ! createActionlog ) {
+                try {
+                    static const int actionLogSizeBytes = 1024 * 1024 * 2;
+                    conn->createCollection( ActionLogType::ConfigNS , actionLogSizeBytes , true );
+                }
+                catch ( const DBException& ex ) {
+                    LOG(1) << "config.actionlog could not be created, another mongos process "
+                           << "may have done so" << causedBy(ex);
+
+                }
+                createActionlog = true;
+            }
+
+            Status result = clusterInsert( ActionLogType::ConfigNS,
+                                           actionLog.toBSON(),
+                                           WriteConcernOptions::AllConfigs,
+                                           NULL );
+
+            if ( !result.isOK() ) {
+                log() << "Error encountered while logging action from balancer "
+                      << result.reason();
+            }
+
+            conn.done();
+        }
+        catch ( const DBException& ex ) {
+            // if we got here, it means the config change is only in the log;
+            // the change didn't make it to config.actionlog
+            warning() << "could not log balancer result" << causedBy(ex);
+        }
     }
 
     bool Balancer::_checkOIDs() {
@@ -246,26 +356,19 @@ namespace mongo {
         // TODO: skip unresponsive shards and mark information as stale.
         //
 
-        vector<Shard> allShards;
-        Shard::getAllShards( allShards );
-        if ( allShards.size() < 2) {
-            LOG(1) << "can't balance without more active shards" << endl;
+        ShardInfoMap shardInfo;
+        Status loadStatus = DistributionStatus::populateShardInfoMap(&shardInfo);
+
+        if (!loadStatus.isOK()) {
+            warning() << "failed to load shard metadata" << causedBy(loadStatus);
+            return;
+        }
+
+        if (shardInfo.size() < 2) {
+            LOG(1) << "can't balance without more active shards";
             return;
         }
         
-        ShardInfoMap shardInfo;
-        for ( vector<Shard>::const_iterator it = allShards.begin(); it != allShards.end(); ++it ) {
-            const Shard& s = *it;
-            ShardStatus status = s.getStatus();
-            shardInfo[ s.getName() ] = ShardInfo( s.getMaxSize(),
-                                                  status.mapped(),
-                                                  s.isDraining(),
-                                                  status.hasOpsQueued(),
-                                                  s.tags(),
-                                                  status.mongoVersion()
-                                                  );
-        }
-
         OCCASIONALLY warnOnMultiVersion( shardInfo );
 
         //
@@ -275,32 +378,51 @@ namespace mongo {
         for (vector<string>::const_iterator it = collections.begin(); it != collections.end(); ++it ) {
             const string& ns = *it;
 
-            map< string,vector<BSONObj> > shardToChunksMap;
+            OwnedPointerMap<string, OwnedPointerVector<ChunkType> > shardToChunksMap;
             cursor = conn.query(ChunkType::ConfigNS,
                                 QUERY(ChunkType::ns(ns)).sort(ChunkType::min()));
 
             set<BSONObj> allChunkMinimums;
 
             while ( cursor->more() ) {
-                BSONObj chunk = cursor->nextSafe().getOwned();
-                vector<BSONObj>& chunks = shardToChunksMap[chunk[ChunkType::shard()].String()];
-                allChunkMinimums.insert( chunk[ChunkType::min()].Obj() );
-                chunks.push_back( chunk );
+                BSONObj chunkDoc = cursor->nextSafe().getOwned();
+
+                auto_ptr<ChunkType> chunk(new ChunkType());
+                string errmsg;
+                if (!chunk->parseBSON(chunkDoc, &errmsg)) {
+                    error() << "bad chunk format for " << chunkDoc
+                            << ": " << errmsg << endl;
+                    return;
+                }
+
+                allChunkMinimums.insert(chunk->getMin().getOwned());
+                OwnedPointerVector<ChunkType>*& chunkList =
+                        shardToChunksMap.mutableMap()[chunk->getShard()];
+
+                if (chunkList == NULL) {
+                    chunkList = new OwnedPointerVector<ChunkType>();
+                }
+
+                chunkList->mutableVector().push_back(chunk.release());
             }
             cursor.reset();
 
-            if (shardToChunksMap.empty()) {
+            if (shardToChunksMap.map().empty()) {
                 LOG(1) << "skipping empty collection (" << ns << ")";
                 continue;
             }
 
-            for ( vector<Shard>::iterator i=allShards.begin(); i!=allShards.end(); ++i ) {
+            for (ShardInfoMap::const_iterator i = shardInfo.begin(); i != shardInfo.end(); ++i) {
                 // this just makes sure there is an entry in shardToChunksMap for every shard
-                Shard s = *i;
-                shardToChunksMap[s.getName()].size();
+                OwnedPointerVector<ChunkType>*& chunkList =
+                        shardToChunksMap.mutableMap()[i->first];
+
+                if (chunkList == NULL) {
+                    chunkList = new OwnedPointerVector<ChunkType>();
+                }
             }
 
-            DistributionStatus status( shardInfo, shardToChunksMap );
+            DistributionStatus status(shardInfo, shardToChunksMap.map());
 
             // load tags
             Status result = clusterCreateIndex(TagsType::ConfigNS,
@@ -351,7 +473,7 @@ namespace mongo {
             for ( unsigned i = 0; i < ranges.size(); i++ ) {
                 BSONObj min = ranges[i].min;
 
-                min = cm->getShardKey().extendRangeBound( min, false );
+                min = cm->getShardKeyPattern().getKeyPattern().extendRangeBound( min, false );
 
                 if ( allChunkMinimums.count( min ) > 0 )
                     continue;
@@ -366,7 +488,7 @@ namespace mongo {
                 vector<BSONObj> splitPoints;
                 splitPoints.push_back( min );
 
-                Status status = c->multiSplit( splitPoints );
+                Status status = c->multiSplit(splitPoints, NULL);
                 if ( !status.isOK() ) {
                     error() << "split failed: " << status << endl;
                 }
@@ -431,7 +553,7 @@ namespace mongo {
             break;
         }
 
-        int sleepTime = 30;
+        int sleepTime = 10;
 
         // getConnectioString and dist lock constructor does not throw, which is what we expect on while
         // on the balancer thread
@@ -440,6 +562,12 @@ namespace mongo {
 
         while ( ! inShutdown() ) {
 
+            Timer balanceRoundTimer;
+            ActionLogType actionLog;
+
+            actionLog.setServer(getHostNameCached());
+            actionLog.setWhat("balancer.round");
+
             try {
 
                 ScopedDbConnection conn(config.toString(), 30);
@@ -447,15 +575,27 @@ namespace mongo {
                 // ping has to be first so we keep things in the config server in sync
                 _ping();
 
+                BSONObj balancerResult;
+
                 // use fresh shard state
                 Shard::reloadShardInfo();
 
                 // refresh chunk size (even though another balancer might be active)
                 Chunk::refreshChunkSize();
 
-                BSONObj balancerConfig;
+                SettingsType balancerConfig;
+                string errMsg;
+
+                if (!grid.getBalancerSettings(&balancerConfig, &errMsg)) {
+                    warning() << errMsg;
+                    return ;
+                }
+
                 // now make sure we should even be running
-                if ( ! grid.shouldBalance( "", &balancerConfig ) ) {
+                if ((balancerConfig.isKeySet() && // balancer config doc exists
+                        !grid.shouldBalance(balancerConfig)) ||
+                        MONGO_FAIL_POINT(skipBalanceRound)) {
+
                     LOG(1) << "skipping balancing round because balancing is disabled" << endl;
 
                     // Ping again so scripts can determine if we're active without waiting
@@ -467,9 +607,6 @@ namespace mongo {
                     continue;
                 }
 
-                sleepTime = balancerConfig[SettingsType::shortBalancerSleep()].trueValue() ? 30 :
-                                                                                             6;
-                
                 uassert( 13258 , "oids broken after resetting!" , _checkOIDs() );
 
                 {
@@ -494,20 +631,26 @@ namespace mongo {
                         continue;
                     }
 
-                    LOG(1) << "*** start balancing round" << endl;
+                    const bool waitForDelete = (balancerConfig.isWaitForDeleteSet() ?
+                            balancerConfig.getWaitForDelete() : false);
 
-                    bool waitForDelete = false;
-                    if (balancerConfig["_waitForDelete"].trueValue()) {
-                        waitForDelete = balancerConfig["_waitForDelete"].trueValue();
+                    scoped_ptr<WriteConcernOptions> writeConcern;
+                    if (balancerConfig.isKeySet()) { // if balancer doc exists.
+                        StatusWith<WriteConcernOptions*> extractStatus =
+                                balancerConfig.extractWriteConcern();
+                        if (extractStatus.isOK()) {
+                            writeConcern.reset(extractStatus.getValue());
+                        }
+                        else {
+                            warning() << extractStatus.toString();
+                        }
                     }
 
-                    bool secondaryThrottle = true; // default to on
-                    if ( balancerConfig[SettingsType::secondaryThrottle()].type() ) {
-                        secondaryThrottle = balancerConfig[SettingsType::secondaryThrottle()].trueValue();
-                    }
-
-                    LOG(1) << "waitForDelete: " << waitForDelete << endl;
-                    LOG(1) << "secondaryThrottle: " << secondaryThrottle << endl;
+                    LOG(1) << "*** start balancing round. "
+                           << "waitForDelete: " << waitForDelete
+                           << ", secondaryThrottle: "
+                           << (writeConcern.get() ? writeConcern->toBSON().toString() : "default")
+                           << endl;
 
                     vector<CandidateChunkPtr> candidateChunks;
                     _doBalanceRound( conn.conn() , &candidateChunks );
@@ -517,9 +660,14 @@ namespace mongo {
                     }
                     else {
                         _balancedLastTime = _moveChunks(&candidateChunks,
-                                                        secondaryThrottle,
+                                                        writeConcern.get(),
                                                         waitForDelete );
                     }
+
+                    actionLog.setDetails( _buildDetails( false, balanceRoundTimer.millis(),
+                        static_cast<int>(candidateChunks.size()), _balancedLastTime, "") );
+
+                    _reportRound( actionLog );
 
                     LOG(1) << "*** end of balancing round" << endl;
                 }
@@ -529,13 +677,19 @@ namespace mongo {
                 
                 conn.done();
 
-                sleepsecs( _balancedLastTime ? sleepTime / 6 : sleepTime );
+                sleepsecs( _balancedLastTime ? sleepTime / 10 : sleepTime );
             }
             catch ( std::exception& e ) {
                 log() << "caught exception while doing balance: " << e.what() << endl;
 
                 // Just to match the opening statement if in log level 1
                 LOG(1) << "*** End of balancing round" << endl;
+
+                // This round failed, tell the world!
+                actionLog.setDetails( _buildDetails( true, balanceRoundTimer.millis(),
+                    0, 0, e.what()) );
+
+                _reportRound( actionLog );
 
                 sleepsecs( sleepTime ); // sleep a fair amount b/c of error
                 continue;

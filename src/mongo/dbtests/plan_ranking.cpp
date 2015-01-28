@@ -30,14 +30,18 @@
  * This file tests db/query/plan_ranker.cpp and db/query/multi_plan_runner.cpp.
  */
 
+#include <boost/scoped_ptr.hpp>
+#include <iostream>
+
 #include "mongo/client/dbclientcursor.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/exec/multi_plan.h"
 #include "mongo/db/index/index_descriptor.h"
-#include "mongo/db/instance.h"
 #include "mongo/db/json.h"
-#include "mongo/db/query/multi_plan_runner.h"
-#include "mongo/db/query/get_runner.h"
+#include "mongo/db/operation_context_impl.h"
+#include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/qlog.h"
 #include "mongo/db/query/query_knobs.h"
 #include "mongo/db/query/query_planner.h"
@@ -45,37 +49,50 @@
 #include "mongo/db/query/stage_builder.h"
 #include "mongo/dbtests/dbtests.h"
 
+
 namespace mongo {
 
     // How we access the external setParameter testing bool.
     extern bool internalQueryForceIntersectionPlans;
 
+    extern bool internalQueryPlannerEnableHashIntersection;
+
 }  // namespace mongo
 
 namespace PlanRankingTests {
+
+    using boost::scoped_ptr;
+    using std::vector;
 
     static const char* ns = "unittests.PlanRankingTests";
 
     class PlanRankingTestBase {
     public:
-        PlanRankingTestBase() : _internalQueryForceIntersectionPlans(internalQueryForceIntersectionPlans) {
-            Client::WriteContext ctx(ns);
+        PlanRankingTestBase()
+            : _internalQueryForceIntersectionPlans(internalQueryForceIntersectionPlans),
+              _enableHashIntersection(internalQueryPlannerEnableHashIntersection),
+              _client(&_txn) {
+
+            // Run all tests with hash-based intersection enabled.
+            internalQueryPlannerEnableHashIntersection = true;
+
+            Client::WriteContext ctx(&_txn, ns);
             _client.dropCollection(ns);
         }
 
         virtual ~PlanRankingTestBase() {
-            // Restore external setParameter testing bool.
+            // Restore external setParameter testing bools.
             internalQueryForceIntersectionPlans = _internalQueryForceIntersectionPlans;
+            internalQueryPlannerEnableHashIntersection = _enableHashIntersection;
         }
 
         void insert(const BSONObj& obj) {
-            Client::WriteContext ctx(ns);
+            Client::WriteContext ctx(&_txn, ns);
             _client.insert(ns, obj);
         }
 
         void addIndex(const BSONObj& obj) {
-            Client::WriteContext ctx(ns);
-            _client.ensureIndex(ns, obj);
+            ASSERT_OK(dbtests::createIndex(&_txn, ns, obj));
         }
 
         /**
@@ -85,11 +102,11 @@ namespace PlanRankingTests {
          * Takes ownership of 'cq'.  Caller DOES NOT own the returned QuerySolution*.
          */
         QuerySolution* pickBestPlan(CanonicalQuery* cq) {
-            Client::ReadContext ctx(ns);
-            Collection* collection = ctx.ctx().db()->getCollection(ns);
+            AutoGetCollectionForRead ctx(&_txn, ns);
+            Collection* collection = ctx.getCollection();
 
             QueryPlannerParams plannerParams;
-            fillOutPlannerParams(collection, cq, &plannerParams);
+            fillOutPlannerParams(&_txn, collection, cq, &plannerParams);
             // Turn this off otherwise it pops up in some plans.
             plannerParams.options &= ~QueryPlannerParams::KEEP_MUTATIONS;
 
@@ -101,33 +118,33 @@ namespace PlanRankingTests {
             ASSERT_GREATER_THAN_OR_EQUALS(solutions.size(), 1U);
 
             // Fill out the MPR.
-            _mpr.reset(new MultiPlanRunner(collection, cq));
-
+            _mps.reset(new MultiPlanStage(&_txn, collection, cq));
+            boost::scoped_ptr<WorkingSet> ws(new WorkingSet());
             // Put each solution from the planner into the MPR.
             for (size_t i = 0; i < solutions.size(); ++i) {
-                WorkingSet* ws;
                 PlanStage* root;
-                ASSERT(StageBuilder::build(collection, *solutions[i], &root, &ws));
-                // Takes ownership of all arguments.
-                _mpr->addPlan(solutions[i], root, ws);
+                ASSERT(StageBuilder::build(&_txn, collection, *solutions[i], ws.get(), &root));
+                // Takes ownership of all (actually some) arguments.
+                _mps->addPlan(solutions[i], root, ws.get());
             }
+            // This is what sets a backup plan, should we test for it. NULL means that there
+            // is no yield policy for this MultiPlanStage's plan selection.
+            _mps->pickBestPlan(NULL);
+            ASSERT(_mps->bestPlanChosen());
 
-            // And return a pointer to the best solution.  The MPR owns the pointer.
-            size_t bestPlan = numeric_limits<size_t>::max();
-            BSONObj unused;
-            ASSERT(_mpr->pickBestPlan(&bestPlan, &unused));
-            ASSERT_LESS_THAN(bestPlan, solutions.size());
-            // This is what sets a backup plan, should we test for it.
-            _mpr->cacheBestPlan();
-            return solutions[bestPlan];
+            size_t bestPlanIdx = _mps->bestPlanIdx();
+            ASSERT_LESS_THAN(bestPlanIdx, solutions.size());
+
+            // And return a pointer to the best solution.
+            return _mps->bestSolution();
         }
 
         /**
          * Was a backup plan picked during the ranking process?
          */
         bool hasBackupPlan() const {
-            ASSERT(NULL != _mpr.get());
-            return _mpr->hasBackupPlan();
+            ASSERT(NULL != _mps.get());
+            return _mps->hasBackupPlan();
         }
 
     protected:
@@ -136,15 +153,21 @@ namespace PlanRankingTests {
         // determining the number of documents in the tests below.
         static const int N;
 
+        OperationContextImpl _txn;
+
     private:
-        static DBDirectClient _client;
-        scoped_ptr<MultiPlanRunner> _mpr;
         // Holds the value of global "internalQueryForceIntersectionPlans" setParameter flag.
         // Restored at end of test invocation regardless of test result.
         bool _internalQueryForceIntersectionPlans;
-    };
 
-    DBDirectClient PlanRankingTestBase::_client;
+        // Holds the value of the global set parameter so it can be restored at the end
+        // of the test.
+        bool _enableHashIntersection;
+
+        scoped_ptr<MultiPlanStage> _mps;
+
+        DBDirectClient _client;
+    };
 
     // static
     const int PlanRankingTestBase::N = internalQueryPlanEvaluationWorks + 1000;
@@ -168,6 +191,7 @@ namespace PlanRankingTests {
             CanonicalQuery* cq;
             verify(CanonicalQuery::canonicalize(ns, BSON("a" << 100 << "b" << 1), &cq).isOK());
             ASSERT(NULL != cq);
+            boost::scoped_ptr<CanonicalQuery> killCq(cq);
 
             // {a:100} is super selective so choose that.
             // Takes ownership of cq.
@@ -182,6 +206,7 @@ namespace PlanRankingTests {
 
             // And run the same query again.
             ASSERT(CanonicalQuery::canonicalize(ns, BSON("a" << 100 << "b" << 1), &cq).isOK());
+            boost::scoped_ptr<CanonicalQuery> killCq2(cq);
 
             // With the "ranking picks ixisect always" option we pick an intersection plan that uses
             // both the {a:1} and {b:1} indices even though it performs poorly.
@@ -189,7 +214,7 @@ namespace PlanRankingTests {
             // Takes ownership of cq.
             soln = pickBestPlan(cq);
             ASSERT(QueryPlannerTestLib::solutionMatches(
-                             "{fetch: {filter: null, node: {andSorted: {nodes: ["
+                             "{fetch: {node: {andSorted: {nodes: ["
                                      "{ixscan: {filter: null, pattern: {a:1}}},"
                                      "{ixscan: {filter: null, pattern: {b:1}}}]}}}}",
                              soln->root.get()));
@@ -216,6 +241,7 @@ namespace PlanRankingTests {
             verify(CanonicalQuery::canonicalize(ns, BSON("a" << 1 << "b" << BSON("$gt" << 1)),
                                                 &cq).isOK());
             ASSERT(NULL != cq);
+            boost::scoped_ptr<CanonicalQuery> killCq(cq);
 
             // Turn on the "force intersect" option.
             // This will be reverted by PlanRankingTestBase's destructor when the test completes.
@@ -224,7 +250,7 @@ namespace PlanRankingTests {
             // Takes ownership of cq.
             QuerySolution* soln = pickBestPlan(cq);
             ASSERT(QueryPlannerTestLib::solutionMatches(
-                             "{fetch: {filter: null, node: {andHash: {nodes: ["
+                             "{fetch: {node: {andHash: {nodes: ["
                                      "{ixscan: {filter: null, pattern: {a:1}}},"
                                      "{ixscan: {filter: null, pattern: {b:1}}}]}}}}",
                              soln->root.get()));
@@ -258,6 +284,7 @@ namespace PlanRankingTests {
                                                 BSON("_id" << 0 << "a" << 1 << "b" << 1),
                                                 &cq).isOK());
             ASSERT(NULL != cq);
+            boost::scoped_ptr<CanonicalQuery> killCq(cq);
 
             // Takes ownership of cq.
             QuerySolution* soln = pickBestPlan(cq);
@@ -291,6 +318,7 @@ namespace PlanRankingTests {
             BSONObj queryObj = BSON("a" << 1 << "b" << 1 << "c" << 99);
             ASSERT(CanonicalQuery::canonicalize(ns, queryObj, &cq).isOK());
             ASSERT(NULL != cq);
+            boost::scoped_ptr<CanonicalQuery> killCq(cq);
 
             // Takes ownership of cq.
             QuerySolution* soln = pickBestPlan(cq);
@@ -333,6 +361,7 @@ namespace PlanRankingTests {
                                                 BSON("_id" << 0 << "a" << 1 << "b" << 1),
                                                 &cq).isOK());
             ASSERT(NULL != cq);
+            boost::scoped_ptr<CanonicalQuery> killCq(cq);
 
             // Takes ownership of cq.
             QuerySolution* soln = pickBestPlan(cq);
@@ -364,6 +393,44 @@ namespace PlanRankingTests {
             CanonicalQuery* cq;
             verify(CanonicalQuery::canonicalize(ns, BSON("a" << N + 1 << "b" << 1), &cq).isOK());
             ASSERT(NULL != cq);
+            boost::scoped_ptr<CanonicalQuery> killCq(cq);
+
+            // {a: 100} is super selective so choose that.
+            // Takes ownership of cq.
+            QuerySolution* soln = pickBestPlan(cq);
+            ASSERT(QueryPlannerTestLib::solutionMatches(
+                        "{fetch: {filter: {b:1}, node: {ixscan: {pattern: {a: 1}}}}}",
+                        soln->root.get()));
+        }
+    };
+
+    /**
+     * Same as PlanRankingPreferImmediateEOF, but substitute a range predicate on "a" for the
+     * equality predicate on "a".  The presence of the range predicate has an impact on the
+     * intersection plan that is raced against the single-index plans: since "a" no longer generates
+     * point interval bounds, the results of the index scan aren't guaranteed to be returned in
+     * RecordId order, and so the intersection plan uses the AND_HASHED stage instead of the
+     * AND_SORTED stage.  It is still the case that the query should pick the plan that uses index
+     * "b", instead of the plan that uses index "a" or the (hashed) intersection plan.
+     */
+    class PlanRankingPreferImmediateEOFAgainstHashed : public PlanRankingTestBase {
+    public:
+        void run() {
+            // 'a' is very selective, 'b' is not.
+            for (int i = 0; i < N; ++i) {
+                insert(BSON("a" << i << "b" << 1));
+            }
+
+            // Add indices on 'a' and 'b'.
+            addIndex(BSON("a" << 1));
+            addIndex(BSON("b" << 1));
+
+            // Run the query {a:N+1, b:1}.  (No such document.)
+            CanonicalQuery* cq;
+            verify(CanonicalQuery::canonicalize(ns, BSON("a" << BSON("$gte" << N + 1)
+                                                             << "b" << 1), &cq).isOK());
+            ASSERT(NULL != cq);
+            boost::scoped_ptr<CanonicalQuery> killCq(cq);
 
             // {a: 100} is super selective so choose that.
             // Takes ownership of cq.
@@ -398,6 +465,7 @@ namespace PlanRankingTests {
                                                 sortObj,
                                                 projObj,
                                                 &cq).isOK());
+            boost::scoped_ptr<CanonicalQuery> killCq(cq);
 
             // Takes ownership of cq.
             QuerySolution* soln = pickBestPlan(cq);
@@ -426,6 +494,7 @@ namespace PlanRankingTests {
             CanonicalQuery* cq;
             verify(CanonicalQuery::canonicalize(ns, BSON("foo" << 2001), &cq).isOK());
             ASSERT(NULL != cq);
+            boost::scoped_ptr<CanonicalQuery> killCq(cq);
 
             // Takes ownership of cq.
             QuerySolution* soln = pickBestPlan(cq);
@@ -462,6 +531,7 @@ namespace PlanRankingTests {
                                                 BSON("_id" << 0 << "a" << 1 << "b" << 1),
                                                 &cq).isOK());
             ASSERT(NULL != cq);
+            boost::scoped_ptr<CanonicalQuery> killCq(cq);
 
             // We should choose an ixisect plan because it requires fewer fetches.
             // Takes ownership of cq.
@@ -498,6 +568,7 @@ namespace PlanRankingTests {
                                                 BSON("a" << 1 << "b" << 1),
                                                 &cq).isOK());
             ASSERT(NULL != cq);
+            boost::scoped_ptr<CanonicalQuery> killCq(cq);
 
             // The intersection is large, and ixisect does not make the
             // query covered. We should NOT choose an intersection plan.
@@ -549,10 +620,11 @@ namespace PlanRankingTests {
                                                 fromjson("{a: 1, b: 1}"),
                                                 &cq).isOK());
             ASSERT(NULL != cq);
+            boost::scoped_ptr<CanonicalQuery> killCq(cq);
 
             QuerySolution* soln = pickBestPlan(cq);
             ASSERT(QueryPlannerTestLib::solutionMatches(
-                "{fetch: {filter: null, node: {andSorted: {nodes: ["
+                "{fetch: {node: {andSorted: {nodes: ["
                     "{ixscan: {filter: null, pattern: {a:1}}},"
                     "{ixscan: {filter: null, pattern: {b:1}}}]}}}}",
                 soln->root.get()));
@@ -589,11 +661,12 @@ namespace PlanRankingTests {
                                                 fromjson("{a: 1, b: 1}"),
                                                 &cq).isOK());
             ASSERT(NULL != cq);
+            boost::scoped_ptr<CanonicalQuery> killCq(cq);
 
             // Choose the index intersection plan.
             QuerySolution* soln = pickBestPlan(cq);
             ASSERT(QueryPlannerTestLib::solutionMatches(
-                "{fetch: {filter: null, node: {andSorted: {nodes: ["
+                "{fetch: {node: {andSorted: {nodes: ["
                     "{ixscan: {filter: null, pattern: {a:1}}},"
                     "{ixscan: {filter: null, pattern: {b:1}}}]}}}}",
                 soln->root.get()));
@@ -631,12 +704,13 @@ namespace PlanRankingTests {
                                                 fromjson("{a: 1, b: 1, c: 1}"),
                                                 &cq).isOK());
             ASSERT(NULL != cq);
+            boost::scoped_ptr<CanonicalQuery> killCq(cq);
 
             // Intersection between 'b' and 'c' should hit EOF while the
             // other plans are busy fetching documents.
             QuerySolution* soln = pickBestPlan(cq);
             ASSERT(QueryPlannerTestLib::solutionMatches(
-                "{fetch: {filter: {a:1}, node: {andSorted: {nodes: ["
+                "{fetch: {node: {andSorted: {nodes: ["
                     "{ixscan: {filter: null, pattern: {b:1}}},"
                     "{ixscan: {filter: null, pattern: {c:1}}}]}}}}",
                 soln->root.get()));
@@ -668,6 +742,7 @@ namespace PlanRankingTests {
                                                 BSONObj(), // projection
                                                 &cq).isOK());
             ASSERT(NULL != cq);
+            boost::scoped_ptr<CanonicalQuery> killCq(cq);
 
             // No results will be returned during the trial period,
             // so we expect to choose {d: 1, e: 1}, as it allows us
@@ -704,11 +779,45 @@ namespace PlanRankingTests {
                                                 fromjson("{a: 1, b: 1, c: {$gte: 5000}}"),
                                                 &cq).isOK());
             ASSERT(NULL != cq);
+            boost::scoped_ptr<CanonicalQuery> killCq(cq);
 
             // Use index on 'b'.
             QuerySolution* soln = pickBestPlan(cq);
             ASSERT(QueryPlannerTestLib::solutionMatches(
                         "{fetch: {node: {ixscan: {pattern: {b: 1}}}}}",
+                        soln->root.get()));
+        }
+    };
+
+    /**
+     * Suppose we have two plans which are roughly equivalent, other than that
+     * one uses an index which involves doing a lot more skipping of index keys.
+     * Prefer the plan which does not have to do this index key skipping.
+     */
+    class PlanRankingAccountForKeySkips : public PlanRankingTestBase {
+    public:
+        void run() {
+            for (int i = 0; i < 100; ++i) {
+                insert(BSON("a" << i << "b" << i << "c" << i));
+            }
+
+            // These indices look equivalent to the ranker for the query below unless we account
+            // for key skipping. We should pick index {a: 1} if we account for key skipping
+            // properly.
+            addIndex(BSON("b" << 1 << "c" << 1));
+            addIndex(BSON("a" << 1));
+
+            CanonicalQuery* cq;
+            ASSERT(CanonicalQuery::canonicalize(ns,
+                                                fromjson("{a: 9, b: {$ne: 10}, c: 9}"),
+                                                &cq).isOK());
+            ASSERT(NULL != cq);
+            boost::scoped_ptr<CanonicalQuery> killCq(cq);
+
+            // Expect to use index {a: 1, b: 1}.
+            QuerySolution* soln = pickBestPlan(cq);
+            ASSERT(QueryPlannerTestLib::solutionMatches(
+                        "{fetch: {node: {ixscan: {pattern: {a: 1}}}}}",
                         soln->root.get()));
         }
     };
@@ -724,6 +833,7 @@ namespace PlanRankingTests {
             add<PlanRankingAvoidIntersectIfNoResults>();
             add<PlanRankingPreferCoveredEvenIfNoResults>();
             add<PlanRankingPreferImmediateEOF>();
+            add<PlanRankingPreferImmediateEOFAgainstHashed>();
             add<PlanRankingNoCollscan>();
             add<PlanRankingCollscan>();
             // TODO: These don't work without counting FETCH and FETCH is now gone.
@@ -734,7 +844,10 @@ namespace PlanRankingTests {
             // add<PlanRankingChooseBetweenIxisectPlans>();
             add<PlanRankingAvoidBlockingSort>();
             add<PlanRankingWorkPlansLongEnough>();
+            add<PlanRankingAccountForKeySkips>();
         }
-    } planRankingAll;
+    };
+
+    SuiteInstance<All> planRankingAll;
 
 }  // namespace PlanRankingTest

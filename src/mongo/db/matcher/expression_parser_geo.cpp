@@ -33,18 +33,20 @@
 #include "mongo/base/init.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/expression_geo.h"
-#include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
+
+    using std::auto_ptr;
 
     StatusWithMatchExpression expressionParserGeoCallbackReal( const char* name,
                                                                int type,
                                                                const BSONObj& section ) {
         if (BSONObj::opWITHIN == type || BSONObj::opGEO_INTERSECTS == type) {
-            GeoQuery gq(name);
-            if ( !gq.parseFrom( section ) )
-                return StatusWithMatchExpression( ErrorCodes::BadValue, "bad geo query" );
+            auto_ptr<GeoExpression> gq(new GeoExpression(name));
+            Status parseStatus = gq->parseFrom(section);
+
+            if (!parseStatus.isOK()) return StatusWithMatchExpression(parseStatus);
 
             auto_ptr<GeoMatchExpression> e( new GeoMatchExpression() );
 
@@ -53,15 +55,15 @@ namespace mongo {
             // layer.
             BSONObjBuilder bob;
             bob.append(name, section);
-            Status s = e->init( name, gq, bob.obj() );
+            Status s = e->init( name, gq.release(), bob.obj() );
             if ( !s.isOK() )
                 return StatusWithMatchExpression( s );
             return StatusWithMatchExpression( e.release() );
         }
         else {
             verify(BSONObj::opNEAR == type);
-            NearQuery nq(name);
-            Status s = nq.parseFrom( section );
+            auto_ptr<GeoNearExpression> nq(new GeoNearExpression(name));
+            Status s = nq->parseFrom( section );
             if ( !s.isOK() ) {
                 return StatusWithMatchExpression( s );
             }
@@ -71,7 +73,7 @@ namespace mongo {
             // layer.
             BSONObjBuilder bob;
             bob.append(name, section);
-            s = e->init( name, nq, bob.obj() );
+            s = e->init( name, nq.release(), bob.obj() );
             if ( !s.isOK() )
                 return StatusWithMatchExpression( s );
             return StatusWithMatchExpression( e.release() );

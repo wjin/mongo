@@ -2,20 +2,32 @@
 /*
  *    Copyright 2010 10gen Inc.
  *
- *    Licensed under the Apache License, Version 2.0 (the "License");
- *    you may not use this file except in compliance with the License.
- *    You may obtain a copy of the License at
+ *    This program is free software: you can redistribute it and/or  modify
+ *    it under the terms of the GNU Affero General Public License, version 3,
+ *    as published by the Free Software Foundation.
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License for more details.
  *
- *    Unless required by applicable law or agreed to in writing, software
- *    distributed under the License is distributed on an "AS IS" BASIS,
- *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *    See the License for the specific language governing permissions and
- *    limitations under the License.
+ *    You should have received a copy of the GNU Affero General Public License
+ *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
  */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include "mongo/shell/shell_utils.h"
 
@@ -23,18 +35,25 @@
 #include "mongo/client/dbclientinterface.h"
 #include "mongo/db/catalog/index_key_validate.h"
 #include "mongo/db/index/external_key_generator.h"
+#include "mongo/shell/bench.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/shell/shell_options.h"
 #include "mongo/shell/shell_utils_extended.h"
 #include "mongo/shell/shell_utils_launcher.h"
 #include "mongo/util/processinfo.h"
+#include "mongo/util/quick_exit.h"
 #include "mongo/util/text.h"
 #include "mongo/util/version_reporting.h"
 
 namespace mongo {
 
+    using std::set;
+    using std::map;
+    using std::string;
+
     namespace JSFiles {
         extern const JSFile servers;
+        extern const JSFile mongodtest;
         extern const JSFile shardingtest;
         extern const JSFile servers_misc;
         extern const JSFile replsettest;
@@ -78,7 +97,7 @@ namespace mongo {
             // converts to the integer value 0.
             goingAwaySoon();
             int exit_code = int( args.firstElement().number() );
-            ::_exit(exit_code);
+            quickExit(exit_code);
             return undefinedReturn;
         }
 
@@ -129,6 +148,23 @@ namespace mongo {
 #else
             return BSON( "" << false );
 #endif
+        }
+
+        BSONObj isAddressSanitizerActive(const BSONObj& a, void* data) {
+            bool isSanitized = false;
+            // See the following for information on how we detect address sanitizer in clang and gcc.
+            //
+            // - http://clang.llvm.org/docs/AddressSanitizer.html#has-feature-address-sanitizer
+            // - https://gcc.gnu.org/ml/gcc-patches/2012-11/msg01827.html
+            //
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer)
+            isSanitized = true;
+#endif
+#elif defined(__SANITIZE_ADDRESS__)
+            isSanitized = true;
+#endif
+            return BSON( "" << isSanitized );
         }
 
         BSONObj getBuildInfo(const BSONObj& a, void* data) {
@@ -185,11 +221,14 @@ namespace mongo {
 
         void installShellUtils( Scope& scope ) {
             scope.injectNative( "quit", Quit );
+            // SERVER-5399: Set `exit` as well, so that quit/exit both resolve.
+            scope.injectNative( "exit", Quit );
             scope.injectNative( "getMemInfo" , JSGetMemInfo );
             scope.injectNative( "_replMonitorStats" , replMonitorStats );
             scope.injectNative( "_srand" , JSSrand );
             scope.injectNative( "_rand" , JSRand );
             scope.injectNative( "_isWindows" , isWindows );
+            scope.injectNative( "_isAddressSanitizerActive", isAddressSanitizerActive );
             scope.injectNative( "interpreterVersion", interpreterVersion );
             scope.injectNative( "getBuildInfo", getBuildInfo );
             scope.injectNative( "isKeyTooLarge", isKeyTooLarge );
@@ -209,11 +248,16 @@ namespace mongo {
             scope.externalSetup();
             mongo::shell_utils::installShellUtils( scope );
             scope.execSetup(JSFiles::servers);
+            scope.execSetup(JSFiles::mongodtest);
             scope.execSetup(JSFiles::shardingtest);
             scope.execSetup(JSFiles::servers_misc);
             scope.execSetup(JSFiles::replsettest);
             scope.execSetup(JSFiles::replsetbridge);
-            scope.installBenchRun();
+
+            scope.injectNative("benchRun", BenchRunner::benchRunSync);
+            scope.injectNative("benchRunSync", BenchRunner::benchRunSync);
+            scope.injectNative("benchStart", BenchRunner::benchStart);
+            scope.injectNative("benchFinish", BenchRunner::benchFinish);
 
             if ( !_dbConnect.empty() ) {
                 uassert( 12513, "connect failed", scope.exec( _dbConnect , "(connect)" , false , true , false ) );

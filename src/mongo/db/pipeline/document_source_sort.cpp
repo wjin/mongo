@@ -26,17 +26,27 @@
 *    it in the license file.
 */
 
-#include "pch.h"
+#include "mongo/platform/basic.h"
 
-#include "db/pipeline/document_source.h"
+#include "mongo/db/pipeline/document_source.h"
 
-#include "db/jsobj.h"
-#include "db/pipeline/document.h"
-#include "db/pipeline/expression.h"
-#include "db/pipeline/expression_context.h"
-#include "db/pipeline/value.h"
+#include <boost/make_shared.hpp>
+#include <boost/scoped_ptr.hpp>
+
+#include "mongo/db/jsobj.h"
+#include "mongo/db/pipeline/document.h"
+#include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/value.h"
 
 namespace mongo {
+
+    using boost::intrusive_ptr;
+    using boost::scoped_ptr;
+    using std::make_pair;
+    using std::string;
+    using std::vector;
+
     const char DocumentSourceSort::sortName[] = "$sort";
 
     const char *DocumentSourceSort::getSourceName() const {
@@ -92,7 +102,7 @@ namespace mongo {
     bool DocumentSourceSort::coalesce(const intrusive_ptr<DocumentSource> &pNextSource) {
         if (!limitSrc) {
             limitSrc = dynamic_cast<DocumentSourceLimit*>(pNextSource.get());
-            return limitSrc; // false if next is not a $limit
+            return limitSrc.get(); // false if next is not a $limit
         }
         else {
             return limitSrc->coalesce(pNextSource);
@@ -176,7 +186,8 @@ namespace mongo {
                 continue;
             }
                 
-            uassert(15974, "$sort key ordering must be specified using a number or {$meta: 'text'}",
+            uassert(15974,
+                    "$sort key ordering must be specified using a number or {$meta: 'textScore'}",
                     keyField.isNumber());
 
             int sortOrder = keyField.numberInt();
@@ -355,5 +366,5 @@ namespace mongo {
     }
 }
 
-#include "db/sorter/sorter.cpp"
+#include "mongo/db/sorter/sorter.cpp"
 // Explicit instantiation unneeded since we aren't exposing Sorter outside of this file.

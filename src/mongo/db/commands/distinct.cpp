@@ -1,7 +1,7 @@
 // distinct.cpp
 
 /**
-*    Copyright (C) 2012 10gen Inc.
+*    Copyright (C) 2012-2014 MongoDB Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -39,14 +39,16 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/kill_current_op.h"
-#include "mongo/db/pdfile.h"
-#include "mongo/db/query/get_runner.h"
+#include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/query_planner_common.h"
-#include "mongo/db/query/type_explain.h"
+#include "mongo/db/query/explain.h"
 #include "mongo/util/timer.h"
 
 namespace mongo {
+
+    using std::auto_ptr;
+    using std::string;
+    using std::stringstream;
 
     class DistinctCommand : public Command {
     public:
@@ -68,11 +70,24 @@ namespace mongo {
             help << "{ distinct : 'collection name' , key : 'a.b' , query : {} }";
         }
 
-        bool run(const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result,
+        bool run(OperationContext* txn, const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result,
                  bool fromRepl ) {
 
             Timer t;
-            string ns = dbname + '.' + cmdObj.firstElement().valuestr();
+
+            // ensure that the key is a string
+            uassert(18510,
+                    mongoutils::str::stream() << "The first argument to the distinct command " <<
+                        "must be a string but was a " << typeName(cmdObj["key"].type()),
+                    cmdObj["key"].type() == mongo::String);
+
+            // ensure that the where clause is a document
+            if( cmdObj["query"].isNull() == false && cmdObj["query"].eoo() == false ){
+             uassert(18511,
+                    mongoutils::str::stream() << "The query for the distinct command must be a " <<
+                        "document but was a " << typeName(cmdObj["query"].type()),
+                    cmdObj["query"].type() == mongo::Object);
+            }
 
             string key = cmdObj["key"].valuestrsafe();
             BSONObj keyPattern = BSON( key << 1 );
@@ -86,14 +101,10 @@ namespace mongo {
             BSONArrayBuilder arr( bb );
             BSONElementSet values;
 
-            long long nscanned = 0; // locations looked at
-            long long nscannedObjects = 0; // full objects looked at
-            long long n = 0; // matches
+            const string ns = parseNs(dbname, cmdObj);
+            AutoGetCollectionForRead ctx(txn, ns);
 
-            Client::ReadContext ctx(ns);
-
-            Collection* collection = ctx.ctx().db()->getCollection( ns );
-
+            Collection* collection = ctx.getCollection();
             if (!collection) {
                 result.appendArray( "values" , BSONObj() );
                 result.append("stats", BSON("n" << 0 <<
@@ -102,22 +113,24 @@ namespace mongo {
                 return true;
             }
 
-            Runner* rawRunner;
-            Status status = getRunnerDistinct(collection, query, key, &rawRunner);
+            PlanExecutor* rawExec;
+            Status status = getExecutorDistinct(txn,
+                                                collection,
+                                                query,
+                                                key,
+                                                PlanExecutor::YIELD_AUTO,
+                                                &rawExec);
             if (!status.isOK()) {
-                uasserted(17216, mongoutils::str::stream() << "Can't get runner for query "
+                uasserted(17216, mongoutils::str::stream() << "Can't get executor for query "
                               << query << ": " << status.toString());
                 return 0;
             }
 
-            auto_ptr<Runner> runner(rawRunner);
-            const ScopedRunnerRegistration safety(runner.get());
-            runner->setYieldPolicy(Runner::YIELD_AUTO);
+            auto_ptr<PlanExecutor> exec(rawExec);
 
-            string cursorName;
             BSONObj obj;
-            Runner::RunnerState state;
-            while (Runner::RUNNER_ADVANCED == (state = runner->getNext(&obj, NULL))) {
+            PlanExecutor::ExecState state;
+            while (PlanExecutor::ADVANCED == (state = exec->getNext(&obj, NULL))) {
                 // Distinct expands arrays.
                 //
                 // If our query is covered, each value of the key should be in the index key and
@@ -139,17 +152,10 @@ namespace mongo {
                     values.insert(x);
                 }
             }
-            TypeExplain* bareExplain;
-            Status res = runner->getInfo(&bareExplain, NULL);
-            if (res.isOK()) {
-                auto_ptr<TypeExplain> explain(bareExplain);
-                if (explain->isCursorSet()) {
-                    cursorName = explain->getCursor();
-                }
-                n = explain->getN();
-                nscanned = explain->getNScanned();
-                nscannedObjects = explain->getNScannedObjects();
-            }
+
+            // Get summary information about the plan.
+            PlanSummaryStats stats;
+            Explain::getSummaryStats(exec.get(), &stats);
 
             verify( start == bb.buf() );
 
@@ -157,11 +163,11 @@ namespace mongo {
 
             {
                 BSONObjBuilder b;
-                b.appendNumber( "n" , n );
-                b.appendNumber( "nscanned" , nscanned );
-                b.appendNumber( "nscannedObjects" , nscannedObjects );
+                b.appendNumber( "n" , stats.nReturned );
+                b.appendNumber( "nscanned" , stats.totalKeysExamined );
+                b.appendNumber( "nscannedObjects" , stats.totalDocsExamined );
                 b.appendNumber( "timems" , t.millis() );
-                b.append( "cursor" , cursorName );
+                b.append( "planSummary" , Explain::getPlanSummary(exec.get()) );
                 result.append( "stats" , b.obj() );
             }
 

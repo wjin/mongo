@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2013-2014 MongoDB Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -28,7 +28,6 @@
 
 #pragma once
 
-#include "mongo/db/diskloc.h"
 #include "mongo/db/exec/plan_stage.h"
 #include "mongo/db/fts/fts_index_format.h"
 #include "mongo/db/fts/fts_matcher.h"
@@ -38,6 +37,7 @@
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/expression.h"
+#include "mongo/db/record_id.h"
 #include "mongo/platform/unordered_map.h"
 
 #include <map>
@@ -51,6 +51,8 @@ namespace mongo {
     using fts::FTSQuery;
     using fts::FTSSpec;
     using fts::MAX_WEIGHT;
+
+    class OperationContext;
 
     struct TextStageParams {
         TextStageParams(const FTSSpec& s) : spec(s) {}
@@ -73,6 +75,9 @@ namespace mongo {
      *
      * Prerequisites: None; is a leaf node.
      * Output type: LOC_AND_OBJ_UNOWNED.
+     *
+     * TODO: Should the TextStage ever generate NEED_FETCH requests? Right now this stage could
+     * reduce concurrency by failing to request a yield during fetch.
      */
     class TextStage : public PlanStage {
     public:
@@ -93,18 +98,31 @@ namespace mongo {
             DONE,
         };
 
-        TextStage(const TextStageParams& params, WorkingSet* ws, const MatchExpression* filter);
+        TextStage(OperationContext* txn,
+                  const TextStageParams& params,
+                  WorkingSet* ws,
+                  const MatchExpression* filter);
 
         virtual ~TextStage();
 
         virtual StageState work(WorkingSetID* out);
         virtual bool isEOF();
 
-        virtual void prepareToYield();
-        virtual void recoverFromYield();
-        virtual void invalidate(const DiskLoc& dl, InvalidationType type);
+        virtual void saveState();
+        virtual void restoreState(OperationContext* opCtx);
+        virtual void invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type);
+
+        virtual std::vector<PlanStage*> getChildren() const;
+
+        virtual StageType stageType() const { return STAGE_TEXT; }
 
         PlanStageStats* getStats();
+
+        virtual const CommonStats* getCommonStats();
+
+        virtual const SpecificStats* getSpecificStats();
+
+        static const char* kStageType;
 
     private:
         /**
@@ -123,13 +141,16 @@ namespace mongo {
          * score) pair for this document.  Also rejects documents that don't match this stage's
          * filter.
          */
-        void addTerm(const BSONObj& key, const DiskLoc& loc);
+        void addTerm(const BSONObj key, WorkingSetID wsid);
 
         /**
          * Possibly return a result.  FYI, this may perform a fetch directly if it is needed to
          * evaluate all filters.
          */
         StageState returnResults(WorkingSetID* out);
+
+        // transactional context for read locks. Not owned by us
+        OperationContext* _txn;
 
         // Parameters of this text stage.
         TextStageParams _params;
@@ -157,10 +178,17 @@ namespace mongo {
         // Which _scanners are we currently reading from?
         size_t _currentIndexScanner;
 
+        // Map each buffered record id to this data.
+        struct TextRecordData {
+            TextRecordData() : wsid(WorkingSet::INVALID_ID), score(0.0) { }
+            WorkingSetID wsid;
+            double score;
+        };
+
         // Temporary score data filled out by sub-scans.  Used in READING_TERMS and
         // RETURNING_RESULTS.
-        // Maps from diskloc -> aggregate score for doc.
-        typedef unordered_map<DiskLoc, double, DiskLoc::Hasher> ScoreMap;
+        // Maps from diskloc -> (aggregate score for doc, wsid).
+        typedef unordered_map<RecordId, TextRecordData, RecordId::Hasher> ScoreMap;
         ScoreMap _scores;
         ScoreMap::const_iterator _scoreIterator;
     };

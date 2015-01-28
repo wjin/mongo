@@ -30,6 +30,8 @@
 
 #pragma once
 
+#include <string>
+
 #include "mongo/client/export_macros.h"
 
 namespace mongo {
@@ -55,7 +57,7 @@ namespace mongo {
 
         void readAt(unsigned long long offset, void *_buf, size_t _len);
 
-        const string _name;
+        const std::string _name;
 
         void truncate(); // Removes extra data after current position
 
@@ -67,6 +69,10 @@ namespace mongo {
 #endif
         fd_type _fd;
         bool _direct; // are we using direct I/O
+
+        // Block size, in case of direct I/O we need to test alignment against the page size,
+        // which can be different than 4kB.
+        size_t _blkSize;
     };
 
 }

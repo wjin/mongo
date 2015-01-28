@@ -34,29 +34,31 @@
 
 #include "mongo/base/owned_pointer_vector.h"
 #include "mongo/bson/ordering.h"
-#include "mongo/db/diskloc.h"
+#include "mongo/db/record_id.h"
 
 namespace mongo {
 
-    class Collection;
+    class CollectionCatalogEntry;
+    class CollectionInfoCache;
     class HeadManager;
     class IndexAccessMethod;
     class IndexDescriptor;
-    class RecordStore;
-    class TransactionExperiment;
+    class OperationContext;
 
     class IndexCatalogEntry {
         MONGO_DISALLOW_COPYING( IndexCatalogEntry );
     public:
-        IndexCatalogEntry( Collection* collection,
+        IndexCatalogEntry( const StringData& ns,
+                           CollectionCatalogEntry* collection, // not owned
                            IndexDescriptor* descriptor, // ownership passes to me
-                           RecordStore* recordStore ); // ownership passes to me
+                           CollectionInfoCache* infoCache ); // not owned, optional
 
         ~IndexCatalogEntry();
 
-        void init( IndexAccessMethod* accessMethod );
+        const std::string& ns() const { return _ns; }
 
-        const Collection* collection() const { return _collection; }
+        void init( OperationContext* txn,
+                   IndexAccessMethod* accessMethod );
 
         IndexDescriptor* descriptor() { return _descriptor; }
         const IndexDescriptor* descriptor() const { return _descriptor; }
@@ -64,16 +66,13 @@ namespace mongo {
         IndexAccessMethod* accessMethod() { return _accessMethod; }
         const IndexAccessMethod* accessMethod() const { return _accessMethod; }
 
-        RecordStore* recordStore() { return _recordStore; }
-        const RecordStore* recordStore() const { return _recordStore; }
-
         const Ordering& ordering() const { return _ordering; }
 
         /// ---------------------
 
-        const DiskLoc& head() const;
+        const RecordId& head( OperationContext* txn ) const;
 
-        void setHead( TransactionExperiment* txn, DiskLoc newHead );
+        void setHead( OperationContext* txn, RecordId newHead );
 
         void setIsReady( bool newIsReady );
 
@@ -83,26 +82,29 @@ namespace mongo {
 
         bool isMultikey() const;
 
-        void setMultikey();
+        void setMultikey( OperationContext* txn );
 
         // if this ready is ready for queries
-        bool isReady() const;
+        bool isReady( OperationContext* txn ) const;
 
     private:
 
-        int _indexNo() const;
+        class SetMultikeyChange;
+        class SetHeadChange;
 
-        bool _catalogIsReady() const;
-        DiskLoc _catalogHead() const;
-        bool _catalogIsMultikey() const;
+        bool _catalogIsReady( OperationContext* txn ) const;
+        RecordId _catalogHead( OperationContext* txn ) const;
+        bool _catalogIsMultikey( OperationContext* txn ) const;
 
         // -----
 
-        Collection* _collection; // not owned here
+        std::string _ns;
+
+        CollectionCatalogEntry* _collection; // not owned here
 
         IndexDescriptor* _descriptor; // owned here
 
-        RecordStore* _recordStore; // owned here
+        CollectionInfoCache* _infoCache; // not owned here
 
         IndexAccessMethod* _accessMethod; // owned here
 
@@ -113,7 +115,7 @@ namespace mongo {
 
         Ordering _ordering; // TODO: this might be b-tree specific
         bool _isReady; // cache of NamespaceDetails info
-        DiskLoc _head; // cache of IndexDetails
+        RecordId _head; // cache of IndexDetails
         bool _isMultikey; // cache of NamespaceDetails info
     };
 
@@ -140,7 +142,16 @@ namespace mongo {
         unsigned size() const { return _entries.size(); }
         // -----------------
 
-        bool remove( const IndexDescriptor* desc );
+        /**
+         * Removes from _entries and returns the matching entry or NULL if none matches.
+         */
+        IndexCatalogEntry* release( const IndexDescriptor* desc );
+
+        bool remove( const IndexDescriptor* desc ) {
+            IndexCatalogEntry* entry = release(desc);
+            delete entry;
+            return entry;
+        }
 
         // pass ownership to EntryContainer
         void add( IndexCatalogEntry* entry ) { _entries.mutableVector().push_back( entry ); }

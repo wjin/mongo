@@ -26,15 +26,25 @@
 *    it in the license file.
 */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kIndex
+
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/index/btree_based_bulk_access_method.h"
 
-#include "mongo/db/kill_current_op.h"
-#include "mongo/db/pdfile_private.h"  // This is for inDBRepair.
-#include "mongo/db/repl/rs.h"         // This is for ignoreUniqueIndex.
-#include "mongo/db/storage/transaction.h"
+#include <boost/scoped_ptr.hpp>
+
+#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/curop.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/storage_options.h"
+#include "mongo/util/log.h"
 #include "mongo/util/progress_meter.h"
 
 namespace mongo {
+
+    using boost::scoped_ptr;
+    using std::set;
 
     //
     // Comparison for external sorter interface
@@ -44,57 +54,32 @@ namespace mongo {
     // XXX TODO: rename to something more descriptive, etc. etc.
     int oldCompare(const BSONObj& l,const BSONObj& r, const Ordering &o);
 
-    class BtreeExternalSortComparisonV0 : public ExternalSortComparison {
+    class BtreeExternalSortComparison {
     public:
-        BtreeExternalSortComparisonV0(const BSONObj& ordering)
-            : _ordering(Ordering::make(ordering)){
+        BtreeExternalSortComparison(const BSONObj& ordering, int version)
+            : _ordering(Ordering::make(ordering)),
+              _version(version) {
+            invariant(version == 1 || version == 0);
         }
 
-        virtual ~BtreeExternalSortComparisonV0() { }
+        typedef std::pair<BSONObj, RecordId> Data;
 
-        virtual int compare(const ExternalSortDatum& l, const ExternalSortDatum& r) const {
-            int x = oldCompare(l.first, r.first, _ordering);
+        int operator() (const Data& l, const Data& r) const {
+            int x = (_version == 1
+                        ? l.first.woCompare(r.first, _ordering, /*considerfieldname*/false)
+                        : oldCompare(l.first, r.first, _ordering));
             if (x) { return x; }
             return l.second.compare(r.second);
         }
     private:
         const Ordering _ordering;
+        const int _version;
     };
 
-    class BtreeExternalSortComparisonV1 : public ExternalSortComparison {
-    public:
-        BtreeExternalSortComparisonV1(const BSONObj& ordering)
-            : _ordering(Ordering::make(ordering)) {
-        }
-
-        virtual ~BtreeExternalSortComparisonV1() { }
-
-        virtual int compare(const ExternalSortDatum& l, const ExternalSortDatum& r) const {
-            int x = l.first.woCompare(r.first, _ordering, /*considerfieldname*/false);
-            if (x) { return x; }
-            return l.second.compare(r.second);
-        }
-    private:
-        const Ordering _ordering;
-    };
-
-    // static
-    ExternalSortComparison* BtreeBasedBulkAccessMethod::getComparison(int version, const BSONObj& keyPattern) {
-        if (0 == version) {
-            return new BtreeExternalSortComparisonV0(keyPattern);
-        }
-        else if (1 == version) {
-            return new BtreeExternalSortComparisonV1(keyPattern);
-        }
-        verify( 0 );
-        return NULL;
-    }
-
-    BtreeBasedBulkAccessMethod::BtreeBasedBulkAccessMethod(TransactionExperiment* txn,
+    BtreeBasedBulkAccessMethod::BtreeBasedBulkAccessMethod(OperationContext* txn,
                                                            BtreeBasedAccessMethod* real,
-                                                           BtreeInterface* interface,
-                                                           const IndexDescriptor* descriptor,
-                                                           int numRecords) {
+                                                           SortedDataInterface* interface,
+                                                           const IndexDescriptor* descriptor) {
         _real = real;
         _interface = interface;
         _txn = txn;
@@ -103,14 +88,16 @@ namespace mongo {
         _keysInserted = 0;
         _isMultiKey = false;
 
-        _sortCmp.reset(getComparison(descriptor->version(), descriptor->keyPattern()));
-        _sorter.reset(new BSONObjExternalSorter(_sortCmp.get()));
-        _sorter->hintNumObjects(numRecords);
+        _sorter.reset(BSONObjExternalSorter::make(
+                    SortOptions().TempDir(storageGlobalParams.dbpath + "/_tmp")
+                                 .ExtSortAllowed()
+                                 .MaxMemoryUsageBytes(100*1024*1024),
+                    BtreeExternalSortComparison(descriptor->keyPattern(), descriptor->version())));
     }
 
-    Status BtreeBasedBulkAccessMethod::insert(TransactionExperiment* txn,
+    Status BtreeBasedBulkAccessMethod::insert(OperationContext* txn,
                                               const BSONObj& obj,
-                                              const DiskLoc& loc,
+                                              const RecordId& loc,
                                               const InsertDeleteOptions& options,
                                               int64_t* numInserted) {
         BSONObjSet keys;
@@ -120,7 +107,7 @@ namespace mongo {
 
         for (BSONObjSet::iterator it = keys.begin(); it != keys.end(); ++it) {
             // False is for mayInterrupt.
-            _sorter->add(*it, loc, false);
+            _sorter->add(*it, loc);
             _keysInserted++;
         }
 
@@ -133,83 +120,84 @@ namespace mongo {
         return Status::OK();
     }
 
-    Status BtreeBasedBulkAccessMethod::commit(set<DiskLoc>* dupsToDrop, CurOp* op, bool mayInterrupt) {
-        DiskLoc oldHead = _real->_btreeState->head();
-
-        // XXX: do we expect the tree to be empty but have a head set?  Looks like so from old code.
-        invariant(!oldHead.isNull());
-        _real->_btreeState->setHead(_txn, DiskLoc());
-        _real->_btreeState->recordStore()->deleteRecord(_txn, oldHead);
-
-        if (_isMultiKey) {
-            _real->_btreeState->setMultikey();
-        }
-
-        _sorter->sort(false);
-
+    Status BtreeBasedBulkAccessMethod::commit(set<RecordId>* dupsToDrop,
+                                              bool mayInterrupt,
+                                              bool dupsAllowed) {
         Timer timer;
-        IndexCatalogEntry* entry = _real->_btreeState;
 
-        bool dupsAllowed = !entry->descriptor()->unique()
-                           || ignoreUniqueIndex(entry->descriptor());
+        scoped_ptr<BSONObjExternalSorter::Iterator> i(_sorter->done());
 
-        bool dropDups = entry->descriptor()->dropDups() || inDBRepair;
+        ProgressMeterHolder pm(*_txn->setMessage("Index Bulk Build: (2/3) btree bottom up",
+                                                 "Index: (2/3) BTree Bottom Up Progress",
+                                                 _keysInserted,
+                                                 10));
 
-        scoped_ptr<BSONObjExternalSorter::Iterator> i(_sorter->iterator());
+        scoped_ptr<SortedDataBuilderInterface> builder;
 
-        // verifies that pm and op refer to the same ProgressMeter
-        ProgressMeter& pm = op->setMessage("Index Bulk Build: (2/3) btree bottom up",
-                                           "Index: (2/3) BTree Bottom Up Progress",
-                                           _keysInserted,
-                                           10);
+        MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+            WriteUnitOfWork wunit(_txn);
 
-        scoped_ptr<BtreeBuilderInterface> builder;
+            if (_isMultiKey) {
+                _real->_btreeState->setMultikey( _txn );
+            }
 
-        builder.reset(_interface->getBulkBuilder(_txn, dupsAllowed));
+            builder.reset(_interface->getBulkBuilder(_txn, dupsAllowed));
+            wunit.commit();
+        } MONGO_WRITE_CONFLICT_RETRY_LOOP_END(_txn, "setting index multikey flag", "");
 
         while (i->more()) {
+            if (mayInterrupt) {
+                _txn->checkForInterrupt();
+            }
+
+            WriteUnitOfWork wunit(_txn);
+            // Improve performance in the btree-building phase by disabling rollback tracking.
+            // This avoids copying all the written bytes to a buffer that is only used to roll back.
+            // Note that this is safe to do, as this entire index-build-in-progress will be cleaned
+            // up by the index system.
+            _txn->recoveryUnit()->setRollbackWritesDisabled();
+
             // Get the next datum and add it to the builder.
-            ExternalSortDatum d = i->next();
+            BSONObjExternalSorter::Data d = i->next();
             Status status = builder->addKey(d.first, d.second);
 
             if (!status.isOK()) {
-                if (ErrorCodes::DuplicateKey != status.code()) {
-                    return status;
+                // Overlong key that's OK to skip?
+                if (status.code() == ErrorCodes::KeyTooLong && _real->ignoreKeyTooLong(_txn)) {
+                    continue;
                 }
 
-                // If we're here it's a duplicate key.
-                if (dropDups) {
-                    static const size_t kMaxDupsToStore = 1000000;
-                    dupsToDrop->insert(d.second);
-                    if (dupsToDrop->size() > kMaxDupsToStore) {
-                        return Status(ErrorCodes::InternalError,
-                                      "Too many dups on index build with dropDups = true");
+                // Check if this is a duplicate that's OK to skip
+                if (status.code() == ErrorCodes::DuplicateKey) {
+                    invariant(!dupsAllowed); // shouldn't be getting DupKey errors if dupsAllowed.
+
+                    if (dupsToDrop) {
+                        dupsToDrop->insert(d.second);
+                        continue;
                     }
                 }
-                else if (!dupsAllowed) {
-                    return status;
-                }
+
+                return status;
             }
 
             // If we're here either it's a dup and we're cool with it or the addKey went just
             // fine.
             pm.hit();
+            wunit.commit();
         }
 
         pm.finished();
 
-        op->setMessage("Index Bulk Build: (3/3) btree-middle",
-                       "Index: (3/3) BTree Middle Progress");
+        _txn->getCurOp()->setMessage("Index Bulk Build: (3/3) btree-middle",
+                                     "Index: (3/3) BTree Middle Progress");
 
         LOG(timer.seconds() > 10 ? 0 : 1 ) << "\t done building bottom layer, going to commit";
 
-        unsigned long long keysCommit = builder->commit(mayInterrupt);
-
-        if (!dropDups && (keysCommit != _keysInserted)) {
-            warning() << "not all entries were added to the index, probably some "
-                      << "keys were too large" << endl;
-        }
+        builder->commit(mayInterrupt);
         return Status::OK();
     }
 
 }  // namespace mongo
+
+#include "mongo/db/sorter/sorter.cpp"
+MONGO_CREATE_SORTER(mongo::BSONObj, mongo::RecordId, mongo::BtreeExternalSortComparison);

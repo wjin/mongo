@@ -28,7 +28,13 @@
 
 #include "mongo/db/range_deleter_mock_env.h"
 
+#include "mongo/db/global_environment_experiment.h"
+#include "mongo/db/global_environment_noop.h"
+
 namespace mongo {
+
+    using std::set;
+    using std::string;
 
     bool DeletedRangeCmp::operator()(const DeletedRange& lhs,
                                      const DeletedRange& rhs) const {
@@ -53,6 +59,8 @@ namespace mongo {
         _pausedCount(0),
         _envStatMutex("envStat"),
         _getCursorsCallCount(0) {
+
+        setGlobalEnvironment(new GlobalEnvironmentNoop());
     }
 
     void RangeDeleterMockEnv::addCursorId(const StringData& ns, CursorId id) {
@@ -100,11 +108,9 @@ namespace mongo {
         return _deleteList.back();
     }
 
-    bool RangeDeleterMockEnv::deleteRange(const StringData& ns,
-                                          const BSONObj& min,
-                                          const BSONObj& max,
-                                          const BSONObj& shardKeyPattern,
-                                          bool secondaryThrottle,
+    bool RangeDeleterMockEnv::deleteRange(OperationContext* txn,
+                                          const RangeDeleteEntry& taskDetails,
+                                          long long int* deletedDocs,
                                           string* errMsg) {
 
         {
@@ -127,10 +133,10 @@ namespace mongo {
             scoped_lock sl(_deleteListMutex);
 
             DeletedRange entry;
-            entry.ns = ns.toString();
-            entry.min = min.getOwned();
-            entry.max = max.getOwned();
-            entry.shardKeyPattern = shardKeyPattern.getOwned();
+            entry.ns = taskDetails.options.range.ns;
+            entry.min = taskDetails.options.range.minKey.getOwned();
+            entry.max = taskDetails.options.range.maxKey.getOwned();
+            entry.shardKeyPattern = taskDetails.options.range.keyPattern.getOwned();
 
             _deleteList.push_back(entry);
         }
@@ -138,7 +144,8 @@ namespace mongo {
         return true;
     }
 
-    void RangeDeleterMockEnv::getCursorIds(const StringData& ns, set<CursorId>* in) {
+    void RangeDeleterMockEnv::getCursorIds(
+                    OperationContext* txn, const StringData& ns, set<CursorId>* in) {
         {
             scoped_lock sl(_cursorMapMutex);
             const set<CursorId>& _cursors = _cursorMap[ns.toString()];

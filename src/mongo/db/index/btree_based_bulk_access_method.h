@@ -1,5 +1,5 @@
 /**
-*    Copyright (C) 2013 10gen Inc.
+*    Copyright (C) 2013-2014 MongoDB Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -26,18 +26,18 @@
 *    it in the license file.
 */
 
+#include <boost/scoped_ptr.hpp>
 #include <set>
 #include <vector>
 
 #include "mongo/base/error_codes.h"
 #include "mongo/base/status.h"
-#include "mongo/db/curop.h"
-#include "mongo/db/extsort.h"
+#include "mongo/db/sorter/sorter.h"
 #include "mongo/db/index/btree_based_access_method.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/structure/btree/btree_interface.h"
+#include "mongo/db/storage/sorted_data_interface.h"
 
 namespace mongo {
 
@@ -47,21 +47,20 @@ namespace mongo {
          * Does not take ownership of any pointers.
          * All pointers must outlive 'this'.
          */
-        BtreeBasedBulkAccessMethod(TransactionExperiment* txn,
+        BtreeBasedBulkAccessMethod(OperationContext* txn,
                                    BtreeBasedAccessMethod* real,
-                                   BtreeInterface* interface,
-                                   const IndexDescriptor* descriptor,
-                                   int numRecords);
+                                   SortedDataInterface* interface,
+                                   const IndexDescriptor* descriptor);
 
         ~BtreeBasedBulkAccessMethod() {}
 
-        virtual Status insert(TransactionExperiment* txn,
+        virtual Status insert(OperationContext* txn,
                               const BSONObj& obj,
-                              const DiskLoc& loc,
+                              const RecordId& loc,
                               const InsertDeleteOptions& options,
                               int64_t* numInserted);
 
-        Status commit(std::set<DiskLoc>* dupsToDrop, CurOp* op, bool mayInterrupt);
+        Status commit(std::set<RecordId>* dupsToDrop, bool mayInterrupt, bool dupsAllowed);
 
         // Exposed for testing.
         static ExternalSortComparison* getComparison(int version, const BSONObj& keyPattern);
@@ -72,58 +71,75 @@ namespace mongo {
 
         virtual Status commitBulk(IndexAccessMethod* bulk,
                                   bool mayInterrupt,
-                                  std::set<DiskLoc>* dups) {
-            verify(this == bulk);
+                                  bool dupsAllowed,
+                                  std::set<RecordId>* dups) {
+            invariant(this == bulk);
             return Status::OK();
         }
 
-        virtual Status touch(const BSONObj& obj) {
+        virtual Status touch(OperationContext* txn, const BSONObj& obj) {
             return _notAllowed();
         }
 
-        virtual Status touch(TransactionExperiment* txn) const {
+        virtual Status touch(OperationContext* txn) const {
             return _notAllowed();
         }
 
-        virtual Status validate(int64_t* numKeys) {
+        virtual Status validate(OperationContext* txn, bool full, int64_t* numKeys, BSONObjBuilder* output) {
             return _notAllowed();
         }
 
-        virtual Status remove(TransactionExperiment* txn,
+        virtual bool appendCustomStats(OperationContext* txn, BSONObjBuilder* output, double scale)
+            const {
+            return false;
+        }
+
+        virtual Status remove(OperationContext* txn,
                               const BSONObj& obj,
-                              const DiskLoc& loc,
+                              const RecordId& loc,
                               const InsertDeleteOptions& options,
                               int64_t* numDeleted) {
             return _notAllowed();
         }
 
-        virtual Status validateUpdate(const BSONObj& from,
+        virtual Status validateUpdate(OperationContext* txn,
+                                      const BSONObj& from,
                                       const BSONObj& to,
-                                      const DiskLoc& loc,
+                                      const RecordId& loc,
                                       const InsertDeleteOptions& options,
                                       UpdateTicket* ticket) {
             return _notAllowed();
         }
 
-        virtual Status update(TransactionExperiment* txn,
+        virtual long long getSpaceUsedBytes( OperationContext* txn ) const {
+            return -1;
+        }
+
+        virtual Status update(OperationContext* txn,
                               const UpdateTicket& ticket,
                               int64_t* numUpdated) {
             return _notAllowed();
         }
 
-        virtual Status newCursor(IndexCursor **out) const {
+        virtual Status newCursor(OperationContext*txn,
+                                 const CursorOptions& opts,
+                                 IndexCursor** out) const {
             return _notAllowed();
         }
 
-        virtual Status initializeAsEmpty(TransactionExperiment* txn) {
+        virtual Status initializeAsEmpty(OperationContext* txn) {
             return _notAllowed();
         }
 
-        virtual IndexAccessMethod* initiateBulk(TransactionExperiment* txn) {
+        virtual IndexAccessMethod* initiateBulk(OperationContext* txn) {
             return NULL;
         }
 
+        OperationContext* getOperationContext() { return _txn; }
+
     private:
+        typedef Sorter<BSONObj, RecordId> BSONObjExternalSorter;
+
         Status _notAllowed() const {
             return Status(ErrorCodes::InternalError, "cannot use bulk for this yet");
         }
@@ -132,13 +148,10 @@ namespace mongo {
         BtreeBasedAccessMethod* _real;
 
         // Not owned here.
-        BtreeInterface* _interface;
+        SortedDataInterface* _interface;
 
         // The external sorter.
         boost::scoped_ptr<BSONObjExternalSorter> _sorter;
-
-        // A comparison object required by the sorter.
-        boost::scoped_ptr<ExternalSortComparison> _sortCmp;
 
         // How many docs are we indexing?
         unsigned long long _docsInserted;
@@ -149,7 +162,7 @@ namespace mongo {
         // Does any document have >1 key?
         bool _isMultiKey;
 
-        TransactionExperiment* _txn;
+        OperationContext* _txn;
     };
 
 }  // namespace mongo

@@ -1,7 +1,7 @@
 // rename_collection.cpp
 
 /**
-*    Copyright (C) 2013 10gen Inc.
+*    Copyright (C) 2013-2014 MongoDB Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -30,19 +30,28 @@
 
 #include "mongo/client/dbclientcursor.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_catalog_entry.h"
+#include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/index_catalog.h"
+#include "mongo/db/catalog/index_create.h"
+#include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/rename_collection.h"
 #include "mongo/db/dbhelpers.h"
-#include "mongo/db/index_builder.h"
 #include "mongo/db/index/index_descriptor.h"
-#include "mongo/db/instance.h"
+#include "mongo/db/index_builder.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/ops/insert.h"
 #include "mongo/db/repl/oplog.h"
-#include "mongo/db/storage/mmap_v1/dur_transaction.h"
+#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/util/scopeguard.h"
 
 namespace mongo {
+
+    using std::min;
+    using std::string;
+    using std::stringstream;
 
     class CmdRenameCollection : public Command {
     public:
@@ -63,7 +72,8 @@ namespace mongo {
             help << " example: { renameCollection: foo.a, to: bar.b }";
         }
 
-        virtual std::vector<BSONObj> stopIndexBuilds(Database* db,
+        virtual std::vector<BSONObj> stopIndexBuilds(OperationContext* opCtx,
+                                                     Database* db,
                                                      const BSONObj& cmdObj) {
             string source = cmdObj.getStringField( name.c_str() );
             string target = cmdObj.getStringField( "to" );
@@ -87,26 +97,28 @@ namespace mongo {
             return indexes;
         }
 
-        virtual void restoreIndexBuildsOnSource(std::vector<BSONObj> indexesInProg, std::string source) {
-            IndexBuilder::restoreIndexes( indexesInProg );
+        static void dropCollection(OperationContext* txn, Database* db, StringData collName) {
+            WriteUnitOfWork wunit(txn);
+            if (db->dropCollection(txn, collName).isOK()) {
+                // ignoring failure case
+                wunit.commit();
+            }
         }
 
-        virtual bool run(const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
-            Lock::GlobalWrite globalWriteLock;
-            DurTransaction txn;
-            bool ok = wrappedRun(&txn, dbname, cmdObj, errmsg, result, fromRepl);
-            if (ok && !fromRepl)
-                logOp(&txn, "c",(dbname + ".$cmd").c_str(), cmdObj);
-            return ok;
-        }
-        virtual bool wrappedRun(DurTransaction* txn,
-                                const string& dbname,
-                                BSONObj& cmdObj,
-                                string& errmsg,
-                                BSONObjBuilder& result,
-                                bool fromRepl) {
+        virtual bool run(OperationContext* txn,
+                         const string& dbname,
+                         BSONObj& cmdObj,
+                         int,
+                         string& errmsg,
+                         BSONObjBuilder& result,
+                         bool fromRepl) {
+            ScopedTransaction transaction(txn, MODE_X);
+            Lock::GlobalWrite globalWriteLock(txn->lockState());
             string source = cmdObj.getStringField( name.c_str() );
             string target = cmdObj.getStringField( "to" );
+
+            // We stay in source context the whole time. This is mostly to set the CurOp namespace.
+            Client::Context ctx(txn, source);
 
             if ( !NamespaceString::validCollectionComponent(target.c_str()) ) {
                 errmsg = "invalid collection name: " + target;
@@ -114,6 +126,24 @@ namespace mongo {
             }
             if ( source.empty() || target.empty() ) {
                 errmsg = "invalid command syntax";
+                return false;
+            }
+
+            if ((repl::getGlobalReplicationCoordinator()->getReplicationMode() != 
+                 repl::ReplicationCoordinator::modeNone)) {
+                if (NamespaceString(source).isOplog()) {
+                    errmsg = "can't rename live oplog while replicating";
+                    return false;
+                }
+                if (NamespaceString(target).isOplog()) {
+                    errmsg = "can't rename to live oplog while replicating";
+                    return false;
+                }
+            }
+
+            if (NamespaceString::oplog(source) != NamespaceString::oplog(target)) {
+                errmsg =
+                    "If either the source or target of a rename is an oplog name, both must be";
                 return false;
             }
 
@@ -131,27 +161,26 @@ namespace mongo {
                 }
             }
 
-            string sourceDB = nsToDatabase(source);
-            string targetDB = nsToDatabase(target);
+            if (NamespaceString(source).coll() == "system.indexes"
+                || NamespaceString(target).coll() == "system.indexes") {
+                errmsg = "renaming system.indexes is not allowed";
+                return false;
+            }
 
-            bool capped = false;
-            long long size = 0;
-            std::vector<BSONObj> indexesInProg;
+            Database* const sourceDB = dbHolder().get(txn, nsToDatabase(source));
+            Collection* const sourceColl = sourceDB ? sourceDB->getCollection(source)
+                                                    : NULL;
+            if (!sourceColl) {
+                errmsg = "source namespace does not exist";
+                return false;
+            }
 
             {
-                Client::Context srcCtx( source );
-                Collection* sourceColl = srcCtx.db()->getCollection( source );
-
-                if ( !sourceColl ) {
-                    errmsg = "source namespace does not exist";
-                    return false;
-                }
-
                 // Ensure that collection name does not exceed maximum length.
                 // Ensure that index names do not push the length over the max.
                 // Iterator includes unfinished indexes.
                 IndexCatalog::IndexIterator sourceIndIt =
-                    sourceColl->getIndexCatalog()->getIndexIterator( true );
+                    sourceColl->getIndexCatalog()->getIndexIterator( txn, true );
                 int longestIndexNameLength = 0;
                 while ( sourceIndIt.more() ) {
                     int thisLength = sourceIndIt.next()->indexName().length();
@@ -160,8 +189,8 @@ namespace mongo {
                 }
 
                 unsigned int longestAllowed =
-                    min(int(Namespace::MaxNsColletionLen),
-                        int(Namespace::MaxNsLen) - 2/*strlen(".$")*/ - longestIndexNameLength);
+                    min(int(NamespaceString::MaxNsCollectionLen),
+                        int(NamespaceString::MaxNsLen) - 2/*strlen(".$")*/ - longestIndexNameLength);
                 if (target.size() > longestAllowed) {
                     StringBuilder sb;
                     sb << "collection name length of " << target.size()
@@ -170,183 +199,152 @@ namespace mongo {
                     errmsg = sb.str();
                     return false;
                 }
-
-                {
-
-                    indexesInProg = stopIndexBuilds( srcCtx.db(), cmdObj );
-                    capped = sourceColl->isCapped();
-                    if ( capped ) {
-                        size = sourceColl->storageSize();
-                    }
-                }
             }
 
+            const std::vector<BSONObj> indexesInProg = stopIndexBuilds(txn, sourceDB, cmdObj);
+            // Dismissed on success
+            ScopeGuard indexBuildRestorer = MakeGuard(IndexBuilder::restoreIndexes,
+                                                      txn,
+                                                      indexesInProg);
+
+            Database* const targetDB = dbHolder().openDb(txn, nsToDatabase(target));
+
             {
-                Client::Context ctx( target );
+                WriteUnitOfWork wunit(txn);
 
                 // Check if the target namespace exists and if dropTarget is true.
                 // If target exists and dropTarget is not true, return false.
-                if ( ctx.db()->getCollection( target ) ) {
-                    if ( !cmdObj["dropTarget"].trueValue() ) {
+                if (targetDB->getCollection(target)) {
+                    if (!cmdObj["dropTarget"].trueValue()) {
                         errmsg = "target namespace exists";
                         return false;
                     }
 
-                    Status s = ctx.db()->dropCollection( txn, target );
+                    Status s = targetDB->dropCollection(txn, target);
                     if ( !s.isOK() ) {
                         errmsg = s.toString();
-                        restoreIndexBuildsOnSource( indexesInProg, source );
                         return false;
                     }
                 }
 
                 // If we are renaming in the same database, just
                 // rename the namespace and we're done.
-                if ( sourceDB == targetDB ) {
-                    Status s = ctx.db()->renameCollection( txn, source, target,
-                                                           cmdObj["stayTemp"].trueValue() );
-                    if ( !s.isOK() ) {
-                        errmsg = s.toString();
-                        restoreIndexBuildsOnSource( indexesInProg, source );
-                        return false;
+                if (sourceDB == targetDB) {
+                    Status s = targetDB->renameCollection(txn,
+                                                          source,
+                                                          target,
+                                                          cmdObj["stayTemp"].trueValue() );
+                    if (!s.isOK()) {
+                        return appendCommandStatus(result, s);
                     }
+
+                    if (!fromRepl) {
+                        repl::logOp(txn, "c", (dbname + ".$cmd").c_str(), cmdObj);
+                    }
+
+                    wunit.commit();
+                    indexBuildRestorer.Dismiss();
                     return true;
                 }
 
-                // Otherwise, we are enaming across databases, so we must copy all
-                // the data and then remove the source collection.
+                wunit.commit();
+            }
 
-                // Create the target collection.
-                Collection* targetColl = NULL;
-                if ( capped ) {
-                    CollectionOptions options;
+            // If we get here, we are renaming across databases, so we must copy all the data and
+            // indexes, then remove the source collection.
+
+            // Create the target collection. It will be removed if we fail to copy the collection.
+            // TODO use a temp collection and unset the temp flag on success.
+            Collection* targetColl = NULL;
+            {
+                CollectionOptions options;
+                options.setNoIdIndex();
+
+                if (sourceColl->isCapped()) {
+                    const CollectionOptions sourceOpts =
+                        sourceColl->getCatalogEntry()->getCollectionOptions(txn);
+
                     options.capped = true;
-                    options.cappedSize = size;
-                    options.setNoIdIndex();
+                    options.cappedSize = sourceOpts.cappedSize;
+                    options.cappedMaxDocs = sourceOpts.cappedMaxDocs;
+                }
 
-                    targetColl = ctx.db()->createCollection( txn, target, options );
-                }
-                else {
-                    CollectionOptions options;
-                    options.setNoIdIndex();
-                    // No logOp necessary because the entire renameCollection command is one logOp.
-                    targetColl = ctx.db()->createCollection( txn, target, options );
-                }
-                if ( !targetColl ) {
+                WriteUnitOfWork wunit(txn);
+
+                // No logOp necessary because the entire renameCollection command is one logOp.
+                targetColl = targetDB->createCollection(txn, target, options);
+                if (!targetColl) {
                     errmsg = "Failed to create target collection.";
-                    restoreIndexBuildsOnSource( indexesInProg, source );
                     return false;
                 }
+
+                wunit.commit();
             }
 
-            // Copy over all the data from source collection to target collection.
-            bool insertSuccessful = true;
-            boost::scoped_ptr<RecordIterator> sourceIt;
-            Collection* sourceColl = NULL;
+            // Dismissed on success
+            ScopeGuard targetCollectionDropper = MakeGuard(dropCollection, txn, targetDB, target);
 
+            MultiIndexBlock indexer(txn, targetColl);
+            indexer.allowInterruption();
+
+            // Copy the index descriptions from the source collection, adjusting the ns field.
             {
-                Client::Context srcCtx( source );
-                sourceColl = srcCtx.db()->getCollection( source );
-                sourceIt.reset( sourceColl->getIterator( DiskLoc(), false, CollectionScanParams::FORWARD ) );
-            }
-
-            Collection* targetColl = NULL;
-            while ( !sourceIt->isEOF() ) {
-                BSONObj o;
-                {
-                    Client::Context srcCtx( source );
-                    o = sourceColl->docFor(sourceIt->getNext());
-                }
-                // Insert and check return status of insert.
-                {
-                    Client::Context ctx( target );
-                    if ( !targetColl )
-                        targetColl = ctx.db()->getCollection( target );
-                    // No logOp necessary because the entire renameCollection command is one logOp.
-                    Status s = targetColl->insertDocument( txn, o, true ).getStatus();
-                    if ( !s.isOK() ) {
-                        insertSuccessful = false;
-                        errmsg = s.toString();
-                        break;
-                    }
-                }
-            }
-
-            // If inserts were unsuccessful, drop the target collection and return false.
-            if ( !insertSuccessful ) {
-                Client::Context ctx( target );
-                Status s = ctx.db()->dropCollection( txn, target );
-                if ( !s.isOK() )
-                    errmsg = s.toString();
-                restoreIndexBuildsOnSource( indexesInProg, source );
-                return false;
-            }
-
-            // Copy over the indexes to temp storage and then to the target..
-            vector<BSONObj> copiedIndexes;
-            bool indexSuccessful = true;
-            {
-                Client::Context srcCtx( source );
+                std::vector<BSONObj> indexesToCopy;
                 IndexCatalog::IndexIterator sourceIndIt =
-                    sourceColl->getIndexCatalog()->getIndexIterator( true );
-
-                while ( sourceIndIt.more() ) {
-                    BSONObj currIndex = sourceIndIt.next()->infoObj();
+                    sourceColl->getIndexCatalog()->getIndexIterator( txn, true );
+                while (sourceIndIt.more()) {
+                    const BSONObj currIndex = sourceIndIt.next()->infoObj();
 
                     // Process the source index.
-                    BSONObjBuilder b;
-                    BSONObjIterator i( currIndex );
-                    while( i.moreWithEOO() ) {
-                        BSONElement e = i.next();
-                        if ( e.eoo() )
-                            break;
-                        else if ( strcmp( e.fieldName(), "ns" ) == 0 )
-                            b.append( "ns", target );
-                        else
-                            b.append( e );
-                    }
-
-                    BSONObj newIndex = b.obj();
-                    copiedIndexes.push_back( newIndex );
+                    BSONObjBuilder newIndex;
+                    newIndex.append("ns", target);
+                    newIndex.appendElementsUnique(currIndex);
+                    indexesToCopy.push_back(newIndex.obj());
                 }
+                indexer.init(indexesToCopy);
             }
 
             {
-                Client::Context ctx( target );
-                if ( !targetColl )
-                    targetColl = ctx.db()->getCollection( target );
+                // Copy over all the data from source collection to target collection.
+                boost::scoped_ptr<RecordIterator> sourceIt(sourceColl->getIterator(txn));
+                while (!sourceIt->isEOF()) {
+                    txn->checkForInterrupt();
 
-                for ( vector<BSONObj>::iterator it = copiedIndexes.begin();
-                                                it != copiedIndexes.end(); ++it ) {
-                    Status s = targetColl->getIndexCatalog()->createIndex(txn, *it, true );
-                    if ( !s.isOK() ) {
-                        indexSuccessful = false;
-                        errmsg = s.toString();
-                        break;
-                    }
-                }
+                    const BSONObj obj = sourceColl->docFor(txn, sourceIt->getNext());
 
-                // If indexes were unsuccessful, drop the target collection and return false.
-                if ( !indexSuccessful ) {
-                    Status s = ctx.db()->dropCollection( txn, target );
-                    if ( !s.isOK() )
-                        errmsg = s.toString();
-                    restoreIndexBuildsOnSource( indexesInProg, source );
-                    return false;
+                    WriteUnitOfWork wunit(txn);
+                    // No logOp necessary because the entire renameCollection command is one logOp.
+                    Status status = targetColl->insertDocument(txn, obj, &indexer, true).getStatus();
+                    if (!status.isOK())
+                        return appendCommandStatus(result, status);
+                    wunit.commit();
                 }
             }
 
-            // Drop the source collection.
+            Status status = indexer.doneInserting();
+            if (!status.isOK())
+                return appendCommandStatus(result, status);
+
             {
-                Client::Context srcCtx( source );
-                Status s = srcCtx.db()->dropCollection( txn, source );
-                if ( !s.isOK() ) {
-                    errmsg = s.toString();
-                    restoreIndexBuildsOnSource( indexesInProg, source );
-                    return false;
+                // Getting here means we successfully built the target copy. We now remove the
+                // source collection and finalize the rename.
+                WriteUnitOfWork wunit(txn);
+
+                Status status = sourceDB->dropCollection(txn, source);
+                if (!status.isOK())
+                    return appendCommandStatus(result, status);
+
+                indexer.commit();
+
+                if (!fromRepl) {
+                    repl::logOp(txn, "c", (dbname + ".$cmd").c_str(), cmdObj);
                 }
+
+                wunit.commit();
             }
 
+            indexBuildRestorer.Dismiss();
+            targetCollectionDropper.Dismiss();
             return true;
         }
     } cmdrenamecollection;

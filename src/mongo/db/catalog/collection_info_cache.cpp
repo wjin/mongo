@@ -28,13 +28,20 @@
 *    it in the license file.
 */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/catalog/collection_info_cache.h"
 
-#include "mongo/db/d_concurrency.h"
-#include "mongo/db/query/plan_cache.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/fts/fts_spec.h"
 #include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/index_legacy.h"
+#include "mongo/db/query/plan_cache.h"
 #include "mongo/util/debug_util.h"
+#include "mongo/util/log.h"
 
 
 namespace mongo {
@@ -45,27 +52,61 @@ namespace mongo {
           _planCache(new PlanCache(collection->ns().ns())),
           _querySettings(new QuerySettings()) { }
 
-    void CollectionInfoCache::reset() {
-        Lock::assertWriteLocked( _collection->ns().ns() );
+    void CollectionInfoCache::reset( OperationContext* txn ) {
         LOG(1) << _collection->ns().ns() << ": clearing plan cache - collection info cache reset";
         clearQueryCache();
         _keysComputed = false;
+        computeIndexKeys( txn );
         // query settings is not affected by info cache reset.
         // index filters should persist throughout life of collection
     }
 
-    void CollectionInfoCache::computeIndexKeys() {
-        DEV Lock::assertWriteLocked( _collection->ns().ns() );
+    const UpdateIndexData& CollectionInfoCache::indexKeys( OperationContext* txn ) const {
+        // This requires "some" lock, and MODE_IS is an expression for that, for now.
+        dassert(txn->lockState()->isCollectionLockedForMode(_collection->ns().ns(), MODE_IS));
+        invariant(_keysComputed);
+        return _indexedPaths;
+    }
 
+    void CollectionInfoCache::computeIndexKeys( OperationContext* txn ) {
+        // This function modified objects attached to the Collection so we need a write lock
+        invariant(txn->lockState()->isCollectionLockedForMode(_collection->ns().ns(), MODE_X));
         _indexedPaths.clear();
 
-        IndexCatalog::IndexIterator i = _collection->getIndexCatalog()->getIndexIterator( true );
-        while( i.more() ) {
-            BSONObj key = i.next()->keyPattern();
-            BSONObjIterator j( key );
-            while ( j.more() ) {
-                BSONElement e = j.next();
-                _indexedPaths.addPath( e.fieldName() );
+        IndexCatalog::IndexIterator i = _collection->getIndexCatalog()->getIndexIterator(txn, true);
+        while (i.more()) {
+            IndexDescriptor* descriptor = i.next();
+
+            if (descriptor->getAccessMethodName() != IndexNames::TEXT) {
+                BSONObj key = descriptor->keyPattern();
+                BSONObjIterator j(key);
+                while (j.more()) {
+                    BSONElement e = j.next();
+                    _indexedPaths.addPath(e.fieldName());
+                }
+            }
+            else {
+                fts::FTSSpec ftsSpec(descriptor->infoObj());
+
+                if (ftsSpec.wildcard()) {
+                    _indexedPaths.allPathsIndexed();
+                }
+                else {
+                    for (size_t i = 0; i < ftsSpec.numExtraBefore(); ++i) {
+                        _indexedPaths.addPath(ftsSpec.extraBefore(i));
+                    }
+                    for (fts::Weights::const_iterator it = ftsSpec.weights().begin();
+                         it != ftsSpec.weights().end();
+                         ++it) {
+                        _indexedPaths.addPath(it->first);
+                    }
+                    for (size_t i = 0; i < ftsSpec.numExtraAfter(); ++i) {
+                        _indexedPaths.addPath(ftsSpec.extraAfter(i));
+                    }
+                    // Any update to a path containing "language" as a component could change the
+                    // language of a subdocument.  Add the override field as a path component.
+                    _indexedPaths.addPathComponent(ftsSpec.languageOverrideField());
+                }
             }
         }
 

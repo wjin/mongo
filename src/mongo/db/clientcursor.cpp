@@ -39,16 +39,21 @@
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/server_status.h"
 #include "mongo/db/commands/server_status_metric.h"
-#include "mongo/db/db.h"
+#include "mongo/db/curop.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/kill_current_op.h"
-#include "mongo/db/repl/rs.h"
-#include "mongo/db/repl/write_concern.h"
+#include "mongo/db/operation_context_impl.h"
+#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/util/exit.h"
 
 namespace mongo {
+
+    using std::string;
+    using std::stringstream;
 
     static Counter64 cursorStatsOpen; // gauge
     static Counter64 cursorStatsOpenPinned; // gauge
@@ -68,48 +73,55 @@ namespace mongo {
         return cursorStatsOpen.get();
     }
 
-    ClientCursor::ClientCursor(const Collection* collection, Runner* runner,
-                               int qopts, const BSONObj query)
-        : _collection( collection ),
-          _countedYet( false ) {
-        _runner.reset(runner);
-        _ns = runner->ns();
+    ClientCursor::ClientCursor(CursorManager* cursorManager,
+                               PlanExecutor* exec,
+                               const std::string& ns,
+                               int qopts,
+                               const BSONObj query,
+                               bool isAggCursor)
+        : _ns(ns),
+          _cursorManager(cursorManager),
+          _countedYet(false),
+          _isAggCursor(isAggCursor),
+          _unownedRU(NULL) {
+
+        _exec.reset(exec);
         _query = query;
         _queryOptions = qopts;
-        if ( runner->collection() ) {
-            invariant( collection == runner->collection() );
+        if (exec->collection()) {
+            invariant(cursorManager == exec->collection()->getCursorManager());
         }
         init();
     }
 
     ClientCursor::ClientCursor(const Collection* collection)
         : _ns(collection->ns().ns()),
-          _collection(collection),
-          _countedYet( false ),
-          _queryOptions(QueryOption_NoCursorTimeout) {
+          _cursorManager(collection->getCursorManager()),
+          _countedYet(false),
+          _queryOptions(QueryOption_NoCursorTimeout),
+          _isAggCursor(false),
+          _unownedRU(NULL) {
         init();
     }
 
     void ClientCursor::init() {
-        invariant( _collection );
+        invariant( _cursorManager );
 
-        isAggCursor = false;
+        _isPinned = false;
+        _isNoTimeout = false;
 
         _idleAgeMillis = 0;
         _leftoverMaxTimeMicros = 0;
-        _pinValue = 0;
         _pos = 0;
-
-        Lock::assertAtLeastReadLocked(_ns);
 
         if (_queryOptions & QueryOption_NoCursorTimeout) {
             // cursors normally timeout after an inactivity period to prevent excess memory use
             // setting this prevents timeout of the cursor in question.
-            ++_pinValue;
+            _isNoTimeout = true;
             cursorStatsOpenNoTimeout.increment();
         }
 
-        _cursorid = _collection->cursorCache()->registerCursor( this );
+        _cursorid = _cursorManager->registerCursor( this );
 
         cursorStatsOpen.increment();
         _countedYet = true;
@@ -122,162 +134,138 @@ namespace mongo {
             return;
         }
 
+        invariant( !_isPinned ); // Must call unsetPinned() before invoking destructor.
+
         if ( _countedYet ) {
             _countedYet = false;
             cursorStatsOpen.decrement();
-            if ( _pinValue == 1 )
+            if ( _isNoTimeout )
                 cursorStatsOpenNoTimeout.decrement();
         }
 
-        if ( _collection ) {
+        if ( _cursorManager ) {
             // this could be null if kill() was killed
-            _collection->cursorCache()->deregisterCursor( this );
+            _cursorManager->deregisterCursor( this );
         }
 
         // defensive:
-        _collection = NULL;
+        _cursorManager = NULL;
         _cursorid = INVALID_CURSOR_ID;
         _pos = -2;
-        _pinValue = 0;
+        _isNoTimeout = false;
     }
 
     void ClientCursor::kill() {
-        if ( _runner.get() )
-            _runner->kill();
+        if ( _exec.get() )
+            _exec->kill();
 
-        _collection = NULL;
-    }
-
-    void yieldOrSleepFor1Microsecond() {
-#ifdef _WIN32
-        SwitchToThread();
-#elif defined(__linux__)
-        pthread_yield();
-#else
-        sleepmicros(1);
-#endif
-    }
-
-    void ClientCursor::staticYield(int micros, const StringData& ns) {
-        bool haveReadLock = Lock::isReadLocked();
-
-        killCurrentOp.checkForInterrupt();
-        {
-            dbtempreleasecond unlock;
-            if ( unlock.unlocked() ) {
-                if ( haveReadLock ) {
-                    // This sleep helps reader threads yield to writer threads.
-                    // Without this, the underlying reader/writer lock implementations
-                    // are not sufficiently writer-greedy.
-#ifdef _WIN32
-                    SwitchToThread();
-#else
-                    if ( micros == 0 ) {
-                        yieldOrSleepFor1Microsecond();
-                    }
-                    else {
-                        sleepmicros(1);
-                    }
-#endif
-                }
-                else {
-                    if ( micros == -1 ) {
-                        sleepmicros(Client::recommendedYieldMicros());
-                    }
-                    else if ( micros == 0 ) {
-                        yieldOrSleepFor1Microsecond();
-                    }
-                    else if ( micros > 0 ) {
-                        sleepmicros( micros );
-                    }
-                }
-
-            }
-            else if ( Listener::getTimeTracker() == 0 ) {
-                // we aren't running a server, so likely a repair, so don't complain
-            }
-            else {
-                CurOp * c = cc().curop();
-                while ( c->parent() )
-                    c = c->parent();
-                warning() << "ClientCursor::staticYield can't unlock b/c of recursive lock"
-                          << " ns: " << ns 
-                          << " top: " << c->info()
-                          << endl;
-            }
-        }
+        _cursorManager = NULL;
     }
 
     //
     // Timing and timeouts
     //
 
-    bool ClientCursor::shouldTimeout(unsigned millis) {
+    bool ClientCursor::shouldTimeout(int millis) {
         _idleAgeMillis += millis;
-        return _idleAgeMillis > 600000 && _pinValue == 0;
+        if (_isNoTimeout || _isPinned) {
+            return false;
+        }
+        return _idleAgeMillis > 600000;
     }
 
-    void ClientCursor::setIdleTime( unsigned millis ) {
+    void ClientCursor::setIdleTime( int millis ) {
         _idleAgeMillis = millis;
     }
 
-    void ClientCursor::updateSlaveLocation( CurOp& curop ) {
-        if ( _slaveReadTill.isNull() )
+    void ClientCursor::updateSlaveLocation(OperationContext* txn, CurOp& curop) {
+        if (_slaveReadTill.isNull())
             return;
-        mongo::updateSlaveLocation( curop , _ns.c_str() , _slaveReadTill );
+
+        verify(str::startsWith(_ns.c_str(), "local.oplog."));
+
+        Client* c = curop.getClient();
+        verify(c);
+        OID rid = c->getRemoteID();
+        if (!rid.isSet())
+            return;
+
+        repl::getGlobalReplicationCoordinator()->setLastOptimeForSlave(rid, _slaveReadTill);
     }
 
-    int ClientCursor::suggestYieldMicros() {
-        int writers = 0;
-        int readers = 0;
+    //
+    // Storage engine state for getMore.
+    //
 
-        int micros = Client::recommendedYieldMicros( &writers , &readers );
+    void ClientCursor::setUnownedRecoveryUnit(RecoveryUnit* ru) {
+        invariant(!_unownedRU);
+        invariant(!_ownedRU.get());
+        _unownedRU = ru;
+    }
 
-        if ( micros > 0 && writers == 0 && Lock::isR() ) {
-            // we have a read lock, and only reads are coming on, so why bother unlocking
-            return 0;
-        }
+    RecoveryUnit* ClientCursor::getUnownedRecoveryUnit() const {
+        return _unownedRU;
+    }
 
-        wassert( micros < 10000000 );
-        dassert( micros <  1000001 );
-        return micros;
+    void ClientCursor::setOwnedRecoveryUnit(RecoveryUnit* ru) {
+        invariant(!_unownedRU);
+        invariant(!_ownedRU.get());
+        _ownedRU.reset(ru);
+    }
+
+    RecoveryUnit* ClientCursor::releaseOwnedRecoveryUnit() {
+        return _ownedRU.release();
     }
 
     //
     // Pin methods
-    // TODO: Simplify when we kill Cursor.  In particular, once we've pinned a CC, it won't be
-    // deleted from underneath us, so we can save the pointer and ignore the ID.
     //
 
-    ClientCursorPin::ClientCursorPin( const Collection* collection, long long cursorid )
+    ClientCursorPin::ClientCursorPin( CursorManager* cursorManager, long long cursorid )
         : _cursor( NULL ) {
         cursorStatsOpenPinned.increment();
-        _cursor = collection->cursorCache()->find( cursorid, true );
+        _cursor = cursorManager->find( cursorid, true );
     }
 
     ClientCursorPin::~ClientCursorPin() {
         cursorStatsOpenPinned.decrement();
-        DESTRUCTOR_GUARD( release(); );
+        release();
     }
 
     void ClientCursorPin::release() {
         if ( !_cursor )
             return;
 
-        invariant( _cursor->pinValue() >= 100 );
+        invariant( _cursor->isPinned() );
 
-        if ( _cursor->collection() == NULL ) {
-            // the ClientCursor was killed while we had it
-            // therefore its our responsibility to kill it
-            delete _cursor;
-            _cursor = NULL; // defensive
+        if ( _cursor->cursorManager() == NULL ) {
+            // The ClientCursor was killed while we had it.  Therefore, it is our responsibility to
+            // kill it.
+            deleteUnderlying();
         }
         else {
-            _cursor->collection()->cursorCache()->unpin( _cursor );
+            // Unpin the cursor under the collection cursor manager lock.
+            _cursor->cursorManager()->unpin( _cursor );
         }
+
+        _cursor = NULL;
     }
 
     void ClientCursorPin::deleteUnderlying() {
+        invariant( _cursor );
+        invariant( _cursor->isPinned() );
+        // Note the following subtleties of this method's implementation:
+        // - We must unpin the cursor before destruction, since it is an error to destroy a pinned
+        //   cursor.
+        // - In addition, we must deregister the cursor before unpinning, since it is an
+        //   error to unpin a registered cursor without holding the cursor manager lock (note that
+        //   we can't simply unpin with the cursor manager lock here, since we need to guarantee
+        //   exclusive ownership of the cursor when we are deleting it).
+        if ( _cursor->cursorManager() ) {
+            _cursor->cursorManager()->deregisterCursor( _cursor );
+            _cursor->kill();
+        }
+        _cursor->unsetPinned();
         delete _cursor;
         _cursor = NULL;
     }
@@ -290,21 +278,32 @@ namespace mongo {
     // ClientCursorMonitor
     //
 
-    void ClientCursorMonitor::run() {
-        Client::initThread("clientcursormon");
-        Client& client = cc();
-        Timer t;
-        const int Secs = 4;
-        while ( ! inShutdown() ) {
-            cursorStatsTimedOut.increment( CollectionCursorCache::timeoutCursorsGlobal( t.millisReset() ) );
-            sleepsecs(Secs);
+    /**
+     * Thread for timing out old cursors
+     */
+    class ClientCursorMonitor : public BackgroundJob {
+    public:
+        std::string name() const { return "ClientCursorMonitor"; }
+
+        void run() {
+            Client::initThread("clientcursormon");
+            Client& client = cc();
+            Timer t;
+            const int Secs = 4;
+            while (!inShutdown()) {
+                OperationContextImpl txn;
+                cursorStatsTimedOut.increment(
+                    CursorManager::timeoutCursorsGlobal(&txn, t.millisReset()));
+                sleepsecs(Secs);
+            }
+            client.shutdown();
         }
-        client.shutdown();
-    }
+    };
 
     namespace {
+        // Only one instance of the ClientCursorMonitor exists
         ClientCursorMonitor clientCursorMonitor;
-        
+
         void _appendCursorStats( BSONObjBuilder& b ) {
             b.append( "note" , "deprecated, use server status metrics" );
             b.appendNumber("clientCursors_size", cursorStatsOpen.get() );
@@ -315,9 +314,13 @@ namespace mongo {
         }
     }
 
+    void startClientCursorMonitor() {
+        clientCursorMonitor.go();
+    }
+
     // QUESTION: Restrict to the namespace from which this command was issued?
     // Alternatively, make this command admin-only?
-    // TODO: remove this for 2.8
+    // TODO: remove this for 3.0
     class CmdCursorInfo : public Command {
     public:
         CmdCursorInfo() : Command( "cursorInfo", true ) {}
@@ -333,7 +336,7 @@ namespace mongo {
             actions.addAction(ActionType::cursorInfo);
             out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
         }
-        bool run(const string& dbname, BSONObj& jsobj, int, string& errmsg, BSONObjBuilder& result,
+        bool run(OperationContext* txn, const string& dbname, BSONObj& jsobj, int, string& errmsg, BSONObjBuilder& result,
                  bool fromRepl ) {
             _appendCursorStats( result );
             return true;
@@ -349,11 +352,13 @@ namespace mongo {
         CursorServerStats() : ServerStatusSection( "cursors" ){}
         virtual bool includeByDefault() const { return true; }
 
-        BSONObj generateSection(const BSONElement& configElement) const {
+        BSONObj generateSection(OperationContext* txn,
+                                const BSONElement& configElement) const {
             BSONObjBuilder b;
             _appendCursorStats( b );
             return b.obj();
         }
+
     } cursorServerStats;
 
 } // namespace mongo

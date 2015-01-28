@@ -37,7 +37,10 @@
 
 namespace mongo {
 
-    const size_t QueryPlannerAnalysis::kMaxScansToExplode = 50;
+    using std::auto_ptr;
+    using std::endl;
+    using std::string;
+    using std::vector;
 
     //
     // Helpers for bounds explosion AKA quick-and-dirty SERVER-1205.
@@ -80,22 +83,37 @@ namespace mongo {
 
         /**
          * Should we try to expand the index scan(s) in 'solnRoot' to pull out an indexed sort?
+         *
+         * Returns the node which should be replaced by the merge sort of exploded scans
+         * in the out-parameter 'toReplace'.
          */
-        bool structureOKForExplode(QuerySolutionNode* solnRoot) {
+        bool structureOKForExplode(QuerySolutionNode* solnRoot, QuerySolutionNode** toReplace) {
             // For now we only explode if we *know* we will pull the sort out.  We can look at
             // more structure (or just explode and recalculate properties and see what happens)
             // but for now we just explode if it's a sure bet.
             //
-            // TODO: Can also try exploding if root is OR and children are ixscans, or root is
-            // AND_HASH (last child dictates order.), or other less obvious cases...
+            // TODO: Can also try exploding if root is AND_HASH (last child dictates order.),
+            // or other less obvious cases...
             if (STAGE_IXSCAN == solnRoot->getType()) {
+                *toReplace = solnRoot;
                 return true;
             }
 
             if (STAGE_FETCH == solnRoot->getType()) {
                  if (STAGE_IXSCAN == solnRoot->children[0]->getType()) {
+                     *toReplace = solnRoot->children[0];
                      return true;
                  }
+            }
+
+            if (STAGE_OR == solnRoot->getType()) {
+                for (size_t i = 0; i < solnRoot->children.size(); ++i) {
+                    if (STAGE_IXSCAN != solnRoot->children[i]->getType()) {
+                        return false;
+                    }
+                }
+                *toReplace = solnRoot;
+                return true;
             }
 
             return false;
@@ -151,8 +169,9 @@ namespace mongo {
         }
 
         /**
-         * Take the provided index scan node 'isn' and return a logically equivalent node that
-         * provides the same data but provides the sort order 'sort'.
+         * Take the provided index scan node 'isn'. Returns a list of index scans which are
+         * logically equivalent to 'isn' if joined by a MergeSort through the out-parameter
+         * 'explosionResult'. These index scan instances are owned by the caller.
          *
          * fieldsToExplode is a count of how many fields in the scan's bounds are the union of point
          * intervals.  This is computed beforehand and provided as a small optimization.
@@ -164,21 +183,18 @@ namespace mongo {
          * 'sort' will be {b: 1}
          * 'fieldsToExplode' will be 1 (as only one field isUnionOfPoints).
          *
-         * The solution returned will be a mergesort of the two scans:
+         * On return, 'explosionResult' will contain the following two scans:
          * a:[[1,1]], b:[MinKey, MaxKey]
          * a:[[2,2]], b:[MinKey, MaxKey]
          */
-        QuerySolutionNode* explodeScan(IndexScanNode* isn,
-                                       const BSONObj& sort,
-                                       size_t fieldsToExplode) {
+        void explodeScan(IndexScanNode* isn,
+                         const BSONObj& sort,
+                         size_t fieldsToExplode,
+                         vector<QuerySolutionNode*>* explosionResult) {
 
             // Turn the compact bounds in 'isn' into a bunch of points...
             vector<PointPrefix> prefixForScans;
             makeCartesianProduct(isn->bounds, fieldsToExplode, &prefixForScans);
-
-            // And merge-sort the scans over those points.
-            auto_ptr<MergeSortNode> merge(new MergeSortNode());
-            merge->sort = sort;
 
             for (size_t i = 0; i < prefixForScans.size(); ++i) {
                 const PointPrefix& prefix = prefixForScans[i];
@@ -192,6 +208,11 @@ namespace mongo {
                 child->addKeyMetadata = isn->addKeyMetadata;
                 child->indexIsMultiKey = isn->indexIsMultiKey;
 
+                // Copy the filter, if there is one.
+                if (isn->filter.get()) {
+                    child->filter.reset(isn->filter->shallowClone());
+                }
+
                 // Create child bounds.
                 child->bounds.fields.resize(isn->bounds.fields.size());
                 for (size_t j = 0; j < fieldsToExplode; ++j) {
@@ -201,11 +222,8 @@ namespace mongo {
                 for (size_t j = fieldsToExplode; j < isn->bounds.fields.size(); ++j) {
                     child->bounds.fields[j] = isn->bounds.fields[j];
                 }
-                merge->children.push_back(child);
+                explosionResult->push_back(child);
             }
-
-            merge->computeProperties();
-            return merge.release();
         }
 
         /**
@@ -240,12 +258,30 @@ namespace mongo {
 
     }  // namespace
 
+    // static
+    BSONObj QueryPlannerAnalysis::getSortPattern(const BSONObj& indexKeyPattern) {
+        BSONObjBuilder sortBob;
+        BSONObjIterator kpIt(indexKeyPattern);
+        while (kpIt.more()) {
+            BSONElement elt = kpIt.next();
+            if (elt.type() == mongo::String) {
+                break;
+            }
+            long long val = elt.safeNumberLong();
+            int sortOrder = val >= 0 ? 1 : -1;
+            sortBob.append(elt.fieldName(), sortOrder);
+        }
+        return sortBob.obj();
+    }
+
+    // static
     bool QueryPlannerAnalysis::explodeForSort(const CanonicalQuery& query,
                                               const QueryPlannerParams& params,
                                               QuerySolutionNode** solnRoot) {
         vector<QuerySolutionNode*> leafNodes;
 
-        if (!structureOKForExplode(*solnRoot)) {
+        QuerySolutionNode* toReplace;
+        if (!structureOKForExplode(*solnRoot, &toReplace)) {
             return false;
         }
 
@@ -297,6 +333,11 @@ namespace mongo {
                 return false;
             }
 
+            // Only explode if there's at least one field to explode for this scan.
+            if (0 == boundsIdx) {
+                return false;
+            }
+
             // The rest of the fields define the sort order we could obtain by exploding
             // the bounds.
             BSONObjBuilder resultingSortBob;
@@ -328,7 +369,7 @@ namespace mongo {
         }
 
         // Too many ixscans spoil the performance.
-        if (totalNumScans > QueryPlannerAnalysis::kMaxScansToExplode) {
+        if (totalNumScans > (size_t)internalQueryMaxScansToExplode) {
             QLOG() << "Could expand ixscans to pull out sort order but resulting scan count"
                    << "(" << totalNumScans << ") is too high.";
             return false;
@@ -336,14 +377,19 @@ namespace mongo {
 
         // If we're here, we can (probably?  depends on how restrictive the structure check is)
         // get our sort order via ixscan blow-up.
+        MergeSortNode* merge = new MergeSortNode();
+        merge->sort = desiredSort;
         for (size_t i = 0; i < leafNodes.size(); ++i) {
             IndexScanNode* isn = static_cast<IndexScanNode*>(leafNodes[i]);
-            QuerySolutionNode* newNode = explodeScan(isn, desiredSort, fieldsToExplode[i]);
-            // Replace 'isn' with 'newNode'
-            replaceNodeInTree(solnRoot, isn, newNode);
-            // And get rid of the old data access node.
-            delete isn;
+            explodeScan(isn, desiredSort, fieldsToExplode[i], &merge->children);
         }
+
+        merge->computeProperties();
+
+        // Replace 'toReplace' with the new merge sort node.
+        replaceNodeInTree(solnRoot, toReplace, merge);
+        // And get rid of the node that got replaced.
+        delete toReplace;
 
         return true;
     }
@@ -434,6 +480,11 @@ namespace mongo {
             // We have no idea what the client intended. One way to handle the ambiguity
             // of a limited OR stage is to use the SPLIT_LIMITED_SORT hack.
             //
+            // If wantMore is false (meaning that 'ntoreturn' was initially passed to
+            // the server as a negative value), then we treat numToReturn as a limit.
+            // Since there is no limit-batchSize ambiguity in this case, we do not use the
+            // SPLIT_LIMITED_SORT hack.
+            //
             // If numToReturn is really a limit, then we want to add a limit to this
             // SORT stage, and hence perform a topK.
             //
@@ -444,7 +495,8 @@ namespace mongo {
             // with the topK first. If the client wants a limit, they'll get the efficiency
             // of topK. If they want a batchSize, the other OR branch will deliver the missing
             // results. The OR stage handles deduping.
-            if (params.options & QueryPlannerParams::SPLIT_LIMITED_SORT
+            if (query.getParsed().wantMore()
+                && params.options & QueryPlannerParams::SPLIT_LIMITED_SORT
                 && !QueryPlannerCommon::hasNode(query.root(), MatchExpression::TEXT)
                 && !QueryPlannerCommon::hasNode(query.root(), MatchExpression::GEO)
                 && !QueryPlannerCommon::hasNode(query.root(), MatchExpression::GEO_NEAR)) {
@@ -476,7 +528,6 @@ namespace mongo {
                                                            QuerySolutionNode* solnRoot) {
         auto_ptr<QuerySolution> soln(new QuerySolution());
         soln->filterData = query.getQueryObj();
-        verify(soln->filterData.isOwned());
         soln->indexFilterApplied = params.indexFiltersApplied;
 
         solnRoot->computeProperties();
@@ -487,12 +538,29 @@ namespace mongo {
         // If we're answering a query on a sharded system, we need to drop documents that aren't
         // logically part of our shard.
         if (params.options & QueryPlannerParams::INCLUDE_SHARD_FILTER) {
-            // TODO: We could use params.shardKey to do fetch analysis instead of always fetching.
+
             if (!solnRoot->fetched()) {
-                FetchNode* fetch = new FetchNode();
-                fetch->children.push_back(solnRoot);
-                solnRoot = fetch;
+
+                // See if we need to fetch information for our shard key.
+                // NOTE: Solution nodes only list ordinary, non-transformed index keys for now
+
+                bool fetch = false;
+                BSONObjIterator it(params.shardKey);
+                while (it.more()) {
+                    BSONElement nextEl = it.next();
+                    if (!solnRoot->hasField(nextEl.fieldName())) {
+                        fetch = true;
+                        break;
+                    }
+                }
+
+                if (fetch) {
+                    FetchNode* fetch = new FetchNode();
+                    fetch->children.push_back(solnRoot);
+                    solnRoot = fetch;
+                }
             }
+
             ShardingFilterNode* sfn = new ShardingFilterNode();
             sfn->children.push_back(solnRoot);
             solnRoot = sfn;
@@ -532,8 +600,7 @@ namespace mongo {
 
         // Only these stages can produce flagged results.  A stage has to hold state past one call
         // to work(...) in order to possibly flag a result.
-        bool couldProduceFlagged = hasNode(solnRoot, STAGE_GEO_2D)
-                                || hasAndHashStage
+        bool couldProduceFlagged = hasAndHashStage
                                 || hasNode(solnRoot, STAGE_AND_SORTED)
                                 || hasNode(solnRoot, STAGE_FETCH);
 

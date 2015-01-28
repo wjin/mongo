@@ -2,20 +2,34 @@
 
 /*    Copyright 2009 10gen Inc.
  *
- *    Licensed under the Apache License, Version 2.0 (the "License");
- *    you may not use this file except in compliance with the License.
- *    You may obtain a copy of the License at
+ *    This program is free software: you can redistribute it and/or  modify
+ *    it under the terms of the GNU Affero General Public License, version 3,
+ *    as published by the Free Software Foundation.
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License for more details.
  *
- *    Unless required by applicable law or agreed to in writing, software
- *    distributed under the License is distributed on an "AS IS" BASIS,
- *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *    See the License for the specific language governing permissions and
- *    limitations under the License.
+ *    You should have received a copy of the GNU Affero General Public License
+ *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
  */
 
-#include "mongo/pch.h"
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+
+#include "mongo/platform/basic.h"
 
 #include "mongo/util/assert_util.h"
 
@@ -27,7 +41,11 @@ using namespace std;
 #endif
 
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/db/lasterror.h"
+#include "mongo/util/debug_util.h"
+#include "mongo/util/debugger.h"
+#include "mongo/util/exit.h"
+#include "mongo/util/log.h"
+#include "mongo/util/quick_exit.h"
 #include "mongo/util/stacktrace.h"
 
 namespace mongo {
@@ -83,7 +101,7 @@ namespace mongo {
     }
 
     /* "warning" assert -- safe to continue, so we don't throw exception. */
-    NOINLINE_DECL void wasserted(const char *msg, const char *file, unsigned line) {
+    NOINLINE_DECL void wasserted(const char* expr, const char* file, unsigned line) {
         static bool rateLimited;
         static time_t lastWhen;
         static unsigned lastLine;
@@ -97,22 +115,20 @@ namespace mongo {
         lastWhen = time(0);
         lastLine = line;
 
-        problem() << "warning assertion failure " << msg << ' ' << file << ' ' << dec << line << endl;
+        log() << "warning assertion failure " << expr << ' ' << file << ' ' << dec << line << endl;
         logContext();
-        setLastError(0,msg && *msg ? msg : "wassertion failure");
         assertionCount.condrollover( ++assertionCount.warning );
 #if defined(_DEBUG) || defined(_DURABLEDEFAULTON) || defined(_DURABLEDEFAULTOFF)
         // this is so we notice in buildbot
         log() << "\n\n***aborting after wassert() failure in a debug/test build\n\n" << endl;
-        abort();
+        quickExit(EXIT_ABRUPT);
 #endif
     }
 
-    NOINLINE_DECL void verifyFailed(const char *msg, const char *file, unsigned line) {
+    NOINLINE_DECL void verifyFailed(const char* expr, const char* file, unsigned line) {
         assertionCount.condrollover( ++assertionCount.regular );
-        problem() << "Assertion failure " << msg << ' ' << file << ' ' << dec << line << endl;
+        log() << "Assertion failure " << expr << ' ' << file << ' ' << dec << line << endl;
         logContext();
-        setLastError(0,msg && *msg ? msg : "assertion failure");
         stringstream temp;
         temp << "assertion " << file << ":" << line;
         AssertionException e(temp.str(),0);
@@ -120,40 +136,57 @@ namespace mongo {
 #if defined(_DEBUG) || defined(_DURABLEDEFAULTON) || defined(_DURABLEDEFAULTOFF)
         // this is so we notice in buildbot
         log() << "\n\n***aborting after verify() failure as this is a debug/test build\n\n" << endl;
-        abort();
+        quickExit(EXIT_ABRUPT);
 #endif
         throw e;
     }
 
-    NOINLINE_DECL void invariantFailed(const char *msg, const char *file, unsigned line) {
-        problem() << "Invariant failure " << msg << ' ' << file << ' ' << dec << line << endl;
+    NOINLINE_DECL void invariantFailed(const char* expr, const char* file, unsigned line) {
+        log() << "Invariant failure " << expr << ' ' << file << ' ' << dec << line << endl;
         logContext();
         breakpoint();
         log() << "\n\n***aborting after invariant() failure\n\n" << endl;
-        abort();
+        quickExit(EXIT_ABRUPT);
+    }
+
+    NOINLINE_DECL void invariantOKFailed(const char* expr, const Status& status, const char *file,
+                                         unsigned line) {
+        log() << "Invariant failure: " << expr << " resulted in status " << status
+              << " at " << file << ' ' << dec << line;
+        logContext();
+        breakpoint();
+        log() << "\n\n***aborting after invariant() failure\n\n" << endl;
+        quickExit(EXIT_ABRUPT);
     }
 
     NOINLINE_DECL void fassertFailed( int msgid ) {
-        problem() << "Fatal Assertion " << msgid << endl;
+        log() << "Fatal Assertion " << msgid << endl;
         logContext();
         breakpoint();
         log() << "\n\n***aborting after fassert() failure\n\n" << endl;
-        abort();
+        quickExit(EXIT_ABRUPT);
     }
 
     NOINLINE_DECL void fassertFailedNoTrace( int msgid ) {
-        problem() << "Fatal Assertion " << msgid << endl;
+        log() << "Fatal Assertion " << msgid << endl;
         breakpoint();
         log() << "\n\n***aborting after fassert() failure\n\n" << endl;
-        ::_exit(EXIT_ABRUPT); // bypass our handler for SIGABRT, which prints a stack trace.
+        quickExit(EXIT_ABRUPT);
     }
 
     MONGO_COMPILER_NORETURN void fassertFailedWithStatus(int msgid, const Status& status) {
-        problem() << "Fatal assertion " <<  msgid << " " << status;
+        log() << "Fatal assertion " <<  msgid << " " << status;
         logContext();
         breakpoint();
         log() << "\n\n***aborting after fassert() failure\n\n" << endl;
-        abort();
+        quickExit(EXIT_ABRUPT);
+    }
+
+    MONGO_COMPILER_NORETURN void fassertFailedWithStatusNoTrace(int msgid, const Status& status) {
+        log() << "Fatal assertion " <<  msgid << " " << status;
+        breakpoint();
+        log() << "\n\n***aborting after fassert() failure\n\n" << endl;
+        quickExit(EXIT_ABRUPT);
     }
 
     void uasserted(int msgid , const string &msg) {
@@ -166,7 +199,6 @@ namespace mongo {
     NOINLINE_DECL void uasserted(int msgid, const char *msg) {
         assertionCount.condrollover( ++assertionCount.user );
         LOG(1) << "User Assertion: " << msgid << ":" << msg << endl;
-        setLastError(msgid,msg);
         throw UserException(msgid, msg);
     }
 
@@ -177,7 +209,6 @@ namespace mongo {
     NOINLINE_DECL void msgasserted(int msgid, const char *msg) {
         assertionCount.condrollover( ++assertionCount.warning );
         log() << "Assertion: " << msgid << ":" << msg << endl;
-        setLastError(msgid,msg && *msg ? msg : "massert failure");
         //breakpoint();
         logContext();
         throw MsgAssertionException(msgid, msg);
@@ -186,7 +217,6 @@ namespace mongo {
     NOINLINE_DECL void msgassertedNoTrace(int msgid, const char *msg) {
         assertionCount.condrollover( ++assertionCount.warning );
         log() << "Assertion: " << msgid << ":" << msg << endl;
-        setLastError(msgid,msg && *msg ? msg : "massert failure");
         throw MsgAssertionException(msgid, msg);
     }
 
@@ -216,14 +246,6 @@ namespace mongo {
 
     std::string causedBy( const Status& e ){
         return causedBy( e.reason() );
-    }
-
-    NOINLINE_DECL void streamNotGood( int code , const std::string& msg , std::ios& myios ) {
-        stringstream ss;
-        // errno might not work on all systems for streams
-        // if it doesn't for a system should deal with here
-        ss << msg << " stream invalid: " << errnoWithDescription();
-        throw UserException( code , ss.str() );
     }
 
     string errnoWithPrefix( const char * prefix ) {

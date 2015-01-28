@@ -28,12 +28,14 @@
 
 #pragma once
 
+#include <boost/noncopyable.hpp>
+#include <boost/scoped_ptr.hpp>
 #include <boost/thread/recursive_mutex.hpp>
 
-#include "mongo/db/diskloc.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/keypattern.h"
-#include "mongo/db/query/runner.h"
+#include "mongo/db/query/plan_executor.h"
+#include "mongo/db/record_id.h"
 #include "mongo/s/collection_metadata.h"
 #include "mongo/util/background.h"
 #include "mongo/util/net/message.h"
@@ -44,9 +46,11 @@ namespace mongo {
     class ClientCursor;
     class Collection;
     class CurOp;
+    class CursorManager;
     class Database;
     class NamespaceDetails;
     class ParsedQuery;
+    class RecoveryUnit;
 
     typedef long long CursorId; /* passed to the client so it can send back on getMore */
     static const CursorId INVALID_CURSOR_ID = -1; // But see SERVER-5726.
@@ -57,36 +61,58 @@ namespace mongo {
      */
     class ClientCursor : private boost::noncopyable {
     public:
-        ClientCursor(const Collection* collection, Runner* runner,
-                     int qopts = 0, const BSONObj query = BSONObj());
+        /**
+         * This ClientCursor constructor creates a cursorid that can be used with getMore and
+         * killCursors.  "cursorManager" is the object that will manage the lifetime of this
+         * cursor, and "ns" is the namespace string that should be associated with this cursor (e.g.
+         * "test.foo", "test.$cmd.listCollections", etc).
+         */
+        ClientCursor(CursorManager* cursorManager,
+                     PlanExecutor* exec,
+                     const std::string& ns,
+                     int qopts = 0,
+                     const BSONObj query = BSONObj(),
+                     bool isAggCursor = false);
 
-        ClientCursor(const Collection* collection);
-
-        ~ClientCursor();
+        /**
+         * This ClientCursor is used to track sharding state for the given collection.
+         */
+        explicit ClientCursor(const Collection* collection);
 
         //
         // Basic accessors
         //
 
         CursorId cursorid() const { return _cursorid; }
-        string ns() const { return _ns; }
-        const Collection* collection() const { return _collection; }
+        std::string ns() const { return _ns; }
+        CursorManager* cursorManager() const { return _cursorManager; }
+        bool isAggCursor() const { return _isAggCursor; }
+
+        //
+        // Pinning functionality.
+        //
+
+        /**
+         * Marks this ClientCursor as in use.  unsetPinned() must be called before the destructor of
+         * this ClientCursor is invoked.
+         */
+        void setPinned() { _isPinned = true; }
+
+        /**
+         * Marks this ClientCursor as no longer in use.
+         */
+        void unsetPinned() { _isPinned = false; }
+
+        bool isPinned() const { return _isPinned; }
 
         /**
          * This is called when someone is dropping a collection or something else that
          * goes through killing cursors.
          * It removes the responsiilibty of de-registering from ClientCursor.
          * Responsibility for deleting the ClientCursor doesn't change from this call
-         * see Runner::kill.
+         * see PlanExecutor::kill.
          */
         void kill();
-
-        //
-        // Yielding.
-        //
-
-        static void staticYield(int micros, const StringData& ns);
-        static int suggestYieldMicros();
 
         //
         // Timing and timeouts
@@ -96,9 +122,9 @@ namespace mongo {
          * @param millis amount of idle passed time since last call
          * note called outside of locks (other than ccmutex) so care must be exercised
          */
-        bool shouldTimeout( unsigned millis );
-        void setIdleTime( unsigned millis );
-        unsigned idleTime() const { return _idleAgeMillis; }
+        bool shouldTimeout( int millis );
+        void setIdleTime( int millis );
+        int idleTime() const { return _idleAgeMillis; }
 
         uint64_t getLeftoverMaxTimeMicros() const { return _leftoverMaxTimeMicros; }
         void setLeftoverMaxTimeMicros( uint64_t leftoverMaxTimeMicros ) {
@@ -116,16 +142,16 @@ namespace mongo {
         // Replication-related stuff.  TODO: Document and clean.
         //
 
-        void updateSlaveLocation( CurOp& curop );
+        void updateSlaveLocation(OperationContext* txn, CurOp& curop);
         void slaveReadTill( const OpTime& t ) { _slaveReadTill = t; }
         /** Just for testing. */
         OpTime getSlaveReadTill() const { return _slaveReadTill; }
 
         //
-        // Query-specific functionality that may be adapted for the Runner.
+        // Query-specific functionality that may be adapted for the PlanExecutor.
         //
 
-        Runner* getRunner() const { return _runner.get(); }
+        PlanExecutor* getExecutor() const { return _exec.get(); }
         int queryOptions() const { return _queryOptions; }
 
         // Used by ops/query.cpp to stash how many results have been returned by a query.
@@ -133,27 +159,61 @@ namespace mongo {
         void incPos(int n) { _pos += n; }
         void setPos(int n) { _pos = n; }
 
-        /**
-         * Is this ClientCursor backed by an aggregation pipeline. Defaults to false.
-         *
-         * Agg Runners differ from others in that they manage their own locking internally and
-         * should not be killed or destroyed when the underlying collection is deleted.
-         *
-         * Note: This should *not* be set for the internal cursor used as input to an aggregation.
-         */
-        bool isAggCursor;
-
-        unsigned pinValue() const { return _pinValue; }
-
         static long long totalOpen();
 
-    private:
-        friend class ClientCursorMonitor;
-        friend class CmdCursorInfo;
-        friend class CollectionCursorCache;
+        //
+        // Storage engine state for getMore.
+        //
+
+        bool hasRecoveryUnit() const { return _ownedRU.get() || _unownedRU; }
 
         /**
-         * Initialization common between both constructors for the ClientCursor.
+         * 
+         * If a ClientCursor is created via DBDirectClient, it uses the same storage engine
+         * context as the DBDirectClient caller.  We store this context in _unownedRU.  We use
+         * this to verify that all further callers use the same RecoveryUnit.
+         *
+         * Once a ClientCursor has an unowned RecoveryUnit, it will always have one.
+         *
+         * Sets the unowned RecoveryUnit to 'ru'.  Does NOT take ownership of the pointer.
+         */
+        void setUnownedRecoveryUnit(RecoveryUnit* ru);
+
+        /**
+         * Return the unowned RecoveryUnit.  'this' does not own pointer and therefore cannot
+         * transfer ownership.
+         */
+        RecoveryUnit* getUnownedRecoveryUnit() const;
+
+        /**
+         * If a ClientCursor is created via a client request, we bind its lifetime to the
+         * ClientCursor's by storing it un _ownedRU.  In order to execute the query over repeated
+         * network requests, we have to keep the execution state around.
+         */
+
+        /**
+         * Set the owned recovery unit to 'ru'.  Takes ownership of it.  If there is a previous
+         * owned recovery unit, it is deleted.
+         */
+        void setOwnedRecoveryUnit(RecoveryUnit* ru);
+
+        /**
+         * Returns the owned recovery unit.  Ownership is transferred to the caller.
+         */
+        RecoveryUnit* releaseOwnedRecoveryUnit();
+
+    private:
+        friend class CursorManager;
+        friend class ClientCursorPin;
+
+        /**
+         * Only friends are allowed to destroy ClientCursor objects.
+         */
+        ~ClientCursor();
+
+        /**
+         * Initialization common between both constructors for the ClientCursor. The database must
+         * be stable when this is called, because cursors hang off the collection.
          */
         void init();
 
@@ -164,16 +224,10 @@ namespace mongo {
         // The ID of the ClientCursor.
         CursorId _cursorid;
 
-        // A variable indicating the state of the ClientCursor.  Possible values:
-        //   0: Normal behavior.  May time out.
-        //   1: No timing out of this ClientCursor.
-        // 100: Currently in use (via ClientCursorPin).
-        unsigned _pinValue;
-
         // The namespace we're operating on.
-        string _ns;
+        std::string _ns;
 
-        const Collection* _collection;
+        CursorManager* _cursorManager;
 
         // if we've added it to the total open counter yet
         bool _countedYet;
@@ -187,11 +241,26 @@ namespace mongo {
         // See the QueryOptions enum in dbclient.h
         int _queryOptions;
 
+        // Is this ClientCursor backed by an aggregation pipeline?  Defaults to false.
+        //
+        // Agg executors differ from others in that they manage their own locking internally and
+        // should not be killed or destroyed when the underlying collection is deleted.
+        //
+        // Note: This should *not* be set for the internal cursor used as input to an aggregation.
+        bool _isAggCursor;
+
+        // Is this cursor in use?  Defaults to false.
+        bool _isPinned;
+
+        // Is the "no timeout" flag set on this cursor?  If false, this cursor may be targeted for
+        // deletion after an interval of inactivity.  Defaults to false.
+        bool _isNoTimeout;
+
         // TODO: document better.
         OpTime _slaveReadTill;
 
         // How long has the cursor been idle?
-        unsigned _idleAgeMillis;
+        int _idleAgeMillis;
 
         // TODO: Document.
         uint64_t _leftoverMaxTimeMicros;
@@ -203,39 +272,82 @@ namespace mongo {
         // is coming from (or a vestige of) an ongoing migration.
         CollectionMetadataPtr _collMetadata;
 
+        // Only one of these is not-NULL.
+        RecoveryUnit* _unownedRU;
+        std::auto_ptr<RecoveryUnit> _ownedRU;
+        // NOTE: _ownedRU must come before _exec, because _ownedRU must outlive _exec.
+        // The storage engine can have resources in the PlanExecutor that rely on
+        // the RecoveryUnit being alive.
+
         //
         // The underlying execution machinery.
         //
-        scoped_ptr<Runner> _runner;
+        boost::scoped_ptr<PlanExecutor> _exec;
     };
 
     /**
-     * use this to assure we don't in the background time out cursor while it is under use.  if you
-     * are using noTimeout() already, there is no risk anyway.  Further, this mechanism guards
-     * against two getMore requests on the same cursor executing at the same time - which might be
-     * bad.  That should never happen, but if a client driver had a bug, it could (or perhaps some
-     * sort of attack situation).
-     * Must have a read lock on the collection already
-    */
-    class ClientCursorPin : boost::noncopyable {
+     * ClientCursorPin is an RAII class that manages the pinned state of a ClientCursor.
+     * ClientCursorPin objects pin the given cursor upon construction, and release the pin upon
+     * destruction.
+     *
+     * A pin extends the lifetime of a ClientCursor object until the pin's release.  Pinned
+     * ClientCursor objects cannot not be killed due to inactivity, and cannot be killed by user
+     * kill requests.  When a CursorManager is destroyed (e.g. by a collection drop), ownership of
+     * any still-pinned ClientCursor objects is transferred to their managing ClientCursorPin
+     * objects.
+     *
+     * Example usage:
+     * {
+     *     ClientCursorPin pin(cursorManager, cursorid);
+     *     ClientCursor* cursor = pin.c();
+     *     if (cursor) {
+     *         // Use cursor.
+     *     }
+     *     // Pin automatically released on block exit.
+     * }
+     *
+     * Clients that wish to access ClientCursor objects owned by collection cursor managers must
+     * hold the collection lock during pin acquisition and pin release.  This guards from a
+     * collection drop (which requires an exclusive lock on the collection) occurring concurrently
+     * with the pin request or unpin request.
+     *
+     * Clients that wish to access ClientCursor objects owned by the global cursor manager need not
+     * hold any locks; the global cursor manager can only be destroyed by a process exit.
+     */
+    class ClientCursorPin {
+        MONGO_DISALLOW_COPYING(ClientCursorPin);
     public:
-        ClientCursorPin( const Collection* collection, long long cursorid );
+        /**
+         * Asks "cursorManager" to set a pin on the ClientCursor associated with "cursorid".  If no
+         * such cursor exists, does nothing.  If the cursor is already pinned, throws a
+         * UserException.
+         */
+        ClientCursorPin( CursorManager* cursorManager, long long cursorid );
+
+        /**
+         * Calls release().
+         */
         ~ClientCursorPin();
-        // This just releases the pin, does not delete the underlying
-        // unless ownership has passed to us after kill
+
+        /**
+         * Releases the pin.  It does not delete the underlying cursor unless ownership has passed
+         * to us after kill.  Turns into a no-op if release() or deleteUnderlying() have already
+         * been called on this pin.
+         */
         void release();
-        // Call this to delete the underlying ClientCursor.
+
+        /**
+         * Deletes the underlying cursor.  Cannot be called if release() or deleteUnderlying() have
+         * already been called on this pin.
+         */
         void deleteUnderlying();
+
         ClientCursor *c() const;
+
     private:
         ClientCursor* _cursor;
     };
 
-    /** thread for timing out old cursors */
-    class ClientCursorMonitor : public BackgroundJob {
-    public:
-        string name() const { return "ClientCursorMonitor"; }
-        void run();
-    };
+    void startClientCursorMonitor();
 
 } // namespace mongo

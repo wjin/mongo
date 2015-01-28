@@ -26,12 +26,18 @@
  * it in the license file.
  */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include "mongo/db/pipeline/document_source.h"
 
+#include <boost/make_shared.hpp>
 
 namespace mongo {
+
+    using boost::intrusive_ptr;
+    using std::make_pair;
+    using std::string;
+    using std::vector;
 
     const char DocumentSourceMergeCursors::name[] = "$mergeCursors";
 
@@ -71,7 +77,7 @@ namespace mongo {
             massert(17027, string("Expected an Object, but got a ") + typeName(cursor.type()),
                     cursor.type() == Object);
 
-            cursorIds.push_back(make_pair(ConnectionString(cursor["host"].String()),
+            cursorIds.push_back(make_pair(ConnectionString(HostAndPort(cursor["host"].String())),
                                           cursor["id"].Long()));
         }
         

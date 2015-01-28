@@ -26,7 +26,12 @@
  *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+
+#include "mongo/platform/basic.h"
+
 #include <algorithm>
+#include <math.h>
 #include <vector>
 #include <utility>
 
@@ -34,12 +39,13 @@
 
 #include "mongo/db/exec/plan_stage.h"
 #include "mongo/db/exec/working_set.h"
-#include "mongo/db/query/explain_plan.h"
+#include "mongo/db/query/explain.h"
 #include "mongo/db/query/query_knobs.h"
 #include "mongo/db/query/query_solution.h"
 #include "mongo/db/query/qlog.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
+#include "mongo/util/log.h"
 
 namespace {
 
@@ -57,6 +63,7 @@ namespace {
 
 namespace mongo {
 
+    using std::endl;
     using std::vector;
 
     // static 
@@ -90,8 +97,9 @@ namespace mongo {
         for (size_t i = 0; i < statTrees.size(); ++i) {
             QLOG() << "Scoring plan " << i << ":" << endl
                    << candidates[i].solution->toString() << "Stats:\n"
-                   << statsToBSON(*statTrees[i]).jsonString(Strict, true);
-            LOG(2) << "Scoring query plan: " << getPlanSummary(*candidates[i].solution)
+                   << Explain::statsToBSON(*statTrees[i]).jsonString(Strict, true);
+            LOG(2) << "Scoring query plan: "
+                   << Explain::getPlanSummary(candidates[i].root)
                    << " planHitEOF=" << statTrees[i]->common.isEOF;
 
             double score = scoreTree(statTrees[i]);
@@ -106,6 +114,14 @@ namespace mongo {
         // Sort (scores, candidateIndex). Get best child and populate candidate ordering.
         std::stable_sort(scoresAndCandidateindices.begin(), scoresAndCandidateindices.end(),
                          scoreComparator);
+
+        // Determine whether plans tied for the win.
+        if (scoresAndCandidateindices.size() > 1) {
+            double bestScore = scoresAndCandidateindices[0].first;
+            double runnerUpScore = scoresAndCandidateindices[1].first;
+            static const double epsilon = 1e-10;
+            why->tieForBest = fabs(bestScore - runnerUpScore) < epsilon;
+        }
 
         // Update results in 'why'
         // Stats and scores in 'why' are sorted in descending order by score.
@@ -183,8 +199,8 @@ namespace mongo {
         double baseScore = 1;
 
         // How many "units of work" did the plan perform. Each call to work(...)
-        // counts as one unit, and each NEED_FETCH is penalized as an additional work unit.
-        size_t workUnits = stats->common.works + stats->common.needFetch;
+        // counts as one unit.
+        size_t workUnits = stats->common.works;
 
         // How much did a plan produce?
         // Range: [0, 1]
@@ -233,9 +249,7 @@ namespace mongo {
                                 <<  " + productivity((" << stats->common.advanced
                                                         << " advanced)/("
                                                         << stats->common.works
-                                                        << " works + "
-                                                        << stats->common.needFetch
-                                                        << " needFetch) = "
+                                                        << " works) = "
                                                         << productivity << ")"
                                 <<  " + tieBreakers(" << noFetchBonus
                                                       << " noFetchBonus + "

@@ -30,7 +30,10 @@
 
 #pragma once
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
+
+#include <boost/noncopyable.hpp>
+#include <boost/scoped_ptr.hpp>
 
 #include "mongo/db/dbmessage.h"
 #include "mongo/s/config.h"
@@ -41,6 +44,8 @@ namespace mongo {
 
     class OpCounters;
     class ClientInfo;
+    class OperationContext;
+
 
     class Request : boost::noncopyable {
     public:
@@ -70,7 +75,7 @@ namespace mongo {
 
         // ---- low level access ----
 
-        void reply( Message & response , const string& fromServer );
+        void reply( Message & response , const std::string& fromServer );
 
         Message& m() { return _m; }
         DbMessage& d() { return _d; }
@@ -92,6 +97,8 @@ namespace mongo {
         ClientInfo * _clientInfo;
 
         OpCounters* _counter;
+
+        boost::scoped_ptr<OperationContext> _txn;
 
         bool _didInit;
     };

@@ -2,28 +2,39 @@
 
 /*    Copyright 2009 10gen Inc.
  *
- *    Licensed under the Apache License, Version 2.0 (the "License");
- *    you may not use this file except in compliance with the License.
- *    You may obtain a copy of the License at
+ *    This program is free software: you can redistribute it and/or  modify
+ *    it under the terms of the GNU Affero General Public License, version 3,
+ *    as published by the Free Software Foundation.
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License for more details.
  *
- *    Unless required by applicable law or agreed to in writing, software
- *    distributed under the License is distributed on an "AS IS" BASIS,
- *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *    See the License for the specific language governing permissions and
- *    limitations under the License.
+ *    You should have received a copy of the GNU Affero General Public License
+ *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
  */
 
 #pragma once
 
-#include "mongo/pch.h"
-
+#include <boost/noncopyable.hpp>
+#include <boost/thread/condition.hpp>
 #include <limits>
 #include <queue>
 
-#include <boost/thread/condition.hpp>
-
+#include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/timer.h"
 
 namespace mongo {
@@ -37,6 +48,8 @@ namespace mongo {
      * Simple blocking queue with optional max size (by count or custom sizing function).
      * A custom sizing function can optionally be given.  By default the getSize function
      * returns 1 for each item, resulting in size equaling the number of items queued.
+     *
+     * Note that use of this class is deprecated.  This class only works with a single consumer and      * a single producer.
      */
     template<typename T>
     class BlockingQueue : boost::noncopyable {
@@ -61,7 +74,7 @@ namespace mongo {
         void push(T const& t) {
             scoped_lock l( _lock );
             size_t tSize = _getSize(t);
-            while (_currentSize + tSize >= _maxSize) {
+            while (_currentSize + tSize > _maxSize) {
                 _cvNoLongerFull.wait( l.boost() );
             }
             _queue.push( t );
@@ -92,7 +105,7 @@ namespace mongo {
         /**
          * The number/count of items in the queue ( _queue.size() )
          */
-        int count() const {
+        size_t count() const {
             scoped_lock l( _lock );
             return _queue.size();
         }
@@ -101,6 +114,7 @@ namespace mongo {
             scoped_lock l(_lock);
             _queue = std::queue<T>();
             _currentSize = 0;
+            _cvNoLongerFull.notify_one();
         }
 
         bool tryPop( T & t ) {

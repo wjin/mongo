@@ -26,6 +26,8 @@
  * then also delete it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/auth/authorization_manager.h"
@@ -34,50 +36,37 @@
 #include "mongo/db/auth/user_management_commands_parser.h"
 #include "mongo/db/commands/user_management_commands.h"
 #include "mongo/db/repl/multicmd.h"
-#include "mongo/db/repl/rs.h"
-#include "mongo/db/repl/rs_config.h"
+#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/version.h"
 
 namespace mongo {
 namespace {
 
+    using std::string;
+
     Status checkReplicaMemberVersions() {
-        if (!theReplSet)
+
+        repl::ReplicationCoordinator* replCoord = repl::getGlobalReplicationCoordinator();
+        if (replCoord->getReplicationMode() != repl::ReplicationCoordinator::modeReplSet)
             return Status::OK();
 
+        std::list<repl::Target> rsMembers;
+        std::vector<HostAndPort> rsMemberHosts = replCoord->getOtherNodesInReplSet();
+        for (size_t i = 0; i < rsMemberHosts.size(); ++i) {
+            rsMembers.push_back(repl::Target(rsMemberHosts[i].toString()));
+        }
 
-        std::list<Target> rsMembers;
         try {
-            const unsigned rsSelfId = theReplSet->selfId();
-            const std::vector<ReplSetConfig::MemberCfg>& rsMemberConfigs =
-                theReplSet->config().members;
-            for (size_t i = 0; i < rsMemberConfigs.size(); ++i) {
-                const unsigned otherId = rsMemberConfigs[i]._id;
-                if (rsSelfId == otherId)
-                    continue;
-                const Member* other = theReplSet->findById(otherId);
-                if (!other) {
-                    log() << "During authSchemaUpgrade, no information about replica set member "
-                        "with id " << otherId << "; ignoring.";
-                    continue;
-                }
-                if (!other->hbinfo().maybeUp()) {
-                    log() << "During authSchemaUpgrade, replica set member " << other->h() <<
-                        " is down; ignoring.";
-                    continue;
-                }
-                rsMembers.push_back(Target(other->fullName()));
-            }
-
             multiCommand(BSON("buildInfo" << 1), rsMembers);
         }
         catch (const DBException& ex) {
             return ex.toStatus();
         }
 
-        for (std::list<Target>::const_iterator iter = rsMembers.begin(), end = rsMembers.end();
-             iter != end;
+        for (std::list<repl::Target>::const_iterator iter = rsMembers.begin();
+             iter != rsMembers.end();
              ++iter) {
 
             if (!iter->ok) {
@@ -113,6 +102,7 @@ namespace {
 
     class CmdAuthSchemaUpgradeD : public CmdAuthSchemaUpgrade {
         virtual bool run(
+                OperationContext* txn,
                 const string& dbname,
                 BSONObj& cmdObj,
                 int options,
@@ -146,7 +136,7 @@ namespace {
             if (!status.isOK())
                 return appendCommandStatus(result, status);
 
-            status = authzManager->upgradeSchema(maxSteps, writeConcern);
+            status = authzManager->upgradeSchema(txn, maxSteps, writeConcern);
             if (status.isOK())
                 result.append("done", true);
             return appendCommandStatus(result, status);

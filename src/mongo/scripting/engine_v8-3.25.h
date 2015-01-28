@@ -2,22 +2,39 @@
 
 /*    Copyright 2014 MongoDB Inc.
  *
- *    Licensed under the Apache License, Version 2.0 (the "License");
- *    you may not use this file except in compliance with the License.
- *    You may obtain a copy of the License at
+ *    This program is free software: you can redistribute it and/or  modify
+ *    it under the terms of the GNU Affero General Public License, version 3,
+ *    as published by the Free Software Foundation.
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License for more details.
  *
- *    Unless required by applicable law or agreed to in writing, software
- *    distributed under the License is distributed on an "AS IS" BASIS,
- *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *    See the License for the specific language governing permissions and
- *    limitations under the License.
+ *    You should have received a copy of the GNU Affero General Public License
+ *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
  */
 
 #pragma once
 
+#include <boost/scoped_ptr.hpp>
+#include <boost/shared_ptr.hpp>
 #include <v8.h>
+#include <set>
+#include <string>
+#include <vector>
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/string_data.h"
@@ -46,6 +63,7 @@ namespace mongo {
     class V8ScriptEngine;
     class V8Scope;
     class BSONHolder;
+    class JSThreadConfig;
 
     typedef v8::Local<v8::Value> (*v8Function)(V8Scope* scope,
                                   const v8::FunctionCallbackInfo<v8::Value>& args);
@@ -62,24 +80,23 @@ namespace mongo {
     class ObjTracker {
     public:
         /** Track an object to be freed when it is no longer referenced in JavaScript.
+         * Return handle to object instance shared pointer.
          * @param  instanceHandle  persistent handle to the weakly referenced object
          * @param  rawData         pointer to the object instance
          */
-        void track(v8::Isolate* isolate, v8::Local<v8::Value> instanceHandle, _ObjType* instance) {
+        v8::Local<v8::External> track(v8::Isolate* isolate, v8::Local<v8::Value> instanceHandle,
+                                      _ObjType* instance) {
             TrackedPtr* collectionHandle = new TrackedPtr(isolate, instanceHandle, instance, this);
             _container.insert(collectionHandle);
             collectionHandle->_instanceHandle.SetWeak(collectionHandle, deleteOnCollect);
+            return v8::External::New(isolate, &(collectionHandle->_objPtr));
         }
         /**
          * Free any remaining objects and their TrackedPtrs.  Invoked when the
          * V8Scope is destructed.
          */
         ~ObjTracker() {
-            if (!_container.empty()) {
-                LOG(1) << "freeing " << _container.size() << " uncollected "
-                       << typeid(_ObjType).name() << " objects" << endl;
-            }
-            typename set<TrackedPtr*>::iterator it = _container.begin();
+            typename std::set<TrackedPtr*>::iterator it = _container.begin();
             while (it != _container.end()) {
                 delete *it;
                 _container.erase(it++);
@@ -99,7 +116,7 @@ namespace mongo {
                 _objPtr(instance),
                 _tracker(tracker) { }
             v8::Persistent<v8::Value> _instanceHandle;
-            scoped_ptr<_ObjType> _objPtr;
+            boost::shared_ptr<_ObjType> _objPtr;
             ObjTracker<_ObjType>* _tracker;
         };
 
@@ -117,7 +134,7 @@ namespace mongo {
         }
 
         // container for all TrackedPtrs created by this ObjTracker instance
-        set<TrackedPtr*> _container;
+        std::set<TrackedPtr*> _container;
     };
 
     /**
@@ -152,12 +169,30 @@ namespace mongo {
 
         /** check if there is a pending killOp request */
         bool isKillPending() const;
+        
+        /**
+         * Obtains the operation context associated with this Scope, so it can be given to the
+         * DBDirectClient used by the V8 engine's connection. Only needed for dbEval.
+         */
+        OperationContext* getOpContext() const;
+
+        /**
+         * Register this scope with the mongo op id.  If executing outside the
+         * context of a mongo operation (e.g. from the shell), killOp will not
+         * be supported.
+         */
+        virtual void registerOperation(OperationContext* txn);
+
+        /**
+         * Unregister this scope with the mongo op id.
+         */
+        virtual void unregisterOperation();
 
         /**
          * Connect to a local database, create a Mongo object instance, and load any
          * server-side js into the global object
          */
-        virtual void localConnect(const char* dbName);
+        virtual void localConnectForDbEval(OperationContext* txn, const char* dbName);
 
         virtual void externalSetup();
 
@@ -165,7 +200,7 @@ namespace mongo {
 
         virtual void installBSONTypes();
 
-        virtual string getError() { return _error; }
+        virtual std::string getError() { return _error; }
 
         virtual bool hasOutOfMemoryException();
 
@@ -183,7 +218,7 @@ namespace mongo {
         virtual double getNumber(const char* field);
         virtual int getNumberInt(const char* field);
         virtual long long getNumberLongLong(const char* field);
-        virtual string getString(const char* field);
+        virtual std::string getString(const char* field);
         virtual bool getBoolean(const char* field);
         virtual BSONObj getObject(const char* field);
 
@@ -202,7 +237,7 @@ namespace mongo {
                            int timeoutMs = 0, bool ignoreReturn = false,
                            bool readOnlyArgs = false, bool readOnlyRecv = false);
 
-        virtual bool exec(const StringData& code, const string& name, bool printResult,
+        virtual bool exec(const StringData& code, const std::string& name, bool printResult,
                           bool reportError, bool assertOnError, int timeoutMs);
 
         // functions to create v8 object and function templates
@@ -300,9 +335,18 @@ namespace mongo {
         v8::Local<v8::Object> getGlobal() { return _global.Get(_isolate); }
 
         ObjTracker<BSONHolder> bsonHolderTracker;
-        ObjTracker<DBClientWithCommands> dbClientWithCommandsTracker;
         ObjTracker<DBClientBase> dbClientBaseTracker;
-        ObjTracker<DBClientCursor> dbClientCursorTracker;
+        // Track both cursor and connection.
+        // This ensures the connection outlives the cursor.
+        struct DBConnectionAndCursor {
+            boost::shared_ptr<DBClientBase> conn;
+            boost::shared_ptr<DBClientCursor> cursor;
+            DBConnectionAndCursor(boost::shared_ptr<DBClientBase> conn,
+                                  boost::shared_ptr<DBClientCursor> cursor)
+                : conn(conn), cursor(cursor) { }
+        };
+        ObjTracker<DBConnectionAndCursor> dbConnectionAndCursor;
+        ObjTracker<JSThreadConfig> jsThreadConfigTracker;
 
         // These are all named after the JS constructor name + FT
         v8::Local<v8::FunctionTemplate> ObjectIdFT()       { return _ObjectIdFT.Get(_isolate); }
@@ -401,18 +445,6 @@ namespace mongo {
         bool nativeEpilogue();
 
         /**
-         * Register this scope with the mongo op id.  If executing outside the
-         * context of a mongo operation (e.g. from the shell), killOp will not
-         * be supported.
-         */
-        void registerOpId();
-
-        /**
-         * Unregister this scope with the mongo op id.
-         */
-        void unregisterOpId();
-
-        /**
          * Create a new function; primarily used for BSON/V8 conversion.
          */
         v8::Local<v8::Value> newFunction(const StringData& code);
@@ -427,7 +459,7 @@ namespace mongo {
 
         v8::Eternal<v8::Context> _context;
         v8::Eternal<v8::Object> _global;
-        string _error;
+        std::string _error;
         std::vector<v8::Eternal<v8::Value> > _funcs;
 
         enum ConnectState { NOT, LOCAL, EXTERNAL };
@@ -487,7 +519,8 @@ namespace mongo {
         mongo::mutex _interruptLock; // protects interruption-related flags
         bool _inNativeExecution;     // protected by _interruptLock
         bool _pendingKill;           // protected by _interruptLock
-        int _opId;                   // op id for this scope
+        unsigned int _opId;          // op id for this scope
+        OperationContext* _opCtx;    // Op context for DbEval
     };
 
     /// Helper to extract V8Scope for an Isolate
@@ -531,7 +564,7 @@ namespace mongo {
          */
         DeadlineMonitor<V8Scope>* getDeadlineMonitor() { return &_deadlineMonitor; }
 
-        typedef map<unsigned, V8Scope*> OpIdToScopeMap;
+        typedef std::map<unsigned, V8Scope*> OpIdToScopeMap;
         mongo::mutex _globalInterruptLock;  // protects map of all operation ids -> scope
         OpIdToScopeMap _opToScopeMap;       // map of mongo op ids to scopes (protected by
                                             // _globalInterruptLock).
@@ -562,53 +595,8 @@ namespace mongo {
         const BSONObj _obj;
         bool _modified;
         const bool _readOnly;
-        set<string> _removed;
+        std::set<std::string> _removed;
     };
-
-    /**
-     * Check for an error condition (e.g. empty handle, JS exception, OOM) after executing
-     * a v8 operation.
-     * @resultHandle         handle storing the result of the preceeding v8 operation
-     * @try_catch            the active v8::TryCatch exception handler
-     * @param reportError    if true, log an error message
-     * @param assertOnError  if true, throw an exception if an error is detected
-     *                       if false, return value indicates error state
-     * @return true if an error was detected and assertOnError is set to false
-     *         false if no error was detected
-     */
-    template <typename _HandleType>
-    bool V8Scope::checkV8ErrorState(const _HandleType& resultHandle,
-                                    const v8::TryCatch& try_catch,
-                                    bool reportError,
-                                    bool assertOnError) {
-        bool haveError = false;
-
-        if (try_catch.HasCaught() && try_catch.CanContinue()) {
-            // normal JS exception
-            _error = v8ExceptionToSTLString(&try_catch);
-            haveError = true;
-        }
-        else if (hasOutOfMemoryException()) {
-            // out of memory exception (treated as terminal)
-            _error = "JavaScript execution failed -- v8 is out of memory";
-            haveError = true;
-        }
-        else if (resultHandle.IsEmpty() || try_catch.HasCaught()) {
-            // terminal exception (due to empty handle, termination, etc.)
-            _error = "JavaScript execution failed";
-            haveError = true;
-        }
-
-        if (haveError) {
-            if (reportError)
-                log() << _error << endl;
-            if (assertOnError)
-                uasserted(16722, _error);
-            return true;
-        }
-
-        return false;
-    }
 
     extern ScriptEngine* globalScriptEngine;
 

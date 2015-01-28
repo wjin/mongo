@@ -26,8 +26,13 @@
  *    then also delete it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+
+#include "mongo/platform/basic.h"
+
 #include "mongo/s/cluster_client_internal.h"
 
+#include <boost/scoped_ptr.hpp>
 #include <string>
 #include <vector>
 
@@ -38,10 +43,14 @@
 #include "mongo/s/type_changelog.h"
 #include "mongo/s/type_mongos.h"
 #include "mongo/s/type_shard.h"
+#include "mongo/util/log.h"
 #include "mongo/util/stringutils.h"
 
 namespace mongo {
 
+    using boost::scoped_ptr;
+    using std::auto_ptr;
+    using std::endl;
     using std::string;
     using std::vector;
     using mongoutils::str::stream;

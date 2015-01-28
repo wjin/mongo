@@ -49,8 +49,11 @@ namespace mongo {
          * Returns Status::OK() if it's a valid spec.
          * Returns a Status indicating how it's invalid otherwise.
          */
-        static Status make(const BSONObj& spec, const MatchExpression* const query,
-                           ParsedProjection** out);
+        static Status make(const BSONObj& spec,
+                           const MatchExpression* const query,
+                           ParsedProjection** out,
+                           const MatchExpressionParser::WhereCallback& whereCallback =
+                                        MatchExpressionParser::WhereCallback());
 
         /**
          * Is the full document required to compute this projection?
@@ -61,7 +64,7 @@ namespace mongo {
          * If requiresDocument() == false, what fields are required to compute
          * the projection?
          */
-        const vector<string>& getRequiredFields() const {
+        const std::vector<std::string>& getRequiredFields() const {
             return _requiredFields;
         }
 
@@ -111,7 +114,7 @@ namespace mongo {
                                                 const std::string& matchfield);
 
         // TODO: stringdata?
-        vector<string> _requiredFields;
+        std::vector<std::string> _requiredFields;
 
         bool _requiresDocument;
 

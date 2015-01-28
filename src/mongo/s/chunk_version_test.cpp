@@ -26,7 +26,7 @@
  *    then also delete it in the license file.
  */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include "mongo/db/jsobj.h"
 #include "mongo/s/chunk_version.h"
@@ -49,7 +49,6 @@ namespace {
      * <OID> is a value of type OID.
      *
      */
-
     TEST(Compatibility, LegacyFormatA) {
         BSONObjBuilder versionObjB;
         versionObjB.appendTimestamp( "testVersion",

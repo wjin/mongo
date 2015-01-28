@@ -26,6 +26,10 @@
  *    then also delete it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+
+#include "mongo/platform/basic.h"
+
 #include "mongo/s/metadata_loader.h"
 
 #include "mongo/client/connpool.h"
@@ -37,8 +41,16 @@
 #include "mongo/s/range_arithmetic.h"
 #include "mongo/s/type_chunk.h"
 #include "mongo/s/type_collection.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
+
+    using std::auto_ptr;
+    using std::endl;
+    using std::make_pair;
+    using std::map;
+    using std::pair;
+    using std::string;
 
     /**
      * This is an adapter so we can use config diffs - mongos and mongod do them slightly
@@ -215,10 +227,10 @@ namespace mongo {
         if ( oldMetadata ) {
 
             // If our epochs are compatible, it's useful to use the old metadata for diffs
-            if ( oldMetadata->getCollVersion().hasCompatibleEpoch( epoch ) ) {
+            if ( oldMetadata->getCollVersion().hasEqualEpoch( epoch ) ) {
 
                 fullReload = false;
-                dassert( oldMetadata->isValid() );
+                invariant( oldMetadata->isValid() );
 
                 versionMap[shard] = oldMetadata->_shardVersion;
                 metadata->_collVersion = oldMetadata->_collVersion;
@@ -280,7 +292,7 @@ namespace mongo {
                 metadata->fillRanges();
                 conn.done();
 
-                dassert( metadata->isValid() );
+                invariant( metadata->isValid() );
                 return Status::OK();
             }
             else if ( diffsApplied == 0 ) {

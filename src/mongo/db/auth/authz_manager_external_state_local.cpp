@@ -26,6 +26,8 @@
 *    it in the license file.
 */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kAccessControl
+
 #include "mongo/db/auth/authz_manager_external_state_local.h"
 
 #include "mongo/base/status.h"
@@ -34,16 +36,19 @@
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/user_document_parser.h"
+#include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
+
+    using std::vector;
 
     AuthzManagerExternalStateLocal::AuthzManagerExternalStateLocal() :
         _roleGraphState(roleGraphStateInitial) {}
     AuthzManagerExternalStateLocal::~AuthzManagerExternalStateLocal() {}
 
-    Status AuthzManagerExternalStateLocal::initialize() {
-        Status status = _initializeRoleGraph();
+    Status AuthzManagerExternalStateLocal::initialize(OperationContext* txn) {
+        Status status = _initializeRoleGraph(txn);
         if (!status.isOK()) {
             if (status == ErrorCodes::GraphContainsCycle) {
                 error() << "Cycle detected in admin.system.roles; role inheritance disabled. "
@@ -59,9 +64,11 @@ namespace mongo {
         return Status::OK();
     }
 
-    Status AuthzManagerExternalStateLocal::getStoredAuthorizationVersion(int* outVersion) {
+    Status AuthzManagerExternalStateLocal::getStoredAuthorizationVersion(
+                            OperationContext* txn, int* outVersion) {
         BSONObj versionDoc;
-        Status status = findOne(AuthorizationManager::versionCollectionNamespace,
+        Status status = findOne(txn,
+                                AuthorizationManager::versionCollectionNamespace,
                                 AuthorizationManager::versionDocumentQuery,
                                 &versionDoc);
         if (status.isOK()) {
@@ -85,12 +92,7 @@ namespace mongo {
             }
         }
         else if (status == ErrorCodes::NoMatchingDocument) {
-            if (hasAnyPrivilegeDocuments()) {
-                *outVersion = AuthorizationManager::schemaVersion24;
-            }
-            else {
-                *outVersion = AuthorizationManager::schemaVersion26Final;
-            }
+            *outVersion = AuthorizationManager::schemaVersion28SCRAM;
             return Status::OK();
         }
         else {
@@ -102,7 +104,7 @@ namespace {
     void addRoleNameToObjectElement(mutablebson::Element object, const RoleName& role) {
         fassert(17153, object.appendString(AuthorizationManager::ROLE_NAME_FIELD_NAME,
                                            role.getRole()));
-        fassert(17154, object.appendString(AuthorizationManager::ROLE_SOURCE_FIELD_NAME,
+        fassert(17154, object.appendString(AuthorizationManager::ROLE_DB_FIELD_NAME,
                                            role.getDB()));
     }
 
@@ -136,11 +138,12 @@ namespace {
 }  // namespace
 
     Status AuthzManagerExternalStateLocal::getUserDescription(
+            OperationContext* txn,
             const UserName& userName,
             BSONObj* result) {
 
         BSONObj userDoc;
-        Status status = _getUserDocument(userName, &userDoc);
+        Status status = _getUserDocument(txn, userName, &userDoc);
         if (!status.isOK())
             return status;
 
@@ -206,6 +209,22 @@ namespace {
         return Status::OK();
     }
 
+    Status AuthzManagerExternalStateLocal::_getUserDocument(OperationContext* txn,
+                                                            const UserName& userName,
+                                                            BSONObj* userDoc) {
+        Status status = findOne(
+                txn,
+                AuthorizationManager::usersCollectionNamespace,
+                BSON(AuthorizationManager::USER_NAME_FIELD_NAME << userName.getUser() <<
+                     AuthorizationManager::USER_DB_FIELD_NAME << userName.getDB()),
+                userDoc);
+        if (status == ErrorCodes::NoMatchingDocument) {
+            status = Status(ErrorCodes::UserNotFound, mongoutils::str::stream() <<
+                            "Could not find user " << userName.getFullName());
+        }
+        return status;
+    }
+
     Status AuthzManagerExternalStateLocal::getRoleDescription(const RoleName& roleName,
                                                               bool showPrivileges,
                                                               BSONObj* result) {
@@ -223,7 +242,7 @@ namespace {
         fassert(17162, resultDoc.root().appendString(
                         AuthorizationManager::ROLE_NAME_FIELD_NAME, roleName.getRole()));
         fassert(17163, resultDoc.root().appendString(
-                        AuthorizationManager::ROLE_SOURCE_FIELD_NAME, roleName.getDB()));
+                        AuthorizationManager::ROLE_DB_FIELD_NAME, roleName.getDB()));
         fassert(17267,
                 resultDoc.root().appendBool("isBuiltin", _roleGraph.isBuiltinRole(roleName)));
         mutablebson::Element rolesElement = resultDoc.makeElementArray("roles");
@@ -307,7 +326,7 @@ namespace {
 
 }  // namespace
 
-    Status AuthzManagerExternalStateLocal::_initializeRoleGraph() {
+    Status AuthzManagerExternalStateLocal::_initializeRoleGraph(OperationContext* txn) {
         boost::lock_guard<boost::mutex> lkInitialzeRoleGraph(_roleGraphMutex);
 
         _roleGraphState = roleGraphStateInitial;
@@ -315,10 +334,11 @@ namespace {
 
         RoleGraph newRoleGraph;
         Status status = query(
+                txn,
                 AuthorizationManager::rolesCollectionNamespace,
                 BSONObj(),
                 BSONObj(),
-                boost::bind(addRoleFromDocumentOrWarn, &newRoleGraph, _1));
+                stdx::bind(addRoleFromDocumentOrWarn, &newRoleGraph, stdx::placeholders::_1));
         if (!status.isOK())
             return status;
 

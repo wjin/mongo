@@ -60,11 +60,10 @@ namespace {
         if (!status.isOK())
             return status;
         status = bsonExtractTypedField(
-                doc, AuthorizationManager::ROLE_SOURCE_FIELD_NAME, String, &sourceElement);
+                doc, AuthorizationManager::ROLE_DB_FIELD_NAME, String, &sourceElement);
         if (!status.isOK())
             return status;
-        *name = RoleName(StringData(nameElement.valuestr(), nameElement.valuestrsize() - 1),
-                         StringData(sourceElement.valuestr(), sourceElement.valuestrsize() - 1));
+        *name = RoleName(nameElement.valueStringData(), sourceElement.valueStringData());
         return status;
     }
 
@@ -80,7 +79,7 @@ namespace {
             return Status(ErrorCodes::TypeMismatch,
                           "Role document _id fields must be strings.");
         }
-        StringData idField(idElement.valuestr(), idElement.valuestrsize() - 1);
+        StringData idField = idElement.valueStringData();
         size_t firstDot = idField.find('.');
         if (firstDot == std::string::npos ||
             idField.substr(0, firstDot) !=  roleName.getDB() ||
@@ -102,7 +101,7 @@ namespace {
             return Status(ErrorCodes::TypeMismatch,
                           "Role document _id fields must be strings.");
         }
-        StringData idField(idElement.valuestr(), idElement.valuestrsize() - 1);
+        StringData idField = idElement.valueStringData();
         size_t dotPos = idField.find('.');
         if (dotPos == std::string::npos) {
             return Status(ErrorCodes::BadValue,
@@ -182,7 +181,8 @@ namespace {
         status = AuthorizationManager::getBSONForRole(
                 roleGraph, roleToUpdate, roleDocument.root());
         if (status == ErrorCodes::RoleNotFound) {
-            status = driver.populateDocumentWithQueryFields(queryPattern, roleDocument);
+            // The query pattern will only contain _id, no other immutable fields are present
+            status = driver.populateDocumentWithQueryFields(queryPattern, NULL, roleDocument);
         }
         if (!status.isOK())
             return status;

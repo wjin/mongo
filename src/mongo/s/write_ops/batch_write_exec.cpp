@@ -26,6 +26,10 @@
  *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+
+#include "mongo/platform/basic.h"
+
 #include "mongo/s/write_ops/batch_write_exec.h"
 
 #include "mongo/base/error_codes.h"
@@ -35,8 +39,14 @@
 #include "mongo/client/dbclientinterface.h" // ConnectionString (header-only)
 #include "mongo/s/write_ops/batch_write_op.h"
 #include "mongo/s/write_ops/write_error_detail.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
+
+    using std::endl;
+    using std::make_pair;
+    using std::stringstream;
+    using std::vector;
 
     BatchWriteExec::BatchWriteExec( NSTargeter* targeter,
                                     ShardResolver* resolver,

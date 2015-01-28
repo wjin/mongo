@@ -1,6 +1,6 @@
 // auto1.js
 
-s = new ShardingTest( "auto1" , 2 , 1 , 1 );
+s = new ShardingTest( "auto1" , 2 , 1 , 1, { enableBalancer : 1 } );
 
 s.adminCommand( { enablesharding : "test" } );
 s.adminCommand( { shardcollection : "test.foo" , key : { num : 1 } } );
@@ -26,7 +26,7 @@ counts = []
 
 s.printChunks();
 counts.push( s.config.chunks.count() );
-assert.eq( 100 , primary.foo.count() );
+assert.eq(100, db.foo.find().itcount());
 
 print( "datasize: " + tojson( s.getServer( "test" ).getDB( "admin" ).runCommand( { datasize : "test.foo" } ) ) );
 

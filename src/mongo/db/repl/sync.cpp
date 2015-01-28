@@ -26,29 +26,35 @@
 *    it in the license file.
 */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/repl/sync.h"
 
 #include <string>
 
-#include "mongo/db/jsobj.h"
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/client.h"
-#include "mongo/db/diskloc.h"
-#include "mongo/db/structure/catalog/namespace_details.h"
-#include "mongo/db/pdfile.h"
+#include "mongo/db/jsobj.h"
+#include "mongo/db/record_id.h"
 #include "mongo/db/repl/oplogreader.h"
-#include "mongo/db/storage/mmap_v1/dur_transaction.h"
-#include "mongo/db/catalog/collection.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
 
+    using std::endl;
+    using std::string;
+
+namespace repl {
+
     void Sync::setHostname(const string& hostname) {
         hn = hostname;
     }
 
-    BSONObj Sync::getMissingDoc(Database* db, const BSONObj& o) {
+    BSONObj Sync::getMissingDoc(OperationContext* txn, Database* db, const BSONObj& o) {
         OplogReader missingObjReader; // why are we using OplogReader to run a non-oplog query?
         const char *ns = o.getStringField("ns");
 
@@ -66,7 +72,7 @@ namespace mongo {
                 sleepsecs(retryCount * retryCount);
             }
             try {
-                bool ok = missingObjReader.connect(hn);
+                bool ok = missingObjReader.connect(HostAndPort(hn));
                 if (!ok) {
                     warning() << "network problem detected while connecting to the "
                               << "sync source, attempt " << retryCount << " of "
@@ -106,16 +112,18 @@ namespace mongo {
                     str::stream() << "Can no longer connect to initial sync source: " << hn);
     }
 
-    bool Sync::shouldRetry(const BSONObj& o) {
-        // should already have write lock
-        const char *ns = o.getStringField("ns");
-        Client::Context ctx(ns);
-        DurTransaction txn;
+    bool Sync::shouldRetry(OperationContext* txn, const BSONObj& o) {
+        const NamespaceString nss(o.getStringField("ns"));
+
+        // Take an X lock on the database in order to preclude other modifications. Also, the
+        // database might not exist yet, so create it.
+        AutoGetOrCreateDb autoDb(txn, nss.db(), MODE_X);
+        Database* const db = autoDb.getDb();
 
         // we don't have the object yet, which is possible on initial sync.  get it.
         log() << "replication info adding missing object" << endl; // rare enough we can log
 
-        BSONObj missingObj = getMissingDoc(ctx.db(), o);
+        BSONObj missingObj = getMissingDoc(txn, db, o);
 
         if( missingObj.isEmpty() ) {
             log() << "replication missing object not found on source. presumably deleted later in oplog" << endl;
@@ -125,15 +133,22 @@ namespace mongo {
             return false;
         }
         else {
-            Collection* collection = ctx.db()->getOrCreateCollection( ns );
-            verify( collection ); // should never happen
-            StatusWith<DiskLoc> result = collection->insertDocument( &txn, missingObj, true );
+            WriteUnitOfWork wunit(txn);
+
+            Collection* const collection = db->getOrCreateCollection(txn, nss.toString());
+            invariant(collection);
+
+            StatusWith<RecordId> result = collection->insertDocument(txn, missingObj, true);
             uassert(15917,
                     str::stream() << "failed to insert missing doc: " << result.toString(),
                     result.isOK() );
 
             LOG(1) << "replication inserted missing doc: " << missingObj.toString() << endl;
+
+            wunit.commit();
             return true;
         }
     }
-}
+
+} // namespace repl
+} // namespace mongo

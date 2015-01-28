@@ -28,6 +28,7 @@
 
 #pragma once
 
+#include <boost/scoped_ptr.hpp>
 #include <vector>
 
 #include "mongo/base/disallow_copying.h"
@@ -53,7 +54,7 @@ namespace mongo {
         MatchExpression* root;
 
         // Not owned here.
-        const vector<IndexEntry>* indices;
+        const std::vector<IndexEntry>* indices;
 
         // How many plans are we willing to ouput from an OR? We currently consider
         // all possibly OR plans, which means the product of the number of possibilities
@@ -176,7 +177,7 @@ namespace mongo {
         struct PredicateAssignment {
             PredicateAssignment() : indexToAssign(0) { }
 
-            vector<IndexID> first;
+            std::vector<IndexID> first;
             // Not owned here.
             MatchExpression* expr;
 
@@ -193,7 +194,7 @@ namespace mongo {
             // subsequent state it just asks all its children to move their states forward.
 
             // Must use all of subnodes.
-            vector<MemoID> subnodes;
+            std::vector<MemoID> subnodes;
 
             // The number of OR states that we've enumerated so far.
             size_t counter;
@@ -202,20 +203,20 @@ namespace mongo {
         // This is used by AndAssignment and is not an actual assignment.
         struct OneIndexAssignment {
             // 'preds[i]' is uses index 'index' at position 'positions[i]'
-            vector<MatchExpression*> preds;
-            vector<IndexPosition> positions;
+            std::vector<MatchExpression*> preds;
+            std::vector<IndexPosition> positions;
             IndexID index;
         };
 
         struct AndEnumerableState {
-            vector<OneIndexAssignment> assignments;
-            vector<MemoID> subnodesToIndex;
+            std::vector<OneIndexAssignment> assignments;
+            std::vector<MemoID> subnodesToIndex;
         };
 
         struct AndAssignment {
             AndAssignment() : counter(0) { }
 
-            vector<AndEnumerableState> choices;
+            std::vector<AndEnumerableState> choices;
 
             // We're on the counter-th member of state.
             size_t counter;
@@ -223,7 +224,7 @@ namespace mongo {
 
         struct ArrayAssignment {
             ArrayAssignment() : counter(0) { }
-            vector<MemoID> subnodes;
+            std::vector<MemoID> subnodes;
             size_t counter;
         };
 
@@ -231,11 +232,11 @@ namespace mongo {
          * Associates indices with predicates.
          */
         struct NodeAssignment {
-            scoped_ptr<PredicateAssignment> pred;
-            scoped_ptr<OrAssignment> orAssignment;
-            scoped_ptr<AndAssignment> andAssignment;
-            scoped_ptr<ArrayAssignment> arrayAssignment;
-            string toString() const;
+            boost::scoped_ptr<PredicateAssignment> pred;
+            boost::scoped_ptr<OrAssignment> orAssignment;
+            boost::scoped_ptr<AndAssignment> andAssignment;
+            boost::scoped_ptr<ArrayAssignment> arrayAssignment;
+            std::string toString() const;
         };
 
         /**
@@ -268,9 +269,9 @@ namespace mongo {
          */
         bool partitionPreds(MatchExpression* node,
                             PrepMemoContext context,
-                            vector<MatchExpression*>* indexOut,
-                            vector<MemoID>* subnodesOut,
-                            vector<MemoID>* mandatorySubnodes);
+                            std::vector<MatchExpression*>* indexOut,
+                            std::vector<MemoID>* subnodesOut,
+                            std::vector<MemoID>* mandatorySubnodes);
 
         /**
          * Finds a set of predicates that can be safely compounded with the set
@@ -334,9 +335,9 @@ namespace mongo {
          *      and then not assign the $near because the $within is already assigned (and
          *      has the same path).
          */
-        void getMultikeyCompoundablePreds(const vector<MatchExpression*>& assigned,
-                                          const vector<MatchExpression*>& couldCompound,
-                                          vector<MatchExpression*>* out);
+        void getMultikeyCompoundablePreds(const std::vector<MatchExpression*>& assigned,
+                                          const std::vector<MatchExpression*>& couldCompound,
+                                          std::vector<MatchExpression*>* out);
 
         /**
          * 'andAssignment' contains assignments that we've already committed to outputting,
@@ -357,12 +358,12 @@ namespace mongo {
          *   and notice that we have already assigned this same set of predicates to
          *   the single index {a: 1, b: 1} via compounding.
          */
-        bool alreadyCompounded(const set<MatchExpression*>& ixisectAssigned,
+        bool alreadyCompounded(const std::set<MatchExpression*>& ixisectAssigned,
                                const AndAssignment* andAssignment);
         /**
          * Output index intersection assignments inside of an AND node.
          */
-        typedef unordered_map<IndexID, vector<MatchExpression*> > IndexToPredMap;
+        typedef unordered_map<IndexID, std::vector<MatchExpression*> > IndexToPredMap;
 
         /**
          * Generate index intersection assignments given the predicate/index structure in idxToFirst
@@ -371,7 +372,7 @@ namespace mongo {
          */
         void enumerateAndIntersect(const IndexToPredMap& idxToFirst,
                                    const IndexToPredMap& idxToNotFirst,
-                                   const vector<MemoID>& subnodes,
+                                   const std::vector<MemoID>& subnodes,
                                    AndAssignment* andAssignment);
 
         /**
@@ -381,7 +382,7 @@ namespace mongo {
          */
         void enumerateOneIndex(const IndexToPredMap& idxToFirst,
                                const IndexToPredMap& idxToNotFirst,
-                               const vector<MemoID>& subnodes,
+                               const std::vector<MemoID>& subnodes,
                                AndAssignment* andAssignment);
 
         /**
@@ -392,14 +393,14 @@ namespace mongo {
         void enumerateMandatoryIndex(const IndexToPredMap& idxToFirst,
                                      const IndexToPredMap& idxToNotFirst,
                                      MatchExpression* mandatoryPred,
-                                     const set<IndexID>& mandatoryIndices,
+                                     const std::set<IndexID>& mandatoryIndices,
                                      AndAssignment* andAssignment);
 
         /**
          * Try to assign predicates in 'tryCompound' to 'thisIndex' as compound assignments.
          * Output the assignments in 'assign'.
          */
-        void compound(const vector<MatchExpression*>& tryCompound,
+        void compound(const std::vector<MatchExpression*>& tryCompound,
                       const IndexEntry& thisIndex,
                       OneIndexAssignment* assign);
 
@@ -429,7 +430,7 @@ namespace mongo {
         MatchExpression* _root;
 
         // Indices we're allowed to enumerate with.  Not owned here.
-        const vector<IndexEntry>* _indices;
+        const std::vector<IndexEntry>* _indices;
 
         // Do we output >1 index per AND (index intersection)?
         bool _ixisect;

@@ -3,29 +3,52 @@
 
 /*    Copyright 2009 10gen Inc.
  *
- *    Licensed under the Apache License, Version 2.0 (the "License");
- *    you may not use this file except in compliance with the License.
- *    You may obtain a copy of the License at
+ *    This program is free software: you can redistribute it and/or  modify
+ *    it under the terms of the GNU Affero General Public License, version 3,
+ *    as published by the Free Software Foundation.
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License for more details.
  *
- *    Unless required by applicable law or agreed to in writing, software
- *    distributed under the License is distributed on an "AS IS" BASIS,
- *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *    See the License for the specific language governing permissions and
- *    limitations under the License.
+ *    You should have received a copy of the GNU Affero General Public License
+ *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
  */
 
 // _ todo: reconnect?
 
-#include "mongo/pch.h"
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+
+#include "mongo/platform/basic.h"
 
 #include "mongo/client/connpool.h"
 #include "mongo/client/replica_set_monitor.h"
 #include "mongo/client/syncclusterconnection.h"
+#include "mongo/util/exit.h"
+#include "mongo/util/log.h"
 #include "mongo/s/shard.h"
 
 namespace mongo {
+
+    using std::endl;
+    using std::list;
+    using std::map;
+    using std::set;
+    using std::string;
+    using std::vector;
 
     // ------ PoolForHost ------
 
@@ -102,30 +125,10 @@ namespace mongo {
     }
 
     void PoolForHost::flush() {
-        vector<StoredConnection> all;
-        while ( ! _pool.empty() ) {
+        while (!_pool.empty()) {
             StoredConnection c = _pool.top();
             _pool.pop();
-            bool res;
-            bool alive = false;
-            try {
-                c.conn->isMaster( res );
-                alive = true;
-            } catch ( const DBException e ) {
-                // There's something wrong with this connection, swallow the exception and do not
-                // put the connection back in the pool.
-                LOG(1) << "Exception thrown when checking pooled connection to " <<
-                    c.conn->getServerAddress() << ": " << causedBy(e) << endl;
-                delete c.conn;
-                c.conn = NULL;
-            }
-            if ( alive ) {
-                all.push_back( c );
-            }
-        }
-
-        for ( vector<StoredConnection>::iterator i=all.begin(); i != all.end(); ++i ) {
-            _pool.push( *i );
+            delete c.conn;
         }
     }
 
@@ -258,7 +261,19 @@ namespace mongo {
         return _finishCreate( host , socketTimeout , c );
     }
 
+    void DBConnectionPool::onRelease(DBClientBase* conn) {
+        if (_hooks->empty()) {
+            return;
+        }
+
+        for (list<DBConnectionHook*>::iterator i = _hooks->begin(); i != _hooks->end(); i++) {
+            (*i)->onRelease( conn );
+        }
+    }
+
     void DBConnectionPool::release(const string& host, DBClientBase *c) {
+        onRelease(c);
+
         scoped_lock L(_mutex);
         _pools[PoolKey(host,c->getSoTimeout())].done(this,c);
     }
@@ -503,6 +518,6 @@ namespace mongo {
         pool.clear();
     }
 
-    AtomicUInt AScopedConnection::_numConnections;
+    AtomicInt32 AScopedConnection::_numConnections;
 
 } // namespace mongo

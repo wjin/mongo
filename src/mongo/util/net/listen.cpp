@@ -2,25 +2,45 @@
 
 /*    Copyright 2009 10gen Inc.
  *
- *    Licensed under the Apache License, Version 2.0 (the "License");
- *    you may not use this file except in compliance with the License.
- *    You may obtain a copy of the License at
+ *    This program is free software: you can redistribute it and/or  modify
+ *    it under the terms of the GNU Affero General Public License, version 3,
+ *    as published by the Free Software Foundation.
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License for more details.
  *
- *    Unless required by applicable law or agreed to in writing, software
- *    distributed under the License is distributed on an "AS IS" BASIS,
- *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *    See the License for the specific language governing permissions and
- *    limitations under the License.
+ *    You should have received a copy of the GNU Affero General Public License
+ *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
  */
 
 
-#include "mongo/pch.h"
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+
+#include "mongo/platform/basic.h"
 
 #include "mongo/util/net/listen.h"
 
+#include <boost/scoped_array.hpp>
+#include <boost/shared_ptr.hpp>
+
+#include "mongo/db/server_options.h"
 #include "mongo/base/owned_pointer_vector.h"
+#include "mongo/util/exit.h"
+#include "mongo/util/log.h"
 #include "mongo/util/net/message_port.h"
 #include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/scopeguard.h"
@@ -55,6 +75,10 @@
 
 namespace mongo {
 
+    using boost::shared_ptr;
+    using std::endl;
+    using std::string;
+    using std::vector;
 
     // ----- Listener -------
 
@@ -90,7 +114,8 @@ namespace mongo {
             out.push_back(sa);
 
 #ifndef _WIN32
-            if (useUnixSockets && (sa.getAddr() == "127.0.0.1" || sa.getAddr() == "0.0.0.0")) // only IPv4
+            if (sa.isValid() && useUnixSockets &&
+                    (sa.getAddr() == "127.0.0.1" || sa.getAddr() == "0.0.0.0")) // only IPv4
                 out.push_back(SockAddr(makeUnixSockPath(port).c_str(), port));
 #endif
         }
@@ -121,8 +146,16 @@ namespace mongo {
         _mine = ipToAddrs(_ip.c_str(), _port, false);
 #endif
 
-        for (vector<SockAddr>::const_iterator it=_mine.begin(), end=_mine.end(); it != end; ++it) {
+        for (std::vector<SockAddr>::const_iterator it=_mine.begin(), end=_mine.end();
+             it != end;
+             ++it) {
+
             const SockAddr& me = *it;
+
+            if (!me.isValid()) {
+                error() << "listen(): socket is invalid." << endl;
+                return;
+            }
 
             SOCKET sock = ::socket(me.getType(), SOCK_STREAM, 0);
             ScopeGuard socketGuard = MakeGuard(&closesocket, sock);
@@ -131,10 +164,10 @@ namespace mongo {
             if (me.getType() == AF_UNIX) {
 #if !defined(_WIN32)
                 if (unlink(me.getAddr().c_str()) == -1) {
-                    int x = errno;
-                    if (x != ENOENT) {
-                        log() << "couldn't unlink socket file " << me << errnoWithDescription(x) << " skipping" << endl;
-                        continue;
+                    if (errno != ENOENT) {
+                        error() << "Failed to unlink socket file " << me << " "
+                                << errnoWithDescription(errno);
+                        fassertFailedNoTrace(28578);
                     }
                 }
 #endif
@@ -150,7 +183,7 @@ namespace mongo {
             {
                 const int one = 1;
                 if ( setsockopt( sock , SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) < 0 )
-                    out() << "Failed to set socket opt, SO_REUSEADDR" << endl;
+                    log() << "Failed to set socket opt, SO_REUSEADDR" << endl;
             }
 #endif
 
@@ -164,19 +197,14 @@ namespace mongo {
 
 #if !defined(_WIN32)
             if (me.getType() == AF_UNIX) {
-                if (chmod(me.getAddr().c_str(), 0777) == -1) {
-                    error() << "couldn't chmod socket file " << me << errnoWithDescription() << endl;
+                if (chmod(me.getAddr().c_str(), serverGlobalParams.unixSocketPermissions) == -1) {
+                    error() << "Failed to chmod socket file " << me << " "
+                            << errnoWithDescription(errno);
+                    fassertFailedNoTrace(28582);
                 }
                 ListeningSockets::get()->addPath( me.getAddr() );
             }
 #endif
-            
-            if ( ::listen(sock, 128) != 0 ) {
-                error() << "listen(): listen() failed " << errnoWithDescription() << endl;
-                return;
-            }
-
-            ListeningSockets::get()->add( sock );
 
             _socks.push_back(sock);
             socketGuard.Dismiss();
@@ -194,8 +222,16 @@ namespace mongo {
 
         SOCKET maxfd = 0; // needed for select()
         for (unsigned i = 0; i < _socks.size(); i++) {
-            if (_socks[i] > maxfd)
+            if (::listen(_socks[i], 128) != 0) {
+                error() << "listen(): listen() failed " << errnoWithDescription() << endl;
+                return;
+            }
+
+            ListeningSockets::get()->add(_socks[i]);
+
+            if (_socks[i] > maxfd) {
                 maxfd = _socks[i];
+            }
         }
 
         if ( maxfd >= FD_SETSIZE ) {
@@ -209,6 +245,13 @@ namespace mongo {
 #else
         _logListen(_port, false);
 #endif
+
+        {
+            // Wake up any threads blocked in waitUntilListening()
+            boost::lock_guard<boost::mutex> lock(_readyMutex);
+            _ready = true;
+            _readyCondition.notify_all();
+        }
 
         struct timeval maxSelectTime;
         while ( ! inShutdown() ) {
@@ -246,7 +289,7 @@ namespace mongo {
             }
 
 #if defined(__linux__)
-            _elapsedTime += max(ret, (int)(( 10000 - maxSelectTime.tv_usec ) / 1000));
+            _elapsedTime += std::max(ret, (int)(( 10000 - maxSelectTime.tv_usec ) / 1000));
 #else
             _elapsedTime += ret; // assume 1ms to grab connection. very rough
 #endif
@@ -363,12 +406,28 @@ namespace mongo {
             return;
         }
 
+        for (unsigned i = 0; i < _socks.size(); i++) {
+            if (::listen(_socks[i], 128) != 0) {
+                error() << "listen(): listen() failed " << errnoWithDescription() << endl;
+                return;
+            }
+
+            ListeningSockets::get()->add(_socks[i]);
+        }
+
 #ifdef MONGO_SSL
         _logListen(_port, _ssl);
 #else
         _logListen(_port, false);
 #endif
-                
+
+        {
+            // Wake up any threads blocked in waitUntilListening()
+            boost::lock_guard<boost::mutex> lock(_readyMutex);
+            _ready = true;
+            _readyCondition.notify_all();
+        }
+
         OwnedPointerVector<EventHolder> eventHolders;
         boost::scoped_array<WSAEVENT> events(new WSAEVENT[_socks.size()]);
         
@@ -512,6 +571,12 @@ namespace mongo {
         log() << _name << ( _name.size() ? " " : "" ) << "waiting for connections on port " << port << ( ssl ? " ssl" : "" ) << endl;
     }
 
+    void Listener::waitUntilListening() const {
+        boost::unique_lock<boost::mutex> lock(_readyMutex);
+        while (!_ready) {
+            _readyCondition.wait(lock);
+        }
+    }
 
     void Listener::accepted(boost::shared_ptr<Socket> psocket, long long connectionId ) {
         MessagingPort* port = new MessagingPort(psocket);
@@ -572,4 +637,32 @@ namespace mongo {
 
     TicketHolder Listener::globalTicketHolder(DEFAULT_MAX_CONN);
     AtomicInt64 Listener::globalConnectionNumber;
+
+    void ListeningSockets::closeAll() {
+        std::set<int>* sockets;
+        std::set<std::string>* paths;
+
+        {
+            scoped_lock lk( _mutex );
+            sockets = _sockets;
+            _sockets = new std::set<int>();
+            paths = _socketPaths;
+            _socketPaths = new std::set<std::string>();
+        }
+
+        for ( std::set<int>::iterator i=sockets->begin(); i!=sockets->end(); i++ ) {
+            int sock = *i;
+            log() << "closing listening socket: " << sock << std::endl;
+            closesocket( sock );
+        }
+        delete sockets;
+
+        for ( std::set<std::string>::iterator i=paths->begin(); i!=paths->end(); i++ ) {
+            std::string path = *i;
+            log() << "removing socket file: " << path << std::endl;
+            ::remove( path.c_str() );
+        }
+        delete paths;
+    }
+
 }

@@ -1,16 +1,28 @@
 /*    Copyright 2012 10gen Inc.
  *
- *    Licensed under the Apache License, Version 2.0 (the "License");
- *    you may not use this file except in compliance with the License.
- *    You may obtain a copy of the License at
+ *    This program is free software: you can redistribute it and/or  modify
+ *    it under the terms of the GNU Affero General Public License, version 3,
+ *    as published by the Free Software Foundation.
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License for more details.
  *
- *    Unless required by applicable law or agreed to in writing, software
- *    distributed under the License is distributed on an "AS IS" BASIS,
- *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *    See the License for the specific language governing permissions and
- *    limitations under the License.
+ *    You should have received a copy of the GNU Affero General Public License
+ *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
  */
 
 #include "mongo/client/dbclientinterface.h"
@@ -20,12 +32,16 @@
 #include <set>
 #include <string>
 
+using mongo::BSONArrayBuilder;
 using mongo::BSONElement;
 using mongo::BSONObj;
+using mongo::BSONObjBuilder;
 using mongo::BSONObjIterator;
 using mongo::ConnectionString;
+using mongo::HostAndPort;
 using mongo::MockRemoteDBServer;
 using mongo::MockReplicaSet;
+using mongo::repl::ReplicaSetConfig;
 
 using std::set;
 using std::string;
@@ -243,13 +259,45 @@ namespace mongo_test {
         ASSERT(expectedMembers == memberList);
     }
 
+namespace {
+    /**
+     * Takes a ReplicaSetConfig and a node to remove and returns a new config with equivalent
+     * members minus the one specified to be removed.  NOTE: Does not copy over properties of the
+     * members other than their id and host.
+     */
+    ReplicaSetConfig _getConfigWithMemberRemoved(
+            const ReplicaSetConfig& oldConfig, const HostAndPort& toRemove) {
+        BSONObjBuilder newConfigBuilder;
+        newConfigBuilder.append("_id", oldConfig.getReplSetName());
+        newConfigBuilder.append("version", oldConfig.getConfigVersion());
+
+        BSONArrayBuilder membersBuilder(newConfigBuilder.subarrayStart("members"));
+        for (ReplicaSetConfig::MemberIterator member = oldConfig.membersBegin();
+                member != oldConfig.membersEnd(); ++member) {
+            if (member->getHostAndPort() == toRemove) {
+                continue;
+            }
+
+            membersBuilder.append(BSON("_id" << member->getId() <<
+                                       "host" << member->getHostAndPort().toString()));
+        }
+
+        membersBuilder.done();
+        ReplicaSetConfig newConfig;
+        ASSERT_OK(newConfig.initialize(newConfigBuilder.obj()));
+        ASSERT_OK(newConfig.validate());
+        return newConfig;
+    }
+} // namespace
+
     TEST(MockReplicaSetTest, IsMasterReconfigNodeRemoved) {
         MockReplicaSet replSet("n", 3);
 
-        MockReplicaSet::ReplConfigMap config = replSet.getReplConfig();
+        ReplicaSetConfig oldConfig = replSet.getReplConfig();
         const string hostToRemove("$n1:27017");
-        config.erase(hostToRemove);
-        replSet.setConfig(config);
+        ReplicaSetConfig newConfig = _getConfigWithMemberRemoved(oldConfig,
+                                                                 HostAndPort(hostToRemove));
+        replSet.setConfig(newConfig);
 
         {
             // Check isMaster for node still in set
@@ -297,10 +345,11 @@ namespace mongo_test {
     TEST(MockReplicaSetTest, replSetGetStatusReconfigNodeRemoved) {
         MockReplicaSet replSet("n", 3);
 
-        MockReplicaSet::ReplConfigMap config = replSet.getReplConfig();
+        ReplicaSetConfig oldConfig = replSet.getReplConfig();
         const string hostToRemove("$n1:27017");
-        config.erase(hostToRemove);
-        replSet.setConfig(config);
+        ReplicaSetConfig newConfig = _getConfigWithMemberRemoved(oldConfig,
+                                                                 HostAndPort(hostToRemove));
+        replSet.setConfig(newConfig);
 
         {
             // Check replSetGetStatus for node still in set

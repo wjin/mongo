@@ -1,5 +1,5 @@
 /**
-*    Copyright (C) 2013 10gen Inc.
+*    Copyright (C) 2013-2014 MongoDB Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -28,15 +28,16 @@
 
 #pragma once
 
+#include <boost/scoped_ptr.hpp>
 #include <vector>
 
 #include "mongo/base/disallow_copying.h"
-#include "mongo/db/diskloc.h"
-#include "mongo/db/jsobj.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_cursor.h"
 #include "mongo/db/index/index_descriptor.h"
-#include "mongo/db/structure/btree/btree_interface.h"
+#include "mongo/db/jsobj.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/storage/sorted_data_interface.h"
 
 namespace mongo {
 
@@ -56,50 +57,60 @@ namespace mongo {
     class BtreeBasedAccessMethod : public IndexAccessMethod {
         MONGO_DISALLOW_COPYING( BtreeBasedAccessMethod );
     public:
-        BtreeBasedAccessMethod( IndexCatalogEntry* btreeState );
+        BtreeBasedAccessMethod( IndexCatalogEntry* btreeState,
+                                SortedDataInterface* btree );
 
         virtual ~BtreeBasedAccessMethod() { }
 
-        virtual Status insert(TransactionExperiment* txn,
+        virtual Status insert(OperationContext* txn,
                               const BSONObj& obj,
-                              const DiskLoc& loc,
+                              const RecordId& loc,
                               const InsertDeleteOptions& options,
                               int64_t* numInserted);
 
-        virtual Status remove(TransactionExperiment* txn,
+        virtual Status remove(OperationContext* txn,
                               const BSONObj& obj,
-                              const DiskLoc& loc,
+                              const RecordId& loc,
                               const InsertDeleteOptions& options,
                               int64_t* numDeleted);
 
-        virtual Status validateUpdate(const BSONObj& from,
+        virtual Status validateUpdate(OperationContext* txn,
+                                      const BSONObj& from,
                                       const BSONObj& to,
-                                      const DiskLoc& loc,
+                                      const RecordId& loc,
                                       const InsertDeleteOptions& options,
                                       UpdateTicket* ticket);
 
-        virtual Status update(TransactionExperiment* txn,
+        virtual Status update(OperationContext* txn,
                               const UpdateTicket& ticket,
                               int64_t* numUpdated);
 
-        virtual Status newCursor(IndexCursor **out) const;
+        virtual Status newCursor(OperationContext* txn,
+                                 const CursorOptions& opts,
+                                 IndexCursor** out) const;
 
-        virtual Status initializeAsEmpty(TransactionExperiment* txn);
+        virtual Status initializeAsEmpty(OperationContext* txn);
 
-        virtual IndexAccessMethod* initiateBulk(TransactionExperiment* txn) ;
+        virtual IndexAccessMethod* initiateBulk(OperationContext* txn);
 
         virtual Status commitBulk( IndexAccessMethod* bulk,
                                    bool mayInterrupt,
-                                   std::set<DiskLoc>* dups );
+                                   bool dupsAllowed,
+                                   std::set<RecordId>* dups );
 
-        virtual Status touch(const BSONObj& obj);
+        virtual Status touch(OperationContext* txn, const BSONObj& obj);
 
-        virtual Status touch(TransactionExperiment* txn) const;
+        virtual Status touch(OperationContext* txn) const;
 
-        virtual Status validate(int64_t* numKeys);
+        virtual Status validate(OperationContext* txn, bool full, int64_t* numKeys,
+                                BSONObjBuilder* output);
+
+        virtual bool appendCustomStats(OperationContext* txn, BSONObjBuilder* output, double scale)
+            const;
+        virtual long long getSpaceUsedBytes( OperationContext* txn ) const;
 
         // XXX: consider migrating callers to use IndexCursor instead
-        virtual DiskLoc findSingle( const BSONObj& key ) const;
+        virtual RecordId findSingle( OperationContext* txn, const BSONObj& key ) const;
 
     protected:
         // Friends who need getKeys.
@@ -110,22 +121,19 @@ namespace mongo {
 
         virtual void getKeys(const BSONObj &obj, BSONObjSet *keys) = 0;
 
+        // Determines whether it's OK to ignore ErrorCodes::KeyTooLong for this OperationContext
+        bool ignoreKeyTooLong(OperationContext* txn);
+
         IndexCatalogEntry* _btreeState; // owned by IndexCatalogEntry
         const IndexDescriptor* _descriptor;
 
-        /**
-         * The collection is needed for resolving record locations to actual objects.
-         */
-        const Collection* collection() const {
-            return _btreeState->collection();
-        }
-
     private:
-        bool removeOneKey(TransactionExperiment* txn,
+        void removeOneKey(OperationContext* txn,
                           const BSONObj& key,
-                          const DiskLoc& loc);
+                          const RecordId& loc,
+                          bool dupsAllowed);
 
-        scoped_ptr<BtreeInterface> _newInterface;
+        boost::scoped_ptr<SortedDataInterface> _newInterface;
     };
 
     /**
@@ -139,9 +147,9 @@ namespace mongo {
         BSONObjSet oldKeys, newKeys;
 
         // These point into the sets oldKeys and newKeys.
-        vector<BSONObj*> removed, added;
+        std::vector<BSONObj*> removed, added;
 
-        DiskLoc loc;
+        RecordId loc;
         bool dupsAllowed;
     };
 

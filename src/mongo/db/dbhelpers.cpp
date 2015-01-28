@@ -1,7 +1,7 @@
 // dbhelpers.cpp
 
 /**
-*    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2008-2014 MongoDB Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -28,7 +28,9 @@
 *    it in the license file.
 */
 
-#include "mongo/pch.h"
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+
+#include "mongo/platform/basic.h"
 
 #include "mongo/db/dbhelpers.h"
 
@@ -37,30 +39,46 @@
 #include <fstream>
 
 #include "mongo/client/dbclientinterface.h"
+#include "mongo/db/catalog/index_create.h"
 #include "mongo/db/db.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/json.h"
+#include "mongo/db/keypattern.h"
 #include "mongo/db/index/btree_access_method.h"
 #include "mongo/db/ops/delete.h"
 #include "mongo/db/ops/update.h"
 #include "mongo/db/ops/update_lifecycle_impl.h"
 #include "mongo/db/ops/update_request.h"
 #include "mongo/db/ops/update_result.h"
-#include "mongo/db/query/get_runner.h"
+#include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/repl/oplog.h"
-#include "mongo/db/repl/write_concern.h"
-#include "mongo/db/storage/mmap_v1/dur_transaction.h"
+#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/write_concern.h"
+#include "mongo/db/write_concern_options.h"
+#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/storage_options.h"
 #include "mongo/db/catalog/collection.h"
-#include "mongo/s/d_logic.h"
+#include "mongo/s/d_state.h"
+#include "mongo/s/shard_key_pattern.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
 
+    using std::auto_ptr;
+    using std::endl;
+    using std::ios_base;
+    using std::ofstream;
+    using std::set;
+    using std::string;
+    using std::stringstream;
+
+    using logger::LogComponent;
+
     const BSONObj reverseNaturalObj = BSON( "$natural" << -1 );
 
-    void Helpers::ensureIndex(TransactionExperiment* txn,
+    void Helpers::ensureIndex(OperationContext* txn,
                               Collection* collection,
                               BSONObj keyPattern,
                               bool unique,
@@ -72,55 +90,79 @@ namespace mongo {
         b.appendBool("unique", unique);
         BSONObj o = b.done();
 
-        Status status = collection->getIndexCatalog()->createIndex(txn, o, false);
+        MultiIndexBlock indexer(txn, collection);
+
+        Status status = indexer.init(o);
         if ( status.code() == ErrorCodes::IndexAlreadyExists )
             return;
         uassertStatusOK( status );
+
+        uassertStatusOK(indexer.insertAllDocumentsInCollection());
+
+        WriteUnitOfWork wunit(txn);
+        indexer.commit();
+        wunit.commit();
     }
 
     /* fetch a single object from collection ns that matches query
        set your db SavedContext first
     */
-    bool Helpers::findOne(Collection* collection, 
+    bool Helpers::findOne(OperationContext* txn,
+                          Collection* collection, 
                           const BSONObj &query, 
                           BSONObj& result, 
                           bool requireIndex) {
-        DiskLoc loc = findOne( collection, query, requireIndex );
+        RecordId loc = findOne( txn, collection, query, requireIndex );
         if ( loc.isNull() )
             return false;
-        result = collection->docFor(loc);
+        result = collection->docFor(txn, loc);
         return true;
     }
 
     /* fetch a single object from collection ns that matches query
        set your db SavedContext first
     */
-    DiskLoc Helpers::findOne(Collection* collection, const BSONObj &query, bool requireIndex) {
+    RecordId Helpers::findOne(OperationContext* txn,
+                             Collection* collection,
+                             const BSONObj &query,
+                             bool requireIndex) {
         if ( !collection )
-            return DiskLoc();
+            return RecordId();
 
         CanonicalQuery* cq;
+        const WhereCallbackReal whereCallback(txn, collection->ns().db());
+
         massert(17244, "Could not canonicalize " + query.toString(),
-                CanonicalQuery::canonicalize(collection->ns(), query, &cq).isOK());
+            CanonicalQuery::canonicalize(collection->ns(), query, &cq, whereCallback).isOK());
 
-        Runner* rawRunner;
+        PlanExecutor* rawExec;
         size_t options = requireIndex ? QueryPlannerParams::NO_TABLE_SCAN : QueryPlannerParams::DEFAULT;
-        massert(17245, "Could not get runner for query " + query.toString(),
-                getRunner(collection, cq, &rawRunner, options).isOK());
+        massert(17245, "Could not get executor for query " + query.toString(),
+                getExecutor(txn,
+                            collection,
+                            cq,
+                            PlanExecutor::YIELD_MANUAL,
+                            &rawExec,
+                            options).isOK());
 
-        auto_ptr<Runner> runner(rawRunner);
-        Runner::RunnerState state;
-        DiskLoc loc;
-        if (Runner::RUNNER_ADVANCED == (state = runner->getNext(NULL, &loc))) {
+        auto_ptr<PlanExecutor> exec(rawExec);
+        PlanExecutor::ExecState state;
+        RecordId loc;
+        if (PlanExecutor::ADVANCED == (state = exec->getNext(NULL, &loc))) {
             return loc;
         }
-        return DiskLoc();
+        return RecordId();
     }
 
-    bool Helpers::findById(Database* database, const char *ns, BSONObj query, BSONObj& result ,
-                           bool* nsFound , bool* indexFound ) {
-        Lock::assertAtLeastReadLocked(ns);
-        invariant( database );
+    bool Helpers::findById(OperationContext* txn,
+                           Database* database,
+                           const char *ns,
+                           BSONObj query,
+                           BSONObj& result,
+                           bool* nsFound,
+                           bool* indexFound) {
+
+        invariant(database);
 
         Collection* collection = database->getCollection( ns );
         if ( !collection ) {
@@ -131,7 +173,7 @@ namespace mongo {
             *nsFound = true;
 
         IndexCatalog* catalog = collection->getIndexCatalog();
-        const IndexDescriptor* desc = catalog->findIdIndex();
+        const IndexDescriptor* desc = catalog->findIdIndex( txn );
 
         if ( !desc )
             return false;
@@ -143,80 +185,53 @@ namespace mongo {
         BtreeBasedAccessMethod* accessMethod =
             static_cast<BtreeBasedAccessMethod*>(catalog->getIndex( desc ));
 
-        DiskLoc loc = accessMethod->findSingle( query["_id"].wrap() );
+        RecordId loc = accessMethod->findSingle( txn, query["_id"].wrap() );
         if ( loc.isNull() )
             return false;
-        result = collection->docFor( loc );
+        result = collection->docFor( txn, loc );
         return true;
     }
 
-    DiskLoc Helpers::findById(Collection* collection, const BSONObj& idquery) {
+    RecordId Helpers::findById(OperationContext* txn,
+                              Collection* collection,
+                              const BSONObj& idquery) {
         verify(collection);
         IndexCatalog* catalog = collection->getIndexCatalog();
-        const IndexDescriptor* desc = catalog->findIdIndex();
+        const IndexDescriptor* desc = catalog->findIdIndex( txn );
         uassert(13430, "no _id index", desc);
         // See SERVER-12397.  This may not always be true.
         BtreeBasedAccessMethod* accessMethod =
             static_cast<BtreeBasedAccessMethod*>(catalog->getIndex( desc ));
-        return accessMethod->findSingle( idquery["_id"].wrap() );
-    }
-
-    vector<BSONObj> Helpers::findAll( const string& ns , const BSONObj& query ) {
-        Lock::assertAtLeastReadLocked(ns);
-        Client::Context ctx(ns);
-
-        CanonicalQuery* cq;
-        uassert(17236, "Could not canonicalize " + query.toString(),
-                CanonicalQuery::canonicalize(ns, query, &cq).isOK());
-
-        Runner* rawRunner;
-        uassert(17237, "Could not get runner for query " + query.toString(),
-                getRunner(ctx.db()->getCollection( ns ), cq, &rawRunner).isOK());
-
-        vector<BSONObj> all;
-
-        auto_ptr<Runner> runner(rawRunner);
-        Runner::RunnerState state;
-        BSONObj obj;
-        while (Runner::RUNNER_ADVANCED == (state = runner->getNext(&obj, NULL))) {
-            all.push_back(obj);
-        }
-
-        return all;
-    }
-
-    bool Helpers::isEmpty(const char *ns) {
-        Client::Context context(ns, storageGlobalParams.dbpath);
-        auto_ptr<Runner> runner(InternalPlanner::collectionScan(ns,
-                                                                context.db()->getCollection(ns)));
-        return Runner::RUNNER_EOF == runner->getNext(NULL, NULL);
+        return accessMethod->findSingle( txn, idquery["_id"].wrap() );
     }
 
     /* Get the first object from a collection.  Generally only useful if the collection
-       only ever has a single object -- which is a "singleton collection.
+       only ever has a single object -- which is a "singleton collection". Note that the
+       BSONObj returned is *not* owned and will become invalid if the database is closed.
 
        Returns: true if object exists.
     */
-    bool Helpers::getSingleton(const char *ns, BSONObj& result) {
-        Client::Context context(ns);
-        auto_ptr<Runner> runner(InternalPlanner::collectionScan(ns,
-                                                                context.db()->getCollection(ns)));
-        Runner::RunnerState state = runner->getNext(&result, NULL);
-        context.getClient()->curop()->done();
-        return Runner::RUNNER_ADVANCED == state;
+    bool Helpers::getSingleton(OperationContext* txn, const char *ns, BSONObj& result) {
+        AutoGetCollectionForRead ctx(txn, ns);
+        auto_ptr<PlanExecutor> exec(InternalPlanner::collectionScan(txn, ns, ctx.getCollection()));
+
+        PlanExecutor::ExecState state = exec->getNext(&result, NULL);
+        txn->getCurOp()->done();
+        return PlanExecutor::ADVANCED == state;
     }
 
-    bool Helpers::getLast(const char *ns, BSONObj& result) {
-        Client::Context ctx(ns);
-        Collection* coll = ctx.db()->getCollection( ns );
-        auto_ptr<Runner> runner(InternalPlanner::collectionScan(ns,
-                                                                coll,
-                                                                InternalPlanner::BACKWARD));
-        Runner::RunnerState state = runner->getNext(&result, NULL);
-        return Runner::RUNNER_ADVANCED == state;
+    bool Helpers::getLast(OperationContext* txn, const char *ns, BSONObj& result) {
+        AutoGetCollectionForRead autoColl(txn, ns);
+        auto_ptr<PlanExecutor> exec(InternalPlanner::collectionScan(txn,
+                                                                    ns,
+                                                                    autoColl.getCollection(),
+                                                                    InternalPlanner::BACKWARD));
+
+        PlanExecutor::ExecState state = exec->getNext(&result, NULL);
+        return PlanExecutor::ADVANCED == state;
     }
 
-    void Helpers::upsert( TransactionExperiment* txn,
+    void Helpers::upsert( OperationContext* txn,
                           const string& ns,
                           const BSONObj& o,
                           bool fromMigrate ) {
@@ -225,7 +240,7 @@ namespace mongo {
         BSONObj id = e.wrap();
 
         OpDebug debug;
-        Client::Context context(ns);
+        Client::Context context(txn, ns);
 
         const NamespaceString requestNs(ns);
         UpdateRequest request(requestNs);
@@ -241,9 +256,9 @@ namespace mongo {
         update(txn, context.db(), request, &debug);
     }
 
-    void Helpers::putSingleton(TransactionExperiment* txn, const char *ns, BSONObj obj) {
+    void Helpers::putSingleton(OperationContext* txn, const char *ns, BSONObj obj) {
         OpDebug debug;
-        Client::Context context(ns);
+        Client::Context context(txn, ns);
 
         const NamespaceString requestNs(ns);
         UpdateRequest request(requestNs);
@@ -259,9 +274,9 @@ namespace mongo {
         context.getClient()->curop()->done();
     }
 
-    void Helpers::putSingletonGod(TransactionExperiment* txn, const char *ns, BSONObj obj, bool logTheOp) {
+    void Helpers::putSingletonGod(OperationContext* txn, const char *ns, BSONObj obj, bool logTheOp) {
         OpDebug debug;
-        Client::Context context(ns);
+        Client::Context context(txn, ns);
 
         const NamespaceString requestNs(ns);
         UpdateRequest request(requestNs);
@@ -292,19 +307,23 @@ namespace mongo {
         return kpBuilder.obj();
     }
 
-    bool findShardKeyIndexPattern( const string& ns,
-                                   const BSONObj& shardKeyPattern,
-                                   BSONObj* indexPattern ) {
-        Client::ReadContext context( ns );
-        Collection* collection = context.ctx().db()->getCollection( ns );
-        if ( !collection )
+    static bool findShardKeyIndexPattern(OperationContext* txn,
+                                         const string& ns,
+                                         const BSONObj& shardKeyPattern,
+                                         BSONObj* indexPattern ) {
+
+        AutoGetCollectionForRead ctx(txn, ns);
+        Collection* collection = ctx.getCollection();
+        if (!collection) {
             return false;
+        }
 
         // Allow multiKey based on the invariant that shard keys must be single-valued.
         // Therefore, any multi-key index prefixed by shard key cannot be multikey over
         // the shard key fields.
         const IndexDescriptor* idx =
-            collection->getIndexCatalog()->findIndexByPrefix(shardKeyPattern,
+            collection->getIndexCatalog()->findIndexByPrefix(txn,
+                                                             shardKeyPattern,
                                                              false /* allow multi key */);
 
         if ( idx == NULL )
@@ -313,9 +332,10 @@ namespace mongo {
         return true;
     }
 
-    long long Helpers::removeRange( const KeyRange& range,
+    long long Helpers::removeRange( OperationContext* txn,
+                                    const KeyRange& range,
                                     bool maxInclusive,
-                                    bool secondaryThrottle,
+                                    const WriteConcernOptions& writeConcern,
                                     RemoveSaver* callback,
                                     bool fromMigrate,
                                     bool onlyRemoveOrphanedDocs )
@@ -326,11 +346,12 @@ namespace mongo {
         // The IndexChunk has a keyPattern that may apply to more than one index - we need to
         // select the index and get the full index keyPattern here.
         BSONObj indexKeyPatternDoc;
-        if ( !findShardKeyIndexPattern( ns,
+        if ( !findShardKeyIndexPattern( txn,
+                                        ns,
                                         range.keyPattern,
                                         &indexKeyPatternDoc ) )
         {
-            warning() << "no index found to clean data over range of type "
+            warning(LogComponent::kSharding) << "no index found to clean data over range of type "
                       << range.keyPattern << " in " << ns << endl;
             return -1;
         }
@@ -348,10 +369,9 @@ namespace mongo {
         const BSONObj& max =
                 Helpers::toKeyFormat( indexKeyPattern.extendRangeBound(range.maxKey,maxInclusive));
 
-        LOG(1) << "begin removal of " << min << " to " << max << " in " << ns
-               << (secondaryThrottle ? " (waiting for secondaries)" : "" ) << endl;
-
-        Client& c = cc();
+        MONGO_LOG_COMPONENT(1, LogComponent::kSharding)
+               << "begin removal of " << min << " to " << max << " in " << ns
+               << " with write concern: " << writeConcern.toBSON() << endl;
 
         long long numDeleted = 0;
         
@@ -360,45 +380,48 @@ namespace mongo {
         while ( 1 ) {
             // Scoping for write lock.
             {
-                Client::WriteContext ctx(ns);
-                DurTransaction txn;
-                Collection* collection = ctx.ctx().db()->getCollection( &txn, ns );
+                Client::WriteContext ctx(txn, ns);
+                Collection* collection = ctx.getCollection();
                 if ( !collection )
                     break;
 
                 IndexDescriptor* desc =
-                    collection->getIndexCatalog()->findIndexByKeyPattern( indexKeyPattern.toBSON() );
+                    collection->getIndexCatalog()->findIndexByKeyPattern( txn,
+                                                                          indexKeyPattern.toBSON() );
 
-                auto_ptr<Runner> runner(InternalPlanner::indexScan(collection, desc, min, max,
-                                                                   maxInclusive,
-                                                                   InternalPlanner::FORWARD,
-                                                                   InternalPlanner::IXSCAN_FETCH));
+                auto_ptr<PlanExecutor> exec(InternalPlanner::indexScan(txn, collection, desc,
+                                                                       min, max,
+                                                                       maxInclusive,
+                                                                       InternalPlanner::FORWARD,
+                                                                       InternalPlanner::IXSCAN_FETCH));
+                exec->setYieldPolicy(PlanExecutor::YIELD_AUTO);
 
-                runner->setYieldPolicy(Runner::YIELD_AUTO);
-                DiskLoc rloc;
+                RecordId rloc;
                 BSONObj obj;
-                Runner::RunnerState state;
+                PlanExecutor::ExecState state;
                 // This may yield so we cannot touch nsd after this.
-                state = runner->getNext(&obj, &rloc);
-                runner.reset();
-                if (Runner::RUNNER_EOF == state) { break; }
+                state = exec->getNext(&obj, &rloc);
+                exec.reset();
+                if (PlanExecutor::IS_EOF == state) { break; }
 
-                if (Runner::RUNNER_DEAD == state) {
-                    warning() << "cursor died: aborting deletion for "
+                if (PlanExecutor::DEAD == state) {
+                    warning(LogComponent::kSharding) << "cursor died: aborting deletion for "
                               << min << " to " << max << " in " << ns
                               << endl;
                     break;
                 }
 
-                if (Runner::RUNNER_ERROR == state) {
-                    warning() << "cursor error while trying to delete "
+                if (PlanExecutor::FAILURE == state) {
+                    warning(LogComponent::kSharding) << "cursor error while trying to delete "
                               << min << " to " << max
                               << " in " << ns << ": "
                               << WorkingSetCommon::toStatusString(obj) << endl;
                     break;
                 }
 
-                verify(Runner::RUNNER_ADVANCED == state);
+                verify(PlanExecutor::ADVANCED == state);
+
+                WriteUnitOfWork wuow(txn);
 
                 if ( onlyRemoveOrphanedDocs ) {
                     // Do a final check in the write lock to make absolutely sure that our
@@ -414,8 +437,8 @@ namespace mongo {
 
                     bool docIsOrphan;
                     if ( metadataNow ) {
-                        KeyPattern kp( metadataNow->getKeyPattern() );
-                        BSONObj key = kp.extractSingleKey( obj );
+                        ShardKeyPattern kp( metadataNow->getKeyPattern() );
+                        BSONObj key = kp.extractShardKeyFromDoc(obj);
                         docIsOrphan = !metadataNow->keyBelongsToMe( key )
                             && !metadataNow->keyIsPending( key );
                     }
@@ -424,43 +447,59 @@ namespace mongo {
                     }
 
                     if ( !docIsOrphan ) {
-                        warning() << "aborting migration cleanup for chunk " << min << " to " << max
+                        warning(LogComponent::kSharding)
+                                  << "aborting migration cleanup for chunk " << min << " to " << max
                                   << ( metadataNow ? (string) " at document " + obj.toString() : "" )
                                   << ", collection " << ns << " has changed " << endl;
                         break;
                     }
                 }
+
+                if (!repl::getGlobalReplicationCoordinator()->canAcceptWritesForDatabase(ns)) {
+                    warning() << "stepped down from primary while deleting chunk; "
+                              << "orphaning data in " << ns
+                              << " in range [" << min << ", " << max << ")";
+                    return numDeleted;
+                }
+
                 if ( callback )
                     callback->goingToDelete( obj );
 
-                logOp(&txn, "d", ns.c_str(), obj["_id"].wrap(), 0, 0, fromMigrate);
-                collection->deleteDocument( &txn, rloc );
+                BSONObj deletedId;
+                collection->deleteDocument( txn, rloc, false, false, &deletedId );
+                // The above throws on failure, and so is not logged
+                repl::logOp(txn, "d", ns.c_str(), deletedId, 0, 0, fromMigrate);
+                wuow.commit();
                 numDeleted++;
             }
 
+            // TODO remove once the yielding below that references this timer has been removed
             Timer secondaryThrottleTime;
 
-            if ( secondaryThrottle && numDeleted > 0 ) {
-                if ( ! waitForReplication( c.getLastOp(), 2, 60 /* seconds to wait */ ) ) {
-                    warning() << "replication to secondaries for removeRange at least 60 seconds behind" << endl;
+            if (writeConcern.shouldWaitForOtherNodes() && numDeleted > 0) {
+                repl::ReplicationCoordinator::StatusAndDuration replStatus =
+                        repl::getGlobalReplicationCoordinator()->awaitReplication(txn,
+                                                                                  txn->getClient()->getLastOp(),
+                                                                                  writeConcern);
+                if (replStatus.status.code() == ErrorCodes::ExceededTimeLimit) {
+                    warning(LogComponent::kSharding)
+                            << "replication to secondaries for removeRange at "
+                                 "least 60 seconds behind";
                 }
-                millisWaitingForReplication += secondaryThrottleTime.millis();
-            }
-            
-            if ( ! Lock::isLocked() ) {
-                int micros = ( 2 * Client::recommendedYieldMicros() ) - secondaryThrottleTime.micros();
-                if ( micros > 0 ) {
-                    LOG(1) << "Helpers::removeRangeUnlocked going to sleep for " << micros << " micros" << endl;
-                    sleepmicros( micros );
+                else {
+                    massertStatusOK(replStatus.status);
                 }
+                millisWaitingForReplication += replStatus.duration.total_milliseconds();
             }
         }
         
-        if ( secondaryThrottle )
-            log() << "Helpers::removeRangeUnlocked time spent waiting for replication: "  
+        if (writeConcern.shouldWaitForOtherNodes())
+            log(LogComponent::kSharding)
+                  << "Helpers::removeRangeUnlocked time spent waiting for replication: "
                   << millisWaitingForReplication << "ms" << endl;
         
-        LOG(1) << "end removal of " << min << " to " << max << " in " << ns
+        MONGO_LOG_COMPONENT(1, LogComponent::kSharding)
+               << "end removal of " << min << " to " << max << " in " << ns
                << " (took " << rangeRemoveTimer.millis() << "ms)" << endl;
 
         return numDeleted;
@@ -470,9 +509,11 @@ namespace mongo {
 
     // Used by migration clone step
     // TODO: Cannot hook up quite yet due to _trackerLocks in shared migration code.
-    Status Helpers::getLocsInRange( const KeyRange& range,
+    // TODO: This function is not used outside of tests
+    Status Helpers::getLocsInRange( OperationContext* txn,
+                                    const KeyRange& range,
                                     long long maxChunkSizeBytes,
-                                    set<DiskLoc>* locs,
+                                    set<RecordId>* locs,
                                     long long* numDocs,
                                     long long* estChunkSizeBytes )
     {
@@ -480,13 +521,16 @@ namespace mongo {
         *estChunkSizeBytes = 0;
         *numDocs = 0;
 
-        Client::ReadContext ctx( ns );
-        Collection* collection = ctx.ctx().db()->getCollection( ns );
-        if ( !collection ) return Status( ErrorCodes::NamespaceNotFound, ns );
+        AutoGetCollectionForRead ctx(txn, ns);
+
+        Collection* collection = ctx.getCollection();
+        if (!collection) {
+            return Status(ErrorCodes::NamespaceNotFound, ns);
+        }
 
         // Require single key
         IndexDescriptor *idx =
-            collection->getIndexCatalog()->findIndexByPrefix( range.keyPattern, true );
+            collection->getIndexCatalog()->findIndexByPrefix( txn, range.keyPattern, true );
 
         if ( idx == NULL ) {
             return Status( ErrorCodes::IndexNotFound, range.keyPattern.toString() );
@@ -498,10 +542,10 @@ namespace mongo {
         // sizes will vary
         long long avgDocsWhenFull;
         long long avgDocSizeBytes;
-        const long long totalDocsInNS = collection->numRecords();
+        const long long totalDocsInNS = collection->numRecords( txn );
         if ( totalDocsInNS > 0 ) {
             // TODO: Figure out what's up here
-            avgDocSizeBytes = collection->dataSize() / totalDocsInNS;
+            avgDocSizeBytes = collection->dataSize( txn ) / totalDocsInNS;
             avgDocsWhenFull = maxChunkSizeBytes / avgDocSizeBytes;
             avgDocsWhenFull = std::min( kMaxDocsPerChunk + 1,
                                         130 * avgDocsWhenFull / 100 /* slack */);
@@ -522,14 +566,15 @@ namespace mongo {
         bool isLargeChunk = false;
         long long docCount = 0;
 
-        auto_ptr<Runner> runner(InternalPlanner::indexScan(collection, idx, min, max, false));
+        auto_ptr<PlanExecutor> exec(
+            InternalPlanner::indexScan(txn, collection, idx, min, max, false));
         // we can afford to yield here because any change to the base data that we might miss  is
         // already being queued and will be migrated in the 'transferMods' stage
-        runner->setYieldPolicy(Runner::YIELD_AUTO);
+        exec->setYieldPolicy(PlanExecutor::YIELD_AUTO);
 
-        DiskLoc loc;
-        Runner::RunnerState state;
-        while (Runner::RUNNER_ADVANCED == (state = runner->getNext(NULL, &loc))) {
+        RecordId loc;
+        PlanExecutor::ExecState state;
+        while (PlanExecutor::ADVANCED == (state = exec->getNext(NULL, &loc))) {
             if ( !isLargeChunk ) {
                 locs->insert( loc );
             }
@@ -552,9 +597,9 @@ namespace mongo {
     }
 
 
-    void Helpers::emptyCollection(TransactionExperiment* txn, const char *ns) {
-        Client::Context context(ns);
-        deleteObjects(txn, context.db(), ns, BSONObj(), false);
+    void Helpers::emptyCollection(OperationContext* txn, const char *ns) {
+        Client::Context context(txn, ns);
+        deleteObjects(txn, context.db(), ns, BSONObj(), PlanExecutor::YIELD_MANUAL, false);
     }
 
     Helpers::RemoveSaver::RemoveSaver( const string& a , const string& b , const string& why) 

@@ -1,16 +1,28 @@
 /*    Copyright 2010 10gen Inc.
  *
- *    Licensed under the Apache License, Version 2.0 (the "License");
- *    you may not use this file except in compliance with the License.
- *    You may obtain a copy of the License at
+ *    This program is free software: you can redistribute it and/or  modify
+ *    it under the terms of the GNU Affero General Public License, version 3,
+ *    as published by the Free Software Foundation.
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License for more details.
  *
- *    Unless required by applicable law or agreed to in writing, software
- *    distributed under the License is distributed on an "AS IS" BASIS,
- *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *    See the License for the specific language governing permissions and
- *    limitations under the License.
+ *    You should have received a copy of the GNU Affero General Public License
+ *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -24,6 +36,7 @@
 #include <boost/thread/tss.hpp>
 #include <boost/thread/xtime.hpp>
 
+#include "mongo/base/init.h"
 #include "mongo/base/parse_number.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/platform/cstdint.h"
@@ -40,7 +53,23 @@
 #define snprintf _snprintf
 #endif
 
+#ifdef __sunos__
+// Some versions of Solaris do not have timegm defined, so fall back to our implementation when
+// building on Solaris.  See SERVER-13446.
+extern "C" time_t
+timegm(struct tm *const tmp);
+#endif
+
 namespace mongo {
+
+    bool Date_t::isFormatable() const {
+        if (sizeof(time_t) == sizeof(int32_t)) {
+            return millis < 2147483647000ULL; // "2038-01-19T03:14:07Z"
+        }
+        else {
+            return millis < 32535215999000ULL; // "3000-12-31T23:59:59Z"
+        }
+    }
 
     // jsTime_virtual_skew is just for testing. a test command manipulates it.
     long long jsTime_virtual_skew = 0;
@@ -118,6 +147,7 @@ namespace {
     };
 
     void _dateToISOString(Date_t date, bool local, DateStringBuffer* result) {
+        invariant(date.isFormatable());
         static const int bufSize = DateStringBuffer::dataCapacity;
         char* const buf = result->data;
         struct tm t;
@@ -726,37 +756,6 @@ namespace {
         }
         boost::thread::sleep(xt);
     }
-#elif defined(__sunos__)
-    void sleepsecs(int s) {
-        boost::xtime xt;
-        boost::xtime_get(&xt, MONGO_BOOST_TIME_UTC);
-        xt.sec += s;
-        boost::thread::sleep(xt);
-    }
-    void sleepmillis(long long s) {
-        boost::xtime xt;
-        boost::xtime_get(&xt, MONGO_BOOST_TIME_UTC);
-        xt.sec += (int)( s / 1000 );
-        xt.nsec += (int)(( s % 1000 ) * 1000000);
-        if ( xt.nsec >= 1000000000 ) {
-            xt.nsec -= 1000000000;
-            xt.sec++;
-        }
-        boost::thread::sleep(xt);
-    }
-    void sleepmicros(long long s) {
-        if ( s <= 0 )
-            return;
-        boost::xtime xt;
-        boost::xtime_get(&xt, MONGO_BOOST_TIME_UTC);
-        xt.sec += (int)( s / 1000000 );
-        xt.nsec += (int)(( s % 1000000 ) * 1000);
-        if ( xt.nsec >= 1000000000 ) {
-            xt.nsec -= 1000000000;
-            xt.sec++;
-        }
-        boost::thread::sleep(xt);
-    }
 #else
     void sleepsecs(int s) {
         struct timespec t;
@@ -884,6 +883,21 @@ namespace {
     static SimpleMutex _curTimeMicros64ReadMutex("curTimeMicros64Read");
     static SimpleMutex _curTimeMicros64ResyncMutex("curTimeMicros64Resync");
 
+    typedef WINBASEAPI VOID (WINAPI *pGetSystemTimePreciseAsFileTime)
+        (_Out_ LPFILETIME lpSystemTimeAsFileTime);
+
+    static pGetSystemTimePreciseAsFileTime GetSystemTimePreciseAsFileTimeFunc;
+
+    MONGO_INITIALIZER(Init32TimeSupport)(InitializerContext*) {
+        HINSTANCE kernelLib = LoadLibraryA("kernel32.dll");
+        if (kernelLib) {
+            GetSystemTimePreciseAsFileTimeFunc = reinterpret_cast<pGetSystemTimePreciseAsFileTime>
+                (GetProcAddress(kernelLib, "GetSystemTimePreciseAsFileTime"));
+        }
+
+        return Status::OK();
+    }
+
     static unsigned long long resyncTime() {
         SimpleMutex::scoped_lock lkResync(_curTimeMicros64ResyncMutex);
         unsigned long long ftOld;
@@ -900,11 +914,18 @@ namespace {
         SimpleMutex::scoped_lock lkRead(_curTimeMicros64ReadMutex);
         baseFiletime = ftNew;
         basePerfCounter = newPerfCounter;
-        resyncInterval = 60 * Timer::_countsPerSecond;
+        resyncInterval = 60 * Timer::getCountsPerSecond();
         return newPerfCounter;
     }
 
     unsigned long long curTimeMicros64() {
+
+        // Windows 8/2012 & later support a <1us time function
+        if (GetSystemTimePreciseAsFileTimeFunc != NULL) {
+            FILETIME time;
+            GetSystemTimePreciseAsFileTimeFunc(&time);
+            return boost::date_time::winapi::file_time_to_microseconds(time);
+        }
 
         // Get a current value for QueryPerformanceCounter; if it is not time to resync we will
         // use this value.
@@ -931,7 +952,7 @@ namespace {
         // truncation while using only integer instructions.
         //
         unsigned long long computedTime = baseFiletime +
-                ((perfCounter - basePerfCounter) * 10 * 1000 * 1000) / Timer::_countsPerSecond;
+                ((perfCounter - basePerfCounter) * 10 * 1000 * 1000) / Timer::getCountsPerSecond();
 
         // Convert the computed FILETIME into microseconds since the Unix epoch (1/1/1970).
         //

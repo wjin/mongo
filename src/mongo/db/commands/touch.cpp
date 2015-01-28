@@ -30,7 +30,7 @@
  *    it in the license file.
  */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include <string>
 #include <vector>
@@ -41,20 +41,18 @@
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/client.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/curop-inl.h"
-#include "mongo/db/d_concurrency.h"
-#include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/kill_current_op.h"
-#include "mongo/db/pdfile.h"
-#include "mongo/db/storage/extent.h"
-#include "mongo/db/storage/extent_manager.h"
-#include "mongo/db/storage/mmap_v1/dur_transaction.h"
+#include "mongo/db/operation_context_impl.h"
 #include "mongo/util/timer.h"
 #include "mongo/util/touch_pages.h"
 
 namespace mongo {
+
+    using std::string;
+    using std::stringstream;
 
     class TouchCmd : public Command {
     public:
@@ -77,19 +75,16 @@ namespace mongo {
         }
         TouchCmd() : Command("touch") { }
 
-        virtual bool run(const string& dbname,
+        virtual bool run(OperationContext* txn,
+                         const string& dbname,
                          BSONObj& cmdObj,
                          int,
                          string& errmsg,
                          BSONObjBuilder& result,
                          bool fromRepl) {
-            string coll = cmdObj.firstElement().valuestr();
-            if( coll.empty() || dbname.empty() ) {
-                errmsg = "no collection name specified";
-                return false;
-            }
+            const std::string ns = parseNsCollectionRequired(dbname, cmdObj);
 
-            NamespaceString nss( dbname, coll );
+            const NamespaceString nss(ns);
             if ( ! nss.isNormal() ) {
                 errmsg = "bad namespace name";
                 return false;
@@ -103,18 +98,16 @@ namespace mongo {
                 return false;
             }
 
-            Client::ReadContext context( nss.ns() );
-            DurTransaction txn;
+            AutoGetCollectionForRead context(txn, nss);
 
-            Database* db = context.ctx().db();
-            Collection* collection = db->getCollection( nss.ns() );
+            Collection* collection = context.getCollection();
             if ( !collection ) {
                 errmsg = "collection not found";
                 return false;
             }
 
             return appendCommandStatus( result,
-                                        collection->touch( &txn,
+                                        collection->touch( txn,
                                                            touch_data, touch_indexes,
                                                            &result ) );
         }

@@ -52,8 +52,9 @@ namespace auth {
         bool hasRoles;
         std::vector<RoleName> roles;
         BSONObj writeConcern;
+        
         CreateOrUpdateUserArgs() :
-            hasHashedPassword(false), hasCustomData(false),  hasRoles(false) {}
+            hasHashedPassword(false), hasCustomData(false), hasRoles(false) {}
     };
 
     /**
@@ -78,7 +79,7 @@ namespace auth {
                                                    const StringData& cmdName,
                                                    const std::string& dbname,
                                                    std::string* parsedName,
-                                                   vector<RoleName>* parsedRoleNames,
+                                                   std::vector<RoleName>* parsedRoleNames,
                                                    BSONObj* parsedWriteConcern);
 
     /**
@@ -216,10 +217,10 @@ namespace auth {
                                        const StringData& dbname,
                                        std::vector<UserName>* parsedUserNames);
 
-
     struct MergeAuthzCollectionsArgs {
         std::string usersCollName;
         std::string rolesCollName;
+        std::string db;
         bool drop;
         BSONObj writeConcern;
         MergeAuthzCollectionsArgs() : drop(false) {}
@@ -228,7 +229,11 @@ namespace auth {
     /**
      * Takes a command object describing an invocation of the "_mergeAuthzCollections" command and
      * parses out the name of the temporary collections to use for user and role data, whether or
-     * not to drop the existing users/roles, and the writeConcern.
+     * not to drop the existing users/roles, the database if this is a for a db-specific restore,
+     * and the writeConcern.
+     * Returns ErrorCodes::OutdatedClient if the "db" field is missing, as that likely indicates
+     * the command was sent by an outdated (pre 2.6.4) version of mongorestore.
+     * Returns other codes indicating missing or incorrectly typed fields.
      */
     Status parseMergeAuthzCollectionsCommand(const BSONObj& cmdObj,
                                              MergeAuthzCollectionsArgs* parsedArgs);

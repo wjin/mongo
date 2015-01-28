@@ -31,18 +31,22 @@
 
 #pragma once
 
-#include <vector>
+#include <boost/noncopyable.hpp>
 
-#include "mongo/bson/util/atomic_int.h"
 #include "mongo/db/client.h"
-#include "mongo/db/structure/catalog/namespace.h"
+#include "mongo/db/server_options.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/util/concurrency/spin_lock.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/progress_meter.h"
+#include "mongo/util/thread_safe_string.h"
 #include "mongo/util/time_support.h"
+
 
 namespace mongo {
 
+    class Client;
+    class Command;
     class CurOp;
 
     /**
@@ -119,28 +123,19 @@ namespace mongo {
     /* lifespan is different than CurOp because of recursives with DBDirectClient */
     class OpDebug {
     public:
-        OpDebug() : ns(""){ reset(); }
+        OpDebug() : planSummary(2048) { reset(); }
 
         void reset();
 
         void recordStats();
 
-        string report( const CurOp& curop ) const;
+        std::string report( const CurOp& curop ) const;
 
         /**
-         * Appends stored data and information from curop to the builder.
-         *
-         * @param curop information about the current operation which will be
-         *     use to append data to the builder.
-         * @param builder the BSON builder to use for appending data. Data can
-         *     still be appended even if this method returns false.
-         * @param maxSize the maximum allowed combined size for the query object
-         *     and update object
-         *
-         * @return false if the sum of the sizes for the query object and update
-         *     object exceeded maxSize
+         * Appends information about the current operation to "builder".  "curop" must be a
+         * reference to the CurOp that owns this OpDebug.
          */
-        bool append(const CurOp& curop, BSONObjBuilder& builder, size_t maxSize) const;
+        void append(const CurOp& curop, BSONObjBuilder& builder) const;
 
         // -------------------
         
@@ -149,7 +144,7 @@ namespace mongo {
         // basic options
         int op;
         bool iscommand;
-        Namespace ns;
+        ThreadSafeString ns;
         BSONObj query;
         BSONObj updateobj;
         
@@ -173,7 +168,8 @@ namespace mongo {
         bool fastmodinsert;  // upsert of an $operation. builds a default object
         bool upsert;         // true if the update actually did an insert
         int keyUpdates;
-        ThreadSafeString planSummary; // a brief string describing the query solution
+        int writeConflicts;
+        ThreadSafeString planSummary; // a brief std::string describing the query solution
 
         // New Query Framework debugging/profiling info
         // TODO: should this really be an opaque BSONObj?  Not sure.
@@ -200,14 +196,12 @@ namespace mongo {
         BSONObj query() const { return _query.get();  }
         void appendQuery( BSONObjBuilder& b , const StringData& name ) const { _query.append( b , name ); }
         
-        void enter( Client::Context * context );
-        void leave( Client::Context * context );
+        void enter(const char* ns, int dbProfileLevel);
         void reset();
         void reset( const HostAndPort& remote, int op );
         void markCommand() { _isCommand = true; }
         OpDebug& debug()           { return _debug; }
-        int profileLevel() const   { return _dbprofile; }
-        const char * getNS() const { return _ns; }
+        std::string getNS() const { return _ns.toString(); }
 
         bool shouldDBProfile( int ms ) const {
             if ( _dbprofile <= 0 )
@@ -216,12 +210,11 @@ namespace mongo {
             return _dbprofile >= 2 || ms >= serverGlobalParams.slowMS;
         }
 
-        AtomicUInt opNum() const { return _opNum; }
+        unsigned int opNum() const { return _opNum; }
 
         /** if this op is running */
         bool active() const { return _active; }
 
-        bool displayInCurop() const { return _active && ! _suppressFromCurop; }
         int getOp() const { return _op; }
 
         //
@@ -258,7 +251,7 @@ namespace mongo {
 
         void ensureStarted();
         bool isStarted() const { return _start > 0; }
-        unsigned long long startTime() { // micros
+        long long startTime() { // micros
             ensureStarted();
             return _start;
         }
@@ -267,12 +260,12 @@ namespace mongo {
             _end = curTimeMicros64();
         }
 
-        unsigned long long totalTimeMicros() {
+        long long totalTimeMicros() {
             massert( 12601 , "CurOp not marked done yet" , ! _active );
             return _end - startTime();
         }
         int totalTimeMillis() { return (int) (totalTimeMicros() / 1000); }
-        unsigned long long elapsedMicros() {
+        long long elapsedMicros() {
             return curTimeMicros64() - startTime();
         }
         int elapsedMillis() {
@@ -286,35 +279,34 @@ namespace mongo {
         Command * getCommand() const { return _command; }
         void setCommand(Command* command) { _command = command; }
         
-        BSONObj info();
+        void reportState(BSONObjBuilder* builder);
 
         // Fetches less information than "info()"; used to search for ops with certain criteria
         BSONObj description();
 
-        string getRemoteString( bool includePort = true ) { return _remote.toString(includePort); }
+        std::string getRemoteString( bool includePort = true ) {
+            if (includePort)
+                return _remote.toString();
+            return _remote.host();
+        }
+
         ProgressMeter& setMessage(const char * msg,
                                   std::string name = "Progress",
                                   unsigned long long progressMeterTotal = 0,
                                   int secondsBetween = 3);
-        string getMessage() const { return _message.toString(); }
+        std::string getMessage() const { return _message.toString(); }
         ProgressMeter& getProgressMeter() { return _progressMeter; }
         CurOp *parent() const { return _wrapped; }
-        void kill(bool* pNotifyFlag = NULL); 
+        void kill(); 
         bool killPendingStrict() const { return _killPending.load(); }
         bool killPending() const { return _killPending.loadRelaxed(); }
         void yielded() { _numYields++; }
         int numYields() const { return _numYields; }
-        void suppressFromCurop() { _suppressFromCurop = true; }
         
         long long getExpectedLatencyMs() const { return _expectedLatencyMs; }
         void setExpectedLatencyMs( long long latency ) { _expectedLatencyMs = latency; }
 
-        void recordGlobalTime( long long micros ) const;
-        
-        const LockStat& lockStat() const { return _lockStat; }
-        LockStat& lockStat() { return _lockStat; }
-
-        void setKillWaiterFlags();
+        void recordGlobalTime(bool isWriteLocked, long long micros) const;
 
         /**
          * this should be used very sparingly
@@ -323,31 +315,22 @@ namespace mongo {
          */
         void setNS( const StringData& ns );
 
-        /**
-         * Find a currently running operation matching the given criteria. This assumes that you're
-         * going to kill the operation, so it must be called multiple times to get multiple matching
-         * operations.
-         * @param criteria the search to do against the infoNoauth() BSONObj
-         * @return a pointer to a matching op or NULL if no ops match
-         */
-        static CurOp* getOp(const BSONObj& criteria);
     private:
         friend class Client;
         void _reset();
 
-        static AtomicUInt _nextOpNum;
+        static AtomicUInt32 _nextOpNum;
         Client * _client;
         CurOp * _wrapped;
         Command * _command;
-        unsigned long long _start;
-        unsigned long long _end;
+        long long _start;
+        long long _end;
         bool _active;
-        bool _suppressFromCurop; // unless $all is set
         int _op;
         bool _isCommand;
         int _dbprofile;                  // 0=off, 1=slow, 2=all
-        AtomicUInt _opNum;               // todo: simple being "unsigned" may make more sense here
-        char _ns[Namespace::MaxNsLen+2];
+        unsigned int _opNum;
+        ThreadSafeString _ns;
         HostAndPort _remote;             // CAREFUL here with thread safety
         CachedBSONObj<512> _query;       // CachedBSONObj is thread safe
         OpDebug _debug;
@@ -355,9 +338,6 @@ namespace mongo {
         ProgressMeter _progressMeter;
         AtomicInt32 _killPending;
         int _numYields;
-        LockStat _lockStat;
-        // _notifyList is protected by the global killCurrentOp's mtx.
-        std::vector<bool*> _notifyList;
         
         // this is how much "extra" time a query might take
         // a writebacklisten for example will block for 30s 

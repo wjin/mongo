@@ -31,82 +31,34 @@
 #include <vector>
 
 #include "mongo/base/status.h"
-#include "mongo/db/diskloc.h"
-#include "mongo/db/jsobj.h"
 #include "mongo/db/index/index_cursor.h"
 #include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/jsobj.h"
+#include "mongo/db/record_id.h"
 #include "mongo/platform/unordered_set.h"
 
 namespace mongo {
 
-    // We keep a list of active cursors so that when a btree's bucket is deleted we notify the
-    // cursors that are pointing into that bucket.  This will go away with finer grained locking.
-    unordered_set<BtreeIndexCursor*> BtreeIndexCursor::_activeCursors;
-    SimpleMutex BtreeIndexCursor::_activeCursorsMutex("active_btree_index_cursors");
+    using std::string;
+    using std::vector;
 
-    BtreeIndexCursor::BtreeIndexCursor(const DiskLoc head,
-                                       BtreeInterface* newInterface)
-        : _direction(1),
-          _interface(newInterface),
-          _bucket(head),
-          _keyOffset(0) {
+    BtreeIndexCursor::BtreeIndexCursor(SortedDataInterface::Cursor* cursor) : _cursor(cursor) { }
 
-        SimpleMutex::scoped_lock lock(_activeCursorsMutex);
-        _activeCursors.insert(this);
-    }
-
-    BtreeIndexCursor::~BtreeIndexCursor() {
-        SimpleMutex::scoped_lock lock(_activeCursorsMutex);
-        _activeCursors.erase(this);
-    }
-
-    bool BtreeIndexCursor::isEOF() const { return _bucket.isNull(); }
-
-    void BtreeIndexCursor::aboutToDeleteBucket(const DiskLoc& bucket) {
-        SimpleMutex::scoped_lock lock(_activeCursorsMutex);
-        for (unordered_set<BtreeIndexCursor*>::iterator i = _activeCursors.begin();
-             i != _activeCursors.end(); ++i) {
-
-            BtreeIndexCursor* ic = *i;
-            if (bucket == ic->_bucket) {
-                ic->_keyOffset = -1;
-            }
-        }
-    }
-
-    Status BtreeIndexCursor::setOptions(const CursorOptions& options) {
-        if (CursorOptions::DECREASING == options.direction) {
-            _direction = -1;
-        } else {
-            _direction = 1;
-        }
-        return Status::OK();
-    }
+    bool BtreeIndexCursor::isEOF() const { return _cursor->isEOF(); }
 
     Status BtreeIndexCursor::seek(const BSONObj& position) {
-        _interface->locate(position, 
-                           1 == _direction ? minDiskLoc : maxDiskLoc,
-                           _direction,
-                           &_bucket,
-                           &_keyOffset);
+        _cursor->locate(position, 
+                        1 == _cursor->getDirection() ? RecordId::min() : RecordId::max());
         return Status::OK();
     }
 
     void BtreeIndexCursor::seek(const BSONObj& position, bool afterKey) {
-        _interface->locate(position, 
-                           afterKey ? maxDiskLoc : minDiskLoc,
-                           1,
-                           &_bucket,
-                           &_keyOffset);
+        const bool forward = (1 == _cursor->getDirection());
+        _cursor->locate(position, (afterKey == forward) ? RecordId::max() : RecordId::min());
     }
 
     bool BtreeIndexCursor::pointsAt(const BtreeIndexCursor& other) {
-        // XXX: do we need this
-        if (isEOF()) {
-            return other.isEOF();
-        }
-
-        return _bucket == other._bucket && _keyOffset == other._keyOffset;
+        return _cursor->pointsToSamePlaceAs(*other._cursor);
     }
 
     Status BtreeIndexCursor::seek(const vector<const BSONElement*>& position,
@@ -114,14 +66,11 @@ namespace mongo {
 
         BSONObj emptyObj;
 
-        _interface->customLocate(&_bucket,
-                                 &_keyOffset,
-                                 emptyObj,
-                                 0,
-                                 false,
-                                 position,
-                                 inclusive,
-                                 _direction);
+        _cursor->customLocate(emptyObj,
+                              0,
+                              false,
+                              position,
+                              inclusive);
         return Status::OK();
     }
 
@@ -131,25 +80,20 @@ namespace mongo {
                                   const vector<const BSONElement*>& keyEnd,
                                   const vector<bool>& keyEndInclusive) {
 
-        _interface->advanceTo(&_bucket,
-                              &_keyOffset,
-                              keyBegin,
-                              keyBeginLen,
-                              afterKey,
-                              keyEnd,
-                              keyEndInclusive,
-                              _direction);
+        _cursor->advanceTo(keyBegin,
+                           keyBeginLen,
+                           afterKey,
+                           keyEnd,
+                           keyEndInclusive);
         return Status::OK();
     }
 
     BSONObj BtreeIndexCursor::getKey() const {
-        verify(!_bucket.isNull());
-        return _interface->getKey(_bucket, _keyOffset);
+        return _cursor->getKey();
     }
 
-    DiskLoc BtreeIndexCursor::getValue() const {
-        verify(!_bucket.isNull());
-        return _interface->getDiskLoc(_bucket, _keyOffset);
+    RecordId BtreeIndexCursor::getValue() const {
+        return _cursor->getRecordId();
     }
 
     void BtreeIndexCursor::next() {
@@ -157,16 +101,12 @@ namespace mongo {
     }
 
     Status BtreeIndexCursor::savePosition() {
-        if (isEOF()) {
-            return Status(ErrorCodes::IllegalOperation, "Can't save position when EOF");
-        }
-
-        _interface->savePosition(_bucket, _keyOffset, &_savedData);
+        _cursor->savePosition();
         return Status::OK();
     }
 
-    Status BtreeIndexCursor::restorePosition() {
-        _interface->restorePosition(_savedData, _direction, &_bucket, &_keyOffset);
+    Status BtreeIndexCursor::restorePosition(OperationContext* txn) {
+        _cursor->restorePosition(txn);
         return Status::OK();
     }
 
@@ -177,7 +117,7 @@ namespace mongo {
 
     // Move to the next/prev. key.  Used by normal getNext and also skipping unused keys.
     void BtreeIndexCursor::advance() {
-        _interface->advance(&_bucket, &_keyOffset, _direction);
+        _cursor->advance();
     }
 
 }  // namespace mongo

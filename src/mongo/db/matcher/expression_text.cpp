@@ -28,10 +28,12 @@
  *    it in the license file.
  */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 #include "mongo/db/matcher/expression_text.h"
 
 namespace mongo {
+
+    using std::string;
 
     Status TextMatchExpression::init( const string& query, const string& language ) {
         _query = query;
@@ -57,6 +59,10 @@ namespace mongo {
             debug << "NULL";
         }
         debug << "\n";
+    }
+
+    void TextMatchExpression::toBSON(BSONObjBuilder* out) const {
+        out->append("$text", BSON("$search" << _query << "$language" << _language));
     }
 
     bool TextMatchExpression::equivalent( const MatchExpression* other ) const {
